@@ -14,7 +14,7 @@ namespace MasryVoice.Api.Migrations
             migrationBuilder.AddColumn<Guid>(
                 name: "ConversationId",
                 table: "Bookings",
-                type: "TEXT",
+                type: "uuid",
                 nullable: true);
 
             migrationBuilder.CreateIndex(

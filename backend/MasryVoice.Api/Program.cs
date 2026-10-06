@@ -267,7 +267,8 @@ using (var scope = app.Services.CreateScope())
 
     if (shouldInitSchema)
     {
-        await db.Database.EnsureCreatedAsync();
+        var logger = scope.ServiceProvider.GetService<ILogger<AppDbContext>>();
+        await DatabaseMigrationHelper.ApplyMigrationsAsync(db, logger);
     }
 
     if (shouldSeed)
@@ -535,9 +536,15 @@ app.MapDelete("/api/admin/fixtures", async (
     AppDbContext db,
     ISecurityService security,
     Microsoft.Extensions.Caching.Memory.IMemoryCache cache,
+    IWebHostEnvironment env,
     [Microsoft.AspNetCore.Mvc.FromQuery] string? conversationIds,
     CancellationToken ct) =>
 {
+    if (env.IsProduction())
+    {
+        return Results.NotFound();
+    }
+
     var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
     if (!security.ValidateAdminKey(authHeader))
     {

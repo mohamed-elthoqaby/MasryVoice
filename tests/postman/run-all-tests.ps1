@@ -55,10 +55,22 @@ if ($p2.ExitCode -ne 0) {
 }
 Write-Host "Postman CLI Run 2: 100% Passed!"
 
-Write-Host "`nSanitizing Postman Acceptance Artifacts..."
-node $SanitizeScript $Run1ReportPath
-node $SanitizeScript $Run2ReportPath
-Copy-Item $Run1ReportPath $PostmanReportPath -Force
+Write-Host "`nSanitizing Postman Acceptance Artifacts into sanitized directory..."
+$SanitizedDir = Join-Path $ReportsDir "sanitized"
+if (-not (Test-Path $SanitizedDir)) {
+    New-Item -ItemType Directory -Path $SanitizedDir -Force | Out-Null
+}
+$SanitizedRun1 = Join-Path $SanitizedDir "postman-acceptance-run1.json"
+$SanitizedRun2 = Join-Path $SanitizedDir "postman-acceptance-run2.json"
+$SanitizedReport = Join-Path $SanitizedDir "postman-acceptance.json"
+
+node $SanitizeScript $Run1ReportPath $SanitizedRun1
+if ($LASTEXITCODE -ne 0) { Write-Host "Sanitization failed for Run 1"; exit $LASTEXITCODE }
+
+node $SanitizeScript $Run2ReportPath $SanitizedRun2
+if ($LASTEXITCODE -ne 0) { Write-Host "Sanitization failed for Run 2"; exit $LASTEXITCODE }
+
+Copy-Item $SanitizedRun1 $SanitizedReport -Force
 
 
 # 4. Performance Benchmarks

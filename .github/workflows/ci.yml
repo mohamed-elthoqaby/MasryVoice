@@ -80,14 +80,14 @@ jobs:
           dotnet restore tests/MasryVoice.Tests/MasryVoice.Tests.csproj
           dotnet build tests/MasryVoice.Tests/MasryVoice.Tests.csproj -c Release
 
-      - name: Run PostgreSQL Capacity & Concurrency Integration Tests
+      - name: Run PostgreSQL Migration, Capacity & Concurrency Integration Tests
         env:
           DatabaseProvider: PostgreSql
           ConnectionStrings__PostgreSql: "Host=localhost;Port=5432;Database=masryvoice_ci_db;Username=masryvoice;Password=masryvoice_ci_pass"
         run: |
           dotnet test tests/MasryVoice.Tests/MasryVoice.Tests.csproj \
             -c Release --no-build \
-            --filter "Category=PostgresIntegration" \
+            --filter "Category=PostgresIntegration|FullyQualifiedName~SchemaMigrationAcceptanceTests" \
             --logger "console;verbosity=normal"
 
   api-acceptance-test:
@@ -241,24 +241,55 @@ jobs:
             console.log("Postman Run 2 acceptance assertions verified successfully!");
           '
 
+      - name: Run Sanitizer Regression Test Suite
+        run: node tests/postman/sanitize-report.test.js
+
       - name: Sanitize and Scan Artifact Confidentiality
-        if: always()
         run: |
+          mkdir -p tests/postman/reports/sanitized
           if [ -f "tests/postman/reports/postman-acceptance-run1.json" ]; then
-            node tests/postman/sanitize-report.js tests/postman/reports/postman-acceptance-run1.json
+            node tests/postman/sanitize-report.js tests/postman/reports/postman-acceptance-run1.json tests/postman/reports/sanitized/postman-acceptance-run1.json
           fi
           if [ -f "tests/postman/reports/postman-acceptance-run2.json" ]; then
-            node tests/postman/sanitize-report.js tests/postman/reports/postman-acceptance-run2.json
+            node tests/postman/sanitize-report.js tests/postman/reports/postman-acceptance-run2.json tests/postman/reports/sanitized/postman-acceptance-run2.json
           fi
 
-      - name: Upload Postman Acceptance Reports
-        if: always()
+      - name: Inspect Sanitized Artifacts Independently
+        run: |
+          node -e '
+            const fs = require("fs");
+            const files = [
+              "tests/postman/reports/sanitized/postman-acceptance-run1.json",
+              "tests/postman/reports/sanitized/postman-acceptance-run2.json"
+            ];
+            for (const file of files) {
+              if (!fs.existsSync(file)) {
+                console.error(`ERROR: Sanitized report missing at ${file}`);
+                process.exit(1);
+              }
+              const content = fs.readFileSync(file, "utf8");
+              if (content.includes("masryvoice_ci_admin_key_2026") || content.includes("masryvoice_ci_customer_hmac_secret_2026")) {
+                console.error(`ERROR: Raw CI secrets detected in ${file}!`);
+                process.exit(1);
+              }
+              const data = JSON.parse(content);
+              const summary = data.run?.summary;
+              if (!summary || (summary.tests?.executed || 0) === 0 || (summary.tests?.failed || 0) > 0) {
+                console.error(`ERROR: Invalid test assertions in sanitized artifact ${file}!`);
+                process.exit(1);
+              }
+              console.log(`Verified ${file}: ${summary.tests.executed} passed assertions, 0 leaks.`);
+            }
+          '
+
+      - name: Upload Sanitized Postman Acceptance Reports
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: postman-acceptance-reports
           path: |
-            tests/postman/reports/postman-acceptance-run1.json
-            tests/postman/reports/postman-acceptance-run2.json
+            tests/postman/reports/sanitized/postman-acceptance-run1.json
+            tests/postman/reports/sanitized/postman-acceptance-run2.json
           retention-days: 3
           if-no-files-found: error
 
@@ -286,6 +317,83 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+  browser-smoke-test:
+    name: Browser UI Smoke Tests (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Frontend Dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Playwright Chromium & System Dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Build Backend (Release)
+        run: dotnet build backend/MasryVoice.Api/MasryVoice.Api.csproj -c Release
+
+      - name: Build Frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Start MasryVoice Backend
+        env:
+          ASPNETCORE_ENVIRONMENT: Testing
+          ASPNETCORE_URLS: "http://localhost:5000"
+          Database__InitializeSchema: "true"
+          Database__AutoSeed: "true"
+          Security__AdminKey: "masryvoice_dev_admin_key"
+          Security__HmacSecret: "masryvoice_dev_hmac_secret_key_12345"
+          LlmProvider: "DeterministicFake"
+          Voice__SttProvider: "Simulated"
+          Voice__TtsProvider: "Simulated"
+          RateLimiting__ApiPermitLimit: "500"
+        run: |
+          dotnet run --project backend/MasryVoice.Api/MasryVoice.Api.csproj -c Release --no-build &
+          echo "Waiting for API readiness at http://localhost:5000/api/health/ready..."
+          for i in {1..30}; do
+            if curl -s -f http://localhost:5000/api/health/ready | grep -q '"status":"Ready"'; then
+              echo "Backend ready!"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Start Frontend Server
+        working-directory: frontend
+        run: |
+          npm run start &
+          echo "Waiting for frontend readiness at http://localhost:3000..."
+          for i in {1..30}; do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:3000 | grep -q "200"; then
+              echo "Frontend ready!"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run Browser Smoke Suite (Playwright)
+        env:
+          FRONTEND_URL: "http://localhost:3000"
+          ADMIN_KEY: "masryvoice_dev_admin_key"
+        run: node tests/browser/smoke.test.js
+
   ci-gate:
     name: CI Gate
     runs-on: ubuntu-latest
@@ -294,6 +402,7 @@ jobs:
       - postgres-integration-test
       - api-acceptance-test
       - frontend-build
+      - browser-smoke-test
     if: always()
     timeout-minutes: 5
 
@@ -305,11 +414,13 @@ jobs:
           echo "PostgreSQL & pgvector Integration: ${{ needs.postgres-integration-test.result }}"
           echo "Postman CLI API Acceptance:        ${{ needs.api-acceptance-test.result }}"
           echo "Frontend TypeScript & Build:       ${{ needs.frontend-build.result }}"
+          echo "Browser UI Smoke Tests:            ${{ needs.browser-smoke-test.result }}"
 
           if [ "${{ needs.backend-build-test.result }}" != "success" ] || \
              [ "${{ needs.postgres-integration-test.result }}" != "success" ] || \
              [ "${{ needs.api-acceptance-test.result }}" != "success" ] || \
-             [ "${{ needs.frontend-build.result }}" != "success" ]; then
+             [ "${{ needs.frontend-build.result }}" != "success" ] || \
+             [ "${{ needs.browser-smoke-test.result }}" != "success" ]; then
             echo "ERROR: One or more required CI jobs did not succeed. Failing CI Gate."
             exit 1
           fi

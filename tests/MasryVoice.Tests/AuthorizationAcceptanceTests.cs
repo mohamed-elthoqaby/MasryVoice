@@ -716,4 +716,209 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
 
         Assert.Equal(HttpStatusCode.OK, authorizedStage.StatusCode);
     }
+
+    [Fact]
+    public async Task AdminFixtures_InProductionEnvironment_Returns404NotFound()
+    {
+        var prodDbName = $"prod_fixtures_{Guid.NewGuid():N}.db";
+        var prodAdminKey = "valid_production_admin_key_super_secret_123";
+        var prodHmacSecret = "valid_production_hmac_secret_at_least_16_chars_123";
+
+        Environment.SetEnvironmentVariable("Security__AdminKey", prodAdminKey);
+        Environment.SetEnvironmentVariable("Security__HmacSecret", prodHmacSecret);
+        Environment.SetEnvironmentVariable("DatabaseProvider", "Sqlite");
+        Environment.SetEnvironmentVariable("ConnectionStrings__Sqlite", $"Data Source={prodDbName}");
+
+        WebApplicationFactory<Program>? prodFactory = null;
+        try
+        {
+            prodFactory = _factory.WithWebHostBuilder(builder =>
+            {
+                builder.UseEnvironment("Production");
+                builder.ConfigureServices(services =>
+                {
+                    var descriptors = services.Where(d =>
+                        d.ServiceType == typeof(DbContextOptions<AppDbContext>) ||
+                        d.ServiceType == typeof(AppDbContext)).ToList();
+                    foreach (var d in descriptors) services.Remove(d);
+
+                    services.AddDbContext<AppDbContext>(options =>
+                    {
+                        options.UseSqlite($"Data Source={prodDbName}");
+                    });
+                });
+            });
+
+            var client = prodFactory.CreateClient();
+            client.DefaultRequestHeaders.Add("X-Admin-Key", prodAdminKey);
+
+            var res = await client.DeleteAsync($"/api/admin/fixtures?conversationIds={Guid.NewGuid()}");
+
+            // Must be absent in Production (404 Not Found)
+            Assert.Equal(HttpStatusCode.NotFound, res.StatusCode);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("Security__AdminKey", null);
+            Environment.SetEnvironmentVariable("Security__HmacSecret", null);
+            Environment.SetEnvironmentVariable("DatabaseProvider", null);
+            Environment.SetEnvironmentVariable("ConnectionStrings__Sqlite", null);
+
+            prodFactory?.Dispose();
+            if (File.Exists(prodDbName))
+            {
+                try { File.Delete(prodDbName); } catch { }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task AdminFixtures_Cleanup_PreservesUnrelatedData_AndRestoresBaselineByIntent()
+    {
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Admin-Key", _adminKey);
+
+        var fixtureConvId = Guid.NewGuid();
+        var unrelatedConvId = Guid.NewGuid();
+        var slotId = Guid.NewGuid();
+
+        var fixturePhone = "01011111111";
+        var unrelatedPhone = "01099999999";
+        var serviceName = "كشف جلدية";
+
+        // 1. Seed slot with unrelated booking + fixture booking
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            var agent = await db.Agents.FirstAsync();
+
+            var slot = new AvailabilitySlot
+            {
+                Id = slotId,
+                ServiceName = serviceName,
+                StartTimeUtc = DateTime.UtcNow.AddDays(2),
+                EndTimeUtc = DateTime.UtcNow.AddDays(2).AddMinutes(30),
+                TotalCapacity = 5,
+                BookedCapacity = 2
+            };
+            db.AvailabilitySlots.Add(slot);
+
+            var unrelatedConv = new Conversation
+            {
+                Id = unrelatedConvId,
+                AgentId = agent.Id,
+                CustomerName = "عميل مستقل",
+                CustomerPhoneNumber = unrelatedPhone,
+                Channel = "WebText",
+                Status = "Active"
+            };
+            db.Conversations.Add(unrelatedConv);
+
+            var fixtureConv = new Conversation
+            {
+                Id = fixtureConvId,
+                AgentId = agent.Id,
+                CustomerName = "عميل الفكستشر",
+                CustomerPhoneNumber = fixturePhone,
+                Channel = "WebText",
+                Status = "Active"
+            };
+            db.Conversations.Add(fixtureConv);
+
+            var unrelatedBooking = new Booking
+            {
+                Id = Guid.NewGuid(),
+                ConversationId = unrelatedConvId,
+                SlotId = slotId,
+                CustomerName = "عميل مستقل",
+                CustomerPhone = unrelatedPhone,
+                ServiceName = serviceName,
+                BookingDateUtc = slot.StartTimeUtc,
+                Status = "Confirmed",
+                IdempotencyKey = $"unrelated_{Guid.NewGuid():N}",
+                RequestHash = "hash_unrelated"
+            };
+            db.Bookings.Add(unrelatedBooking);
+
+            var fixturePending = new PendingBooking
+            {
+                Id = Guid.NewGuid(),
+                ConversationId = fixtureConvId,
+                SlotId = slotId,
+                CustomerName = "عميل الفكستشر",
+                CustomerPhone = fixturePhone,
+                ServiceName = serviceName,
+                BookingDateUtc = slot.StartTimeUtc,
+                Status = "Confirmed",
+                IdempotencyKey = $"fixture_{Guid.NewGuid():N}",
+                RequestHash = "hash_fixture"
+            };
+            db.PendingBookings.Add(fixturePending);
+
+            var fixtureBooking = new Booking
+            {
+                Id = Guid.NewGuid(),
+                ConversationId = fixtureConvId,
+                SlotId = slotId,
+                CustomerName = "عميل الفكستشر",
+                CustomerPhone = fixturePhone,
+                ServiceName = serviceName,
+                BookingDateUtc = slot.StartTimeUtc,
+                Status = "Confirmed",
+                IdempotencyKey = fixturePending.IdempotencyKey,
+                RequestHash = fixturePending.RequestHash
+            };
+            db.Bookings.Add(fixtureBooking);
+
+            await db.SaveChangesAsync();
+        }
+
+        // 2. Pre-cleanup state checks: verify intent counts
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            // Count bookings for the fixture booking intent
+            var fixtureIntentCountBefore = await db.Bookings.CountAsync(b =>
+                b.SlotId == slotId && b.CustomerPhone == fixturePhone && b.ServiceName == serviceName);
+            Assert.Equal(1, fixtureIntentCountBefore);
+
+            // Count bookings for unrelated customer
+            var unrelatedCountBefore = await db.Bookings.CountAsync(b =>
+                b.SlotId == slotId && b.CustomerPhone == unrelatedPhone);
+            Assert.Equal(1, unrelatedCountBefore);
+        }
+
+        // 3. Execute cleanup targeted strictly at fixture conversation
+        var deleteRes = await client.DeleteAsync($"/api/admin/fixtures?conversationIds={fixtureConvId}");
+        Assert.Equal(HttpStatusCode.OK, deleteRes.StatusCode);
+
+        // 4. Post-cleanup verification:
+        // Assert cleanup restores the fixture baseline (fixture booking intent count is 0)
+        // Assert unrelated data is preserved
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            var fixtureIntentCountAfter = await db.Bookings.CountAsync(b =>
+                b.SlotId == slotId && b.CustomerPhone == fixturePhone && b.ServiceName == serviceName);
+            Assert.Equal(0, fixtureIntentCountAfter);
+
+            var unrelatedCountAfter = await db.Bookings.CountAsync(b =>
+                b.SlotId == slotId && b.CustomerPhone == unrelatedPhone);
+            Assert.Equal(1, unrelatedCountAfter);
+
+            // Verify slot capacity recalculated to match only surviving unrelated active bookings
+            var slot = await db.AvailabilitySlots.FirstAsync(s => s.Id == slotId);
+            Assert.Equal(1, slot.BookedCapacity);
+
+            // Fixture conversation and pending bookings are cleaned up
+            Assert.False(await db.Conversations.AnyAsync(c => c.Id == fixtureConvId));
+            Assert.False(await db.PendingBookings.AnyAsync(pb => pb.ConversationId == fixtureConvId));
+
+            // Unrelated conversation survives
+            Assert.True(await db.Conversations.AnyAsync(c => c.Id == unrelatedConvId));
+        }
+    }
 }

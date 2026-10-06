@@ -1,5 +1,6 @@
 ﻿using System;
 using Microsoft.EntityFrameworkCore.Migrations;
+using Pgvector;
 
 #nullable disable
 
@@ -11,19 +12,22 @@ namespace MasryVoice.Api.Migrations
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)
         {
+            migrationBuilder.AlterDatabase()
+                .Annotation("Npgsql:PostgresExtension:vector", ",,");
+
             migrationBuilder.CreateTable(
                 name: "Agents",
                 columns: table => new
                 {
-                    Id = table.Column<Guid>(type: "TEXT", nullable: false),
-                    Name = table.Column<string>(type: "TEXT", maxLength: 150, nullable: false),
-                    SystemPrompt = table.Column<string>(type: "TEXT", nullable: false),
-                    ModelName = table.Column<string>(type: "TEXT", maxLength: 100, nullable: false),
-                    LanguageCode = table.Column<string>(type: "TEXT", maxLength: 10, nullable: false),
-                    Temperature = table.Column<double>(type: "REAL", nullable: false),
-                    IsActive = table.Column<bool>(type: "INTEGER", nullable: false),
-                    AllowedToolsJson = table.Column<string>(type: "TEXT", nullable: false),
-                    CreatedAtUtc = table.Column<DateTime>(type: "TEXT", nullable: false)
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    Name = table.Column<string>(type: "character varying(150)", maxLength: 150, nullable: false),
+                    SystemPrompt = table.Column<string>(type: "text", nullable: false),
+                    ModelName = table.Column<string>(type: "character varying(100)", maxLength: 100, nullable: false),
+                    LanguageCode = table.Column<string>(type: "character varying(10)", maxLength: 10, nullable: false),
+                    Temperature = table.Column<double>(type: "double precision", nullable: false),
+                    IsActive = table.Column<bool>(type: "boolean", nullable: false),
+                    AllowedToolsJson = table.Column<string>(type: "text", nullable: false),
+                    CreatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -34,12 +38,12 @@ namespace MasryVoice.Api.Migrations
                 name: "AvailabilitySlots",
                 columns: table => new
                 {
-                    Id = table.Column<Guid>(type: "TEXT", nullable: false),
-                    ServiceName = table.Column<string>(type: "TEXT", maxLength: 150, nullable: false),
-                    StartTimeUtc = table.Column<DateTime>(type: "TEXT", nullable: false),
-                    EndTimeUtc = table.Column<DateTime>(type: "TEXT", nullable: false),
-                    TotalCapacity = table.Column<int>(type: "INTEGER", nullable: false),
-                    BookedCapacity = table.Column<int>(type: "INTEGER", nullable: false)
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    ServiceName = table.Column<string>(type: "character varying(150)", maxLength: 150, nullable: false),
+                    StartTimeUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    EndTimeUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    TotalCapacity = table.Column<int>(type: "integer", nullable: false),
+                    BookedCapacity = table.Column<int>(type: "integer", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -51,12 +55,12 @@ namespace MasryVoice.Api.Migrations
                 name: "KnowledgeDocuments",
                 columns: table => new
                 {
-                    Id = table.Column<Guid>(type: "TEXT", nullable: false),
-                    Title = table.Column<string>(type: "TEXT", maxLength: 250, nullable: false),
-                    FileName = table.Column<string>(type: "TEXT", nullable: false),
-                    Category = table.Column<string>(type: "TEXT", maxLength: 100, nullable: false),
-                    ChunkCount = table.Column<int>(type: "INTEGER", nullable: false),
-                    CreatedAtUtc = table.Column<DateTime>(type: "TEXT", nullable: false)
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    Title = table.Column<string>(type: "character varying(250)", maxLength: 250, nullable: false),
+                    FileName = table.Column<string>(type: "text", nullable: false),
+                    Category = table.Column<string>(type: "character varying(100)", maxLength: 100, nullable: false),
+                    ChunkCount = table.Column<int>(type: "integer", nullable: false),
+                    CreatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -67,16 +71,16 @@ namespace MasryVoice.Api.Migrations
                 name: "OutboxJobs",
                 columns: table => new
                 {
-                    Id = table.Column<Guid>(type: "TEXT", nullable: false),
-                    Topic = table.Column<string>(type: "TEXT", maxLength: 100, nullable: false),
-                    PayloadJson = table.Column<string>(type: "TEXT", nullable: false),
-                    Status = table.Column<string>(type: "TEXT", maxLength: 50, nullable: false),
-                    RetryCount = table.Column<int>(type: "INTEGER", nullable: false),
-                    MaxRetries = table.Column<int>(type: "INTEGER", nullable: false),
-                    NextRetryUtc = table.Column<DateTime>(type: "TEXT", nullable: false),
-                    CreatedAtUtc = table.Column<DateTime>(type: "TEXT", nullable: false),
-                    ProcessedAtUtc = table.Column<DateTime>(type: "TEXT", nullable: true),
-                    LastError = table.Column<string>(type: "TEXT", nullable: true)
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    Topic = table.Column<string>(type: "character varying(100)", maxLength: 100, nullable: false),
+                    PayloadJson = table.Column<string>(type: "text", nullable: false),
+                    Status = table.Column<string>(type: "character varying(50)", maxLength: 50, nullable: false),
+                    RetryCount = table.Column<int>(type: "integer", nullable: false),
+                    MaxRetries = table.Column<int>(type: "integer", nullable: false),
+                    NextRetryUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    CreatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    ProcessedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    LastError = table.Column<string>(type: "text", nullable: true)
                 },
                 constraints: table =>
                 {
@@ -87,14 +91,14 @@ namespace MasryVoice.Api.Migrations
                 name: "Conversations",
                 columns: table => new
                 {
-                    Id = table.Column<Guid>(type: "TEXT", nullable: false),
-                    AgentId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    CustomerPhoneNumber = table.Column<string>(type: "TEXT", nullable: true),
-                    CustomerName = table.Column<string>(type: "TEXT", nullable: true),
-                    Channel = table.Column<string>(type: "TEXT", nullable: false),
-                    Status = table.Column<string>(type: "TEXT", nullable: false),
-                    StartedAtUtc = table.Column<DateTime>(type: "TEXT", nullable: false),
-                    LastActiveAtUtc = table.Column<DateTime>(type: "TEXT", nullable: false)
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    AgentId = table.Column<Guid>(type: "uuid", nullable: false),
+                    CustomerPhoneNumber = table.Column<string>(type: "text", nullable: true),
+                    CustomerName = table.Column<string>(type: "text", nullable: true),
+                    Channel = table.Column<string>(type: "text", nullable: false),
+                    Status = table.Column<string>(type: "text", nullable: false),
+                    StartedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    LastActiveAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -111,16 +115,16 @@ namespace MasryVoice.Api.Migrations
                 name: "Bookings",
                 columns: table => new
                 {
-                    Id = table.Column<Guid>(type: "TEXT", nullable: false),
-                    SlotId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    CustomerName = table.Column<string>(type: "TEXT", nullable: false),
-                    CustomerPhone = table.Column<string>(type: "TEXT", nullable: false),
-                    ServiceName = table.Column<string>(type: "TEXT", nullable: false),
-                    BookingDateUtc = table.Column<DateTime>(type: "TEXT", nullable: false),
-                    Status = table.Column<string>(type: "TEXT", nullable: false),
-                    IdempotencyKey = table.Column<string>(type: "TEXT", nullable: false),
-                    RequestHash = table.Column<string>(type: "TEXT", nullable: false),
-                    CreatedAtUtc = table.Column<DateTime>(type: "TEXT", nullable: false)
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    SlotId = table.Column<Guid>(type: "uuid", nullable: false),
+                    CustomerName = table.Column<string>(type: "text", nullable: false),
+                    CustomerPhone = table.Column<string>(type: "text", nullable: false),
+                    ServiceName = table.Column<string>(type: "text", nullable: false),
+                    BookingDateUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    Status = table.Column<string>(type: "text", nullable: false),
+                    IdempotencyKey = table.Column<string>(type: "text", nullable: false),
+                    RequestHash = table.Column<string>(type: "text", nullable: false),
+                    CreatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -137,11 +141,12 @@ namespace MasryVoice.Api.Migrations
                 name: "DocumentChunks",
                 columns: table => new
                 {
-                    Id = table.Column<Guid>(type: "TEXT", nullable: false),
-                    DocumentId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    ChunkIndex = table.Column<int>(type: "INTEGER", nullable: false),
-                    Content = table.Column<string>(type: "TEXT", nullable: false),
-                    CreatedAtUtc = table.Column<DateTime>(type: "TEXT", nullable: false)
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    DocumentId = table.Column<Guid>(type: "uuid", nullable: false),
+                    ChunkIndex = table.Column<int>(type: "integer", nullable: false),
+                    Content = table.Column<string>(type: "text", nullable: false),
+                    Embedding = table.Column<Vector>(type: "vector(384)", nullable: true),
+                    CreatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -158,14 +163,14 @@ namespace MasryVoice.Api.Migrations
                 name: "Messages",
                 columns: table => new
                 {
-                    Id = table.Column<Guid>(type: "TEXT", nullable: false),
-                    ConversationId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    Role = table.Column<string>(type: "TEXT", nullable: false),
-                    Content = table.Column<string>(type: "TEXT", nullable: false),
-                    ToolCallId = table.Column<string>(type: "TEXT", nullable: true),
-                    ToolName = table.Column<string>(type: "TEXT", nullable: true),
-                    SequenceNumber = table.Column<int>(type: "INTEGER", nullable: false),
-                    CreatedAtUtc = table.Column<DateTime>(type: "TEXT", nullable: false)
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    ConversationId = table.Column<Guid>(type: "uuid", nullable: false),
+                    Role = table.Column<string>(type: "text", nullable: false),
+                    Content = table.Column<string>(type: "text", nullable: false),
+                    ToolCallId = table.Column<string>(type: "text", nullable: true),
+                    ToolName = table.Column<string>(type: "text", nullable: true),
+                    SequenceNumber = table.Column<int>(type: "integer", nullable: false),
+                    CreatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -182,18 +187,18 @@ namespace MasryVoice.Api.Migrations
                 name: "PendingBookings",
                 columns: table => new
                 {
-                    Id = table.Column<Guid>(type: "TEXT", nullable: false),
-                    ConversationId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    SlotId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    CustomerName = table.Column<string>(type: "TEXT", nullable: false),
-                    CustomerPhone = table.Column<string>(type: "TEXT", nullable: false),
-                    ServiceName = table.Column<string>(type: "TEXT", nullable: false),
-                    BookingDateUtc = table.Column<DateTime>(type: "TEXT", nullable: false),
-                    IdempotencyKey = table.Column<string>(type: "TEXT", nullable: false),
-                    RequestHash = table.Column<string>(type: "TEXT", nullable: false),
-                    Status = table.Column<string>(type: "TEXT", nullable: false),
-                    CreatedAtUtc = table.Column<DateTime>(type: "TEXT", nullable: false),
-                    ConfirmedAtUtc = table.Column<DateTime>(type: "TEXT", nullable: true)
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    ConversationId = table.Column<Guid>(type: "uuid", nullable: false),
+                    SlotId = table.Column<Guid>(type: "uuid", nullable: false),
+                    CustomerName = table.Column<string>(type: "text", nullable: false),
+                    CustomerPhone = table.Column<string>(type: "text", nullable: false),
+                    ServiceName = table.Column<string>(type: "text", nullable: false),
+                    BookingDateUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    IdempotencyKey = table.Column<string>(type: "text", nullable: false),
+                    RequestHash = table.Column<string>(type: "text", nullable: false),
+                    Status = table.Column<string>(type: "text", nullable: false),
+                    CreatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    ConfirmedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: true)
                 },
                 constraints: table =>
                 {
@@ -216,14 +221,14 @@ namespace MasryVoice.Api.Migrations
                 name: "ToolExecutions",
                 columns: table => new
                 {
-                    Id = table.Column<Guid>(type: "TEXT", nullable: false),
-                    ConversationId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    ToolName = table.Column<string>(type: "TEXT", nullable: false),
-                    ArgumentsJson = table.Column<string>(type: "TEXT", nullable: false),
-                    ResultJson = table.Column<string>(type: "TEXT", nullable: false),
-                    Status = table.Column<string>(type: "TEXT", nullable: false),
-                    DurationMs = table.Column<long>(type: "INTEGER", nullable: false),
-                    ExecutedAtUtc = table.Column<DateTime>(type: "TEXT", nullable: false)
+                    Id = table.Column<Guid>(type: "uuid", nullable: false),
+                    ConversationId = table.Column<Guid>(type: "uuid", nullable: false),
+                    ToolName = table.Column<string>(type: "text", nullable: false),
+                    ArgumentsJson = table.Column<string>(type: "text", nullable: false),
+                    ResultJson = table.Column<string>(type: "text", nullable: false),
+                    Status = table.Column<string>(type: "text", nullable: false),
+                    DurationMs = table.Column<long>(type: "bigint", nullable: false),
+                    ExecutedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false)
                 },
                 constraints: table =>
                 {

@@ -156,6 +156,7 @@ export default function Dashboard() {
   const [voiceInterrupted, setVoiceInterrupted] = useState(false);
   const [voiceTurnId, setVoiceTurnId] = useState<number>(0);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
+  const isInterruptedRef = useRef<boolean>(false);
 
   // Settings form state
   const [agentForm, setAgentForm] = useState<Partial<Agent>>({});
@@ -378,27 +379,32 @@ export default function Dashboard() {
         })
       });
       const data = await res.json();
-      if (res.ok && data.Success) {
+      const isSuccess = data.success !== undefined ? Boolean(data.success) : Boolean(data.Success);
+      const resData = data.data !== undefined ? data.data : data.Data;
+      const resMsg = data.message !== undefined ? data.message : data.Message;
+      const resErrorCode = data.errorCode !== undefined ? data.errorCode : data.ErrorCode;
+
+      if (res.ok && isSuccess) {
         if (data.customerToken) updateSessionCredentials(conversationId, data.customerToken);
         setPendingCard(prev => prev ? {
           ...prev,
           status: 'Confirmed',
-          confirmedBookingId: data.Data?.bookingId
+          confirmedBookingId: resData?.bookingId
         } : null);
         setMessages(prev => [
           ...prev,
           {
             role: 'assistant',
-            content: `✅ تم تأكيد وتثبيت الحجز بنجاح في قاعدة البيانات!\nرقم الحجز: ${data.Data?.bookingId}\nالاسم: ${data.Data?.customerName}\nالموعد: ${data.Data?.cairoTime}`,
+            content: `✅ تم تأكيد وتثبيت الحجز بنجاح في قاعدة البيانات!\nرقم الحجز: ${resData?.bookingId}\nالاسم: ${resData?.customerName}\nالموعد: ${resData?.cairoTime}`,
             time: new Date().toLocaleTimeString('ar-EG')
           }
         ]);
         fetchState();
       } else {
-        const err = data.Message || 'تعذر تأكيد الحجز';
+        const err = resMsg || 'تعذر تأكيد الحجز';
         setPendingCard(prev => prev ? {
           ...prev,
-          status: data.ErrorCode === 'STALE_PENDING_BOOKING' ? 'Invalidated' : prev.status,
+          status: resErrorCode === 'STALE_PENDING_BOOKING' ? 'Invalidated' : prev.status,
           errorMessage: err
         } : null);
       }
@@ -481,19 +487,24 @@ export default function Dashboard() {
 
   // Voice Session & Barge-in handlers
   const handleStartVoiceSession = async () => {
+    isInterruptedRef.current = false;
     try {
+      const tokenToUse = customerToken || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_customer_token') : null);
+      const convToUse = conversationId || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_conversation_id') : null);
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (customerToken) headers['X-Customer-Token'] = customerToken;
+      if (tokenToUse) headers['X-Customer-Token'] = tokenToUse;
       const res = await fetch('/api/voice/session', {
         method: 'POST',
         headers,
-        body: JSON.stringify({ conversationId: conversationId || null })
+        body: JSON.stringify({ conversationId: convToUse || null })
       });
       if (res.ok) {
         const data = await res.json();
         setVoiceSessionId(data.sessionId);
         updateSessionCredentials(data.conversationId, data.customerToken);
         setVoiceInterrupted(false);
+      } else {
+        console.error('Failed to create voice session:', res.status, await res.text());
       }
     } catch (err) {
       console.error(err);
@@ -502,15 +513,18 @@ export default function Dashboard() {
 
   const handleBargeInInterrupt = async () => {
     if (!voiceSessionId) return;
+    isInterruptedRef.current = true;
     try {
       if (audioPlayerRef.current) {
         audioPlayerRef.current.pause();
         audioPlayerRef.current.currentTime = 0;
+        audioPlayerRef.current.src = '';
       }
       setIsVoiceSpeaking(false);
       setVoiceInterrupted(true);
+      const tokenToUse = customerToken || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_customer_token') : null);
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (customerToken) headers['X-Customer-Token'] = customerToken;
+      if (tokenToUse) headers['X-Customer-Token'] = tokenToUse;
       await fetch('/api/voice/interrupt', {
         method: 'POST',
         headers,
@@ -524,19 +538,22 @@ export default function Dashboard() {
   const handleSendVoiceTurn = async (messageText?: string) => {
     const textToSend = messageText || voiceText;
     if (!textToSend.trim() || !selectedAgent) return;
+    isInterruptedRef.current = false;
     let sId = voiceSessionId;
-    let currentConv = conversationId;
+    let currentConv = conversationId || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_conversation_id') : null);
+    let currentToken = customerToken || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_customer_token') : null);
     if (!sId) {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (customerToken) headers['X-Customer-Token'] = customerToken;
+      if (currentToken) headers['X-Customer-Token'] = currentToken;
       const res = await fetch('/api/voice/session', {
         method: 'POST',
         headers,
-        body: JSON.stringify({ conversationId: conversationId || null })
+        body: JSON.stringify({ conversationId: currentConv || null })
       });
       const data = await res.json();
       sId = data.sessionId;
       currentConv = data.conversationId;
+      currentToken = data.customerToken;
       setVoiceSessionId(sId);
       updateSessionCredentials(data.conversationId, data.customerToken);
     }
@@ -545,7 +562,7 @@ export default function Dashboard() {
     setVoiceInterrupted(false);
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (customerToken) headers['X-Customer-Token'] = customerToken;
+      if (currentToken) headers['X-Customer-Token'] = currentToken;
       const res = await fetch('/api/voice/turn', {
         method: 'POST',
         headers,
@@ -562,15 +579,25 @@ export default function Dashboard() {
         setVoiceTurnId(data.turnId);
         setVoiceText('');
 
+        // Suppress late playback if user interrupted while waiting
+        if (data.interrupted || isInterruptedRef.current) {
+          setIsVoiceSpeaking(false);
+          setVoiceInterrupted(true);
+          return;
+        }
+
         if (data.audioBase64) {
           const audioSrc = `data:audio/wav;base64,${data.audioBase64}`;
-          if (audioPlayerRef.current) {
+          if (audioPlayerRef.current && !isInterruptedRef.current) {
             audioPlayerRef.current.src = audioSrc;
             setIsVoiceSpeaking(true);
             audioPlayerRef.current.play().catch(() => {});
             audioPlayerRef.current.onended = () => setIsVoiceSpeaking(false);
           }
         }
+      } else if (res.status === 499) {
+        setIsVoiceSpeaking(false);
+        setVoiceInterrupted(true);
       }
     } catch (err) {
       console.error(err);
@@ -821,6 +848,7 @@ export default function Dashboard() {
         {/* Sidebar Navigation */}
         <aside style={{ width: '260px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
           <button
+            id="tab-chat-btn"
             onClick={() => setActiveTab('chat')}
             style={{
               display: 'flex',
@@ -842,6 +870,7 @@ export default function Dashboard() {
           </button>
 
           <button
+            id="tab-bookings-btn"
             onClick={() => setActiveTab('bookings')}
             style={{
               display: 'flex',
@@ -876,6 +905,7 @@ export default function Dashboard() {
           </button>
 
           <button
+            id="tab-voice-btn"
             onClick={() => setActiveTab('voice')}
             style={{
               display: 'flex',
@@ -897,6 +927,7 @@ export default function Dashboard() {
           </button>
 
           <button
+            id="tab-knowledge-btn"
             onClick={() => setActiveTab('knowledge')}
             style={{
               display: 'flex',
@@ -931,6 +962,7 @@ export default function Dashboard() {
           </button>
 
           <button
+            id="tab-settings-btn"
             onClick={() => setActiveTab('settings')}
             style={{
               display: 'flex',
@@ -1326,6 +1358,7 @@ export default function Dashboard() {
                 </button>
 
                 <input
+                  id="chat-input-text"
                   type="text"
                   value={inputMessage}
                   onChange={e => setInputMessage(e.target.value)}
@@ -1346,6 +1379,7 @@ export default function Dashboard() {
                 />
 
                 <button
+                  id="chat-send-btn"
                   type="button"
                   onClick={() => handleSendMessage()}
                   disabled={isStreaming || !inputMessage.trim()}
@@ -1509,6 +1543,7 @@ export default function Dashboard() {
 
                 <div style={{ display: 'flex', gap: '10px' }}>
                   <button
+                    id="start-voice-session-btn"
                     onClick={handleStartVoiceSession}
                     style={{
                       background: 'rgba(255, 255, 255, 0.08)',
@@ -1528,6 +1563,7 @@ export default function Dashboard() {
                   </button>
 
                   <button
+                    id="voice-barge-in-btn"
                     onClick={handleBargeInInterrupt}
                     disabled={!voiceSessionId}
                     style={{
@@ -1573,7 +1609,7 @@ export default function Dashboard() {
 
                   <div>
                     <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)', display: 'block' }}>رقم الدور (Turn Epoch)</span>
-                    <span style={{ fontWeight: 700, fontSize: '0.85rem', color: '#10b981' }}>
+                    <span id="voice-turn-id-display" style={{ fontWeight: 700, fontSize: '0.85rem', color: '#10b981' }}>
                       #{voiceTurnId}
                     </span>
                   </div>
@@ -1581,7 +1617,7 @@ export default function Dashboard() {
 
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                   {isVoiceSpeaking && (
-                    <span style={{
+                    <span id="voice-speaking-indicator" style={{
                       background: 'rgba(16, 185, 129, 0.2)',
                       border: '1px solid #10b981',
                       color: '#10b981',
@@ -1599,7 +1635,7 @@ export default function Dashboard() {
                   )}
 
                   {isVoiceProcessing && (
-                    <span style={{
+                    <span id="voice-processing-indicator" style={{
                       background: 'rgba(245, 158, 11, 0.2)',
                       border: '1px solid #f59e0b',
                       color: '#f59e0b',
@@ -1613,7 +1649,7 @@ export default function Dashboard() {
                   )}
 
                   {voiceInterrupted && (
-                    <span style={{
+                    <span id="voice-interrupted-indicator" style={{
                       background: 'rgba(239, 68, 68, 0.2)',
                       border: '1px solid #ef4444',
                       color: '#ef4444',
@@ -1670,6 +1706,7 @@ export default function Dashboard() {
                 gap: '12px'
               }}>
                 <input
+                  id="voice-input-text"
                   type="text"
                   placeholder="اكتب رسالة صوتية أو استفسار باللهجة المصرية..."
                   value={voiceText}
@@ -1688,6 +1725,7 @@ export default function Dashboard() {
                   }}
                 />
                 <button
+                  id="send-voice-turn-btn"
                   onClick={() => handleSendVoiceTurn()}
                   disabled={isVoiceProcessing || !voiceText.trim()}
                   style={{
@@ -2005,6 +2043,7 @@ export default function Dashboard() {
                     اسم الوكيل
                   </label>
                   <input
+                    id="agent-name-input"
                     type="text"
                     value={agentForm.name || ''}
                     onChange={e => setAgentForm({ ...agentForm, name: e.target.value })}
@@ -2123,6 +2162,7 @@ export default function Dashboard() {
                 </div>
 
                 <button
+                  id="save-settings-btn"
                   type="submit"
                   style={{
                     background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
