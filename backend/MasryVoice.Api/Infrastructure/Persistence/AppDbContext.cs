@@ -110,6 +110,11 @@ public class AppDbContext : DbContext
              .HasForeignKey(bk => bk.SlotId)
              .OnDelete(DeleteBehavior.Restrict);
 
+            b.HasOne<Conversation>()
+             .WithMany()
+             .HasForeignKey(bk => bk.ConversationId)
+             .OnDelete(DeleteBehavior.SetNull);
+
             // Unique index on IdempotencyKey to prevent duplicate booking creation
             b.HasIndex(bk => bk.IdempotencyKey).IsUnique();
             // Fast order-by-descending seek for recent bookings

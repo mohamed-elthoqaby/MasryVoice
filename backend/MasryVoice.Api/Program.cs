@@ -95,7 +95,7 @@ builder.Services.AddRateLimiter(options =>
     options.AddPolicy("api", httpContext =>
     {
         var config = httpContext.RequestServices.GetRequiredService<IConfiguration>();
-        int apiPermits = config.GetValue<int>("RateLimiting:ApiPermitLimit", 60);
+        int apiPermits = config.GetValue<int>("RateLimiting:ApiPermitLimit", builder.Environment.IsProduction() ? 60 : 300);
         var clientIp = (builder.Environment.IsEnvironment("Testing") ? httpContext.Request.Headers["X-Test-Client-Id"].FirstOrDefault() : null)
             ?? httpContext.Connection.RemoteIpAddress?.ToString()
             ?? "unknown-client";
@@ -507,18 +507,8 @@ app.MapGet("/api/bookings/{id:guid}", async (Guid id, HttpContext ctx, AppDbCont
     var booking = await db.Bookings.AsNoTracking().Include(b => b.Slot).FirstOrDefaultAsync(b => b.Id == id);
     if (booking == null) return Results.NotFound();
 
-    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
-    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
-
-    bool isAdmin = security.ValidateAdminKey(authHeader);
-    bool isCustomer = false;
     // Strict ownership: Access is bound to the owning conversation, not a caller-supplied phone number
-    if (!isAdmin && !string.IsNullOrEmpty(customerToken) && booking.ConversationId.HasValue)
-    {
-        isCustomer = security.ValidateCustomerAccess(customerToken, booking.ConversationId.Value);
-    }
-
-    if (!isAdmin && !isCustomer)
+    if (!booking.ConversationId.HasValue || !security.HasAccessToConversation(ctx, booking.ConversationId.Value))
     {
         return Results.StatusCode(StatusCodes.Status403Forbidden);
     }
@@ -539,47 +529,90 @@ app.MapGet("/api/bookings/{id:guid}", async (Guid id, HttpContext ctx, AppDbCont
     });
 }).RequireRateLimiting("api");
 
+// Test Fixtures Cleanup Endpoint (Admin Protected: for safely scoped acceptance test fixture cleanup)
+app.MapDelete("/api/admin/fixtures", async (
+    HttpContext ctx,
+    AppDbContext db,
+    ISecurityService security,
+    Microsoft.Extensions.Caching.Memory.IMemoryCache cache,
+    [Microsoft.AspNetCore.Mvc.FromQuery] string? conversationIds,
+    CancellationToken ct) =>
+{
+    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
+    if (!security.ValidateAdminKey(authHeader))
+    {
+        return Results.Unauthorized();
+    }
+
+    if (string.IsNullOrWhiteSpace(conversationIds))
+    {
+        return Results.BadRequest(new { message = "conversationIds parameter is required" });
+    }
+
+    var guids = conversationIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(s => Guid.TryParse(s, out var g) ? g : Guid.Empty)
+        .Where(g => g != Guid.Empty)
+        .ToList();
+
+    if (guids.Count == 0)
+    {
+        return Results.BadRequest(new { message = "No valid GUIDs provided" });
+    }
+
+    var pendingBookings = await db.PendingBookings.Where(pb => guids.Contains(pb.ConversationId)).ToListAsync(ct);
+    var slotIds = pendingBookings.Select(pb => pb.SlotId).Distinct().ToList();
+
+    var bookings = await db.Bookings.Where(b => b.ConversationId != null && guids.Contains(b.ConversationId.Value)).ToListAsync(ct);
+    foreach (var b in bookings)
+    {
+        if (!slotIds.Contains(b.SlotId)) slotIds.Add(b.SlotId);
+    }
+
+    db.Bookings.RemoveRange(bookings);
+    db.PendingBookings.RemoveRange(pendingBookings);
+
+    var conversations = await db.Conversations.Where(c => guids.Contains(c.Id)).ToListAsync(ct);
+    db.Conversations.RemoveRange(conversations);
+
+    await db.SaveChangesAsync(ct);
+
+    foreach (var slotId in slotIds)
+    {
+        var activeCount = await db.Bookings.CountAsync(b => b.SlotId == slotId && b.Status == "Confirmed", ct);
+        var slot = await db.AvailabilitySlots.FirstOrDefaultAsync(s => s.Id == slotId, ct);
+        if (slot != null)
+        {
+            slot.BookedCapacity = activeCount;
+        }
+    }
+    await db.SaveChangesAsync(ct);
+    cache.Remove("slots_all");
+
+    return Results.Ok(new { success = true, cleanedConversations = guids.Count, cleanedBookings = bookings.Count });
+}).RequireRateLimiting("api");
+
+
 // Pending Bookings Endpoint (Protected: Admin or Verified Owning Customer)
 app.MapGet("/api/bookings/pending", async (HttpContext ctx, AppDbContext db, ISecurityService security, Guid? conversationId) =>
 {
-    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
-    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
-
-    bool isAdmin = security.ValidateAdminKey(authHeader);
-    bool isCustomer = false;
-
-    if (conversationId.HasValue && conversationId.Value != Guid.Empty)
+    if (!conversationId.HasValue || conversationId.Value == Guid.Empty)
     {
-        bool exists = await db.PendingBookings.AnyAsync(pb => pb.ConversationId == conversationId.Value) ||
-                      await db.Conversations.AnyAsync(c => c.Id == conversationId.Value);
-
-        if (exists)
-        {
-            if (!string.IsNullOrEmpty(customerToken))
-            {
-                isCustomer = security.ValidateCustomerAccess(customerToken, conversationId.Value);
-            }
-            if (!isAdmin && !isCustomer)
-            {
-                return Results.StatusCode(StatusCodes.Status403Forbidden);
-            }
-        }
-        else if (!isAdmin && string.IsNullOrEmpty(customerToken))
+        var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
+        if (!security.ValidateAdminKey(authHeader))
         {
             return Results.StatusCode(StatusCodes.Status403Forbidden);
         }
     }
-    else if (!isAdmin)
+    else
     {
-        return Results.StatusCode(StatusCodes.Status403Forbidden);
+        if (!security.HasAccessToConversation(ctx, conversationId.Value))
+        {
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+        }
     }
 
     var query = db.PendingBookings.AsNoTracking().Include(pb => pb.Slot).AsQueryable();
-    if (!isAdmin)
-    {
-        query = query.Where(pb => pb.ConversationId == conversationId!.Value);
-    }
-    else if (conversationId.HasValue && conversationId.Value != Guid.Empty)
+    if (conversationId.HasValue && conversationId.Value != Guid.Empty)
     {
         query = query.Where(pb => pb.ConversationId == conversationId.Value);
     }
@@ -599,6 +632,31 @@ app.MapGet("/api/bookings/pending", async (HttpContext ctx, AppDbContext db, ISe
     }));
 }).RequireRateLimiting("api");
 
+// Server Session Generation Endpoint (Protected: Server-minted conversation session)
+app.MapPost("/api/sessions", async (AppDbContext db, ISecurityService security, CancellationToken ct) =>
+{
+    var convId = Guid.NewGuid();
+    var agent = await db.Agents.FirstOrDefaultAsync(ct);
+    var conv = new Conversation
+    {
+        Id = convId,
+        AgentId = agent?.Id ?? Guid.Parse("11111111-1111-1111-1111-111111111111"),
+        Channel = "web",
+        Status = "Active",
+        StartedAtUtc = DateTime.UtcNow,
+        LastActiveAtUtc = DateTime.UtcNow
+    };
+    db.Conversations.Add(conv);
+    await db.SaveChangesAsync(ct);
+
+    var token = security.GenerateCustomerToken(convId, null);
+    return Results.Ok(new
+    {
+        conversationId = convId,
+        customerToken = token
+    });
+}).RequireRateLimiting("api");
+
 // Stage Pending Booking Draft Endpoint (Protected: Verified Owning Customer or Admin)
 app.MapPost("/api/bookings/stage", async (
     HttpContext ctx,
@@ -607,31 +665,26 @@ app.MapPost("/api/bookings/stage", async (
     [Microsoft.AspNetCore.Mvc.FromBody] StageBookingRequest req,
     CancellationToken ct) =>
 {
-    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
-    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
-
-    bool isAdmin = security.ValidateAdminKey(authHeader);
-    bool convExists = req.ConversationId != Guid.Empty && await db.Conversations.AnyAsync(c => c.Id == req.ConversationId, ct);
-
-    if (convExists)
-    {
-        bool isCustomer = !isAdmin && security.ValidateCustomerAccess(customerToken, req.ConversationId);
-        if (!isAdmin && !isCustomer)
-        {
-            return Results.StatusCode(StatusCodes.Status403Forbidden);
-        }
-    }
-    else if (!isAdmin && !string.IsNullOrEmpty(customerToken) && req.ConversationId != Guid.Empty)
-    {
-        if (!security.ValidateCustomerAccess(customerToken, req.ConversationId))
-        {
-            return Results.StatusCode(StatusCodes.Status403Forbidden);
-        }
-    }
-
     if (string.IsNullOrWhiteSpace(req.CustomerName) || string.IsNullOrWhiteSpace(req.CustomerPhone))
     {
         return Results.BadRequest(new { success = false, message = "CustomerName and CustomerPhone are required." });
+    }
+
+    if (req.ConversationId == Guid.Empty)
+    {
+        return Results.BadRequest(new { success = false, message = "ConversationId is required." });
+    }
+
+    // Must be an existing conversation owned by the caller (or admin)
+    var convExists = await db.Conversations.AnyAsync(c => c.Id == req.ConversationId, ct);
+    if (!convExists)
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
+    if (!security.HasAccessToConversation(ctx, req.ConversationId))
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
     }
 
     AvailabilitySlot? slot = null;
@@ -661,25 +714,6 @@ app.MapPost("/api/bookings/stage", async (
     var requestHash = PendingBooking.ComputeRequestHash(slot.Id, req.CustomerPhone, req.CustomerName, serviceName);
 
     var convId = req.ConversationId;
-    var conv = await db.Conversations.FirstOrDefaultAsync(c => c.Id == convId, ct);
-    if (conv == null)
-    {
-        var agent = await db.Agents.FirstOrDefaultAsync(ct);
-        conv = new Conversation
-        {
-            Id = convId,
-            AgentId = agent?.Id ?? Guid.Parse("11111111-1111-1111-1111-111111111111"),
-            CustomerName = req.CustomerName,
-            CustomerPhoneNumber = req.CustomerPhone,
-            Channel = "web",
-            Status = "Active",
-            StartedAtUtc = DateTime.UtcNow,
-            LastActiveAtUtc = DateTime.UtcNow
-        };
-        db.Conversations.Add(conv);
-        await db.SaveChangesAsync(ct);
-    }
-
     var idempotencyKey = $"idemp_{convId:N}_{slot.Id:N}_{req.CustomerPhone}";
     var pending = await db.PendingBookings.FirstOrDefaultAsync(pb => pb.ConversationId == convId, ct);
     if (pending != null)
@@ -715,7 +749,8 @@ app.MapPost("/api/bookings/stage", async (
 
     await db.SaveChangesAsync(ct);
 
-    var issuedToken = customerToken ?? security.GenerateCustomerToken(convId, req.CustomerPhone);
+    // Staging must NOT provide an alternative anonymous token-minting path.
+    var existingCustomerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
 
     return Results.Ok(new
     {
@@ -729,7 +764,7 @@ app.MapPost("/api/bookings/stage", async (
         requestHash = pending.RequestHash,
         cairoTime = CairoTimeHelper.FormatCairoFriendly(slot.StartTimeUtc),
         status = pending.Status,
-        customerToken = issuedToken
+        customerToken = existingCustomerToken
     });
 }).RequireRateLimiting("api");
 
@@ -743,19 +778,16 @@ app.MapPost("/api/bookings/confirm", async (
     [Microsoft.AspNetCore.Mvc.FromBody] ConfirmBookingRequest req,
     CancellationToken ct) =>
 {
-    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
-    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
-
-    bool isAdmin = security.ValidateAdminKey(authHeader);
-
     var pending = await db.PendingBookings.AsNoTracking().FirstOrDefaultAsync(pb => pb.Id == req.PendingBookingId, ct);
-    if (pending != null)
+    if (pending == null)
     {
-        bool isCustomer = !string.IsNullOrEmpty(customerToken) && security.ValidateCustomerAccess(customerToken, pending.ConversationId);
-        if (!isAdmin && !isCustomer && !string.IsNullOrEmpty(customerToken))
-        {
-            return Results.StatusCode(StatusCodes.Status403Forbidden);
-        }
+        return Results.NotFound(new { success = false, message = "طلب الحجز المعلق غير موجود في النظام." });
+    }
+
+    // Require a validated owner or authorized admin before confirmation or credential issuance
+    if (!security.HasAccessToConversation(ctx, pending.ConversationId) || req.ConversationId != pending.ConversationId)
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
     }
 
     var result = await confirmationService.ConfirmPendingBookingAsync(
@@ -769,9 +801,9 @@ app.MapPost("/api/bookings/confirm", async (
         return Results.BadRequest(result);
     }
 
-    // Generate signed customer token for future verified access
+    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
     string? issuedToken = customerToken;
-    if (result.Data != null)
+    if (string.IsNullOrEmpty(issuedToken) && result.Data != null)
     {
         var phone = ((dynamic)result.Data).customerPhone as string;
         issuedToken = security.GenerateCustomerToken(req.ConversationId, phone);
@@ -798,13 +830,7 @@ app.MapPost("/api/bookings/confirm", async (
 // Conversation History & Tool Execution Logs (Protected: Admin or Customer)
 app.MapGet("/api/conversations/{id:guid}", async (Guid id, HttpContext ctx, AppDbContext db, ISecurityService security) =>
 {
-    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
-    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
-
-    bool isAdmin = security.ValidateAdminKey(authHeader);
-    bool isCustomer = security.ValidateCustomerAccess(customerToken, id);
-
-    if (!isAdmin && !isCustomer)
+    if (!security.HasAccessToConversation(ctx, id))
     {
         return Results.StatusCode(StatusCodes.Status403Forbidden);
     }
@@ -863,32 +889,51 @@ app.MapPost("/api/chat/stream", async (
     CancellationToken ct) =>
 {
     var authHeader = httpContext.Request.Headers["Authorization"].FirstOrDefault() ?? httpContext.Request.Headers["X-Admin-Key"].FirstOrDefault();
-    var providedToken = httpContext.Request.Headers["X-Customer-Token"].FirstOrDefault();
     bool isAdmin = security.ValidateAdminKey(authHeader);
 
     Guid convId;
     string customerToken;
-    bool convExists = request.ConversationId != Guid.Empty && await db.Conversations.AnyAsync(c => c.Id == request.ConversationId, ct);
 
-    if (convExists)
+    if (!request.ConversationId.HasValue || request.ConversationId.Value == Guid.Empty)
     {
-        // Continuing existing conversation: verify resource ownership! Never issue credential merely because caller supplies its ID
-        bool isCustomer = !isAdmin && security.ValidateCustomerAccess(providedToken, request.ConversationId);
-        if (!isAdmin && !isCustomer)
+        // Start new anonymous customer session: server generates identifier and scoped credential
+        convId = Guid.NewGuid();
+        var agent = await db.Agents.FirstOrDefaultAsync(ct);
+        db.Conversations.Add(new Conversation
+        {
+            Id = convId,
+            AgentId = agent?.Id ?? Guid.Parse("11111111-1111-1111-1111-111111111111"),
+            Channel = "web",
+            Status = "Active",
+            StartedAtUtc = DateTime.UtcNow,
+            LastActiveAtUtc = DateTime.UtcNow
+        });
+        await db.SaveChangesAsync(ct);
+        customerToken = security.GenerateCustomerToken(convId, null);
+    }
+    else
+    {
+        var conv = await db.Conversations.FirstOrDefaultAsync(c => c.Id == request.ConversationId.Value, ct);
+        if (conv == null)
+        {
+            // Reject unauthorized supplied identifiers
+            httpContext.Response.StatusCode = StatusCodes.Status403Forbidden;
+            httpContext.Response.ContentType = "application/json";
+            await httpContext.Response.WriteAsJsonAsync(new { message = "المعرف المقدم غير مصرح به." }, ct);
+            return;
+        }
+
+        if (!security.HasAccessToConversation(httpContext, request.ConversationId.Value))
         {
             httpContext.Response.StatusCode = StatusCodes.Status403Forbidden;
             httpContext.Response.ContentType = "application/json";
             await httpContext.Response.WriteAsJsonAsync(new { message = "غير مصرح بالوصول إلى هذه المحادثة." }, ct);
             return;
         }
-        convId = request.ConversationId;
-        customerToken = providedToken!;
-    }
-    else
-    {
-        // Start new anonymous customer session: server generates identifier and scoped credential
-        convId = request.ConversationId == Guid.Empty ? Guid.NewGuid() : request.ConversationId;
-        customerToken = security.GenerateCustomerToken(convId, null);
+
+        convId = request.ConversationId.Value;
+        customerToken = httpContext.Request.Headers["X-Customer-Token"].FirstOrDefault()
+            ?? (isAdmin ? security.GenerateCustomerToken(convId, null) : string.Empty);
     }
 
     httpContext.Response.Headers.ContentType = "text/event-stream";
@@ -979,21 +1024,10 @@ app.MapPost("/api/voice/session", async (
 
     Guid convId;
     string customerTokenToReturn;
-    bool convExists = req.ConversationId != Guid.Empty && await db.Conversations.AnyAsync(c => c.Id == req.ConversationId);
 
-    if (convExists)
+    if (!req.ConversationId.HasValue || req.ConversationId.Value == Guid.Empty)
     {
-        bool isCustomer = !isAdmin && security.ValidateCustomerAccess(customerToken, req.ConversationId);
-        if (!isAdmin && !isCustomer)
-        {
-            return Results.StatusCode(StatusCodes.Status403Forbidden);
-        }
-        convId = req.ConversationId;
-        customerTokenToReturn = customerToken!;
-    }
-    else
-    {
-        convId = req.ConversationId == Guid.Empty ? Guid.NewGuid() : req.ConversationId;
+        convId = Guid.NewGuid();
         customerTokenToReturn = security.GenerateCustomerToken(convId, null);
 
         var agent = await db.Agents.FirstOrDefaultAsync();
@@ -1007,6 +1041,23 @@ app.MapPost("/api/voice/session", async (
             LastActiveAtUtc = DateTime.UtcNow
         });
         await db.SaveChangesAsync();
+    }
+    else
+    {
+        var conv = await db.Conversations.FirstOrDefaultAsync(c => c.Id == req.ConversationId.Value);
+        if (conv == null)
+        {
+            // Reject unauthorized supplied identifiers
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+        }
+
+        if (!security.HasAccessToConversation(ctx, req.ConversationId.Value))
+        {
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+        }
+
+        convId = req.ConversationId.Value;
+        customerTokenToReturn = customerToken ?? (isAdmin ? security.GenerateCustomerToken(convId, null) : string.Empty);
     }
 
     var sessionId = Guid.NewGuid();
@@ -1026,12 +1077,7 @@ app.MapPost("/api/voice/interrupt", (
         return Results.NotFound(new { message = "الجلسة الصوتية غير موجودة." });
     }
 
-    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
-    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
-    bool isAdmin = security.ValidateAdminKey(authHeader);
-    bool isCustomer = !isAdmin && security.ValidateCustomerAccess(customerToken, session.ConversationId);
-
-    if (!isAdmin && !isCustomer)
+    if (!security.HasAccessToConversation(ctx, session.ConversationId))
     {
         return Results.StatusCode(StatusCodes.Status403Forbidden);
     }
@@ -1070,17 +1116,25 @@ app.MapPost("/api/voice/turn", async (
     [Microsoft.AspNetCore.Mvc.FromBody] VoiceTurnRequest req,
     CancellationToken ct) =>
 {
-    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
-    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
-    bool isAdmin = security.ValidateAdminKey(authHeader);
-    bool isCustomer = !isAdmin && security.ValidateCustomerAccess(customerToken, req.ConversationId);
+    // Must resolve an existing session (Do not use GetOrCreateSession for control operations)
+    var session = sessionMgr.GetSession(req.SessionId);
+    if (session == null)
+    {
+        return Results.NotFound(new { message = "الجلسة الصوتية غير موجودة." });
+    }
 
-    if (!isAdmin && !isCustomer)
+    // Reject mismatched request ConversationId
+    if (req.ConversationId != session.ConversationId)
     {
         return Results.StatusCode(StatusCodes.Status403Forbidden);
     }
 
-    var session = sessionMgr.GetOrCreateSession(req.SessionId, req.ConversationId);
+    // Authorize its stored owning conversation
+    if (!security.HasAccessToConversation(ctx, session.ConversationId))
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
     using var turnContext = session.StartNewTurn();
 
     var assistantText = new System.Text.StringBuilder();
@@ -1132,8 +1186,8 @@ app.Run();
 // ----------------------------------------------------
 public record ChatStreamRequest(
     Guid AgentId,
-    Guid ConversationId,
-    string Message
+    Guid? ConversationId = null,
+    string Message = ""
 );
 
 public record AgentUpdateRequest(
@@ -1169,7 +1223,7 @@ public record IngestDocumentRequest(
 );
 
 public record VoiceSessionRequest(
-    Guid ConversationId
+    Guid? ConversationId = null
 );
 
 public record VoiceInterruptRequest(

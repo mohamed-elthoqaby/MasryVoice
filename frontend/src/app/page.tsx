@@ -123,7 +123,11 @@ export default function Dashboard() {
   ]);
   const [inputMessage, setInputMessage] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
-  const [conversationId, setConversationId] = useState<string>(() => createUUID());
+  const [conversationId, setConversationId] = useState<string>('');
+  const [customerToken, setCustomerToken] = useState<string>('');
+  const [adminKey, setAdminKey] = useState<string>('');
+  const [adminKeyInput, setAdminKeyInput] = useState<string>('');
+  const [showAdminModal, setShowAdminModal] = useState<boolean>(false);
   const [isRecording, setIsRecording] = useState(false);
   const [toolLogs, setToolLogs] = useState<any[]>([]);
   const [pendingCard, setPendingCard] = useState<PendingBookingCard | null>(null);
@@ -167,16 +171,59 @@ export default function Dashboard() {
     scrollToBottom();
   }, [messages]);
 
+  // Load persisted session and admin keys from browser sessionStorage on mount
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const savedAdmin = sessionStorage.getItem('masryvoice_admin_key');
+      if (savedAdmin) {
+        setAdminKey(savedAdmin);
+        setAdminKeyInput(savedAdmin);
+      }
+      const savedConv = sessionStorage.getItem('masryvoice_conversation_id');
+      const savedToken = sessionStorage.getItem('masryvoice_customer_token');
+      if (savedConv) setConversationId(savedConv);
+      if (savedToken) setCustomerToken(savedToken);
+    }
+  }, []);
+
+  const updateSessionCredentials = (newConvId?: string, newToken?: string) => {
+    if (newConvId) {
+      setConversationId(newConvId);
+      if (typeof window !== 'undefined') sessionStorage.setItem('masryvoice_conversation_id', newConvId);
+    }
+    if (newToken) {
+      setCustomerToken(newToken);
+      if (typeof window !== 'undefined') sessionStorage.setItem('masryvoice_customer_token', newToken);
+    }
+  };
+
+  const handleAdminLogin = (keyToSave: string) => {
+    const trimmed = keyToSave.trim();
+    setAdminKey(trimmed);
+    if (typeof window !== 'undefined') {
+      if (trimmed) sessionStorage.setItem('masryvoice_admin_key', trimmed);
+      else sessionStorage.removeItem('masryvoice_admin_key');
+    }
+    setShowAdminModal(false);
+    fetchState(trimmed);
+  };
+
   // Fetch initial system state
-  const fetchState = async () => {
+  const fetchState = async (overrideAdminKey?: string) => {
+    const keyToUse = overrideAdminKey !== undefined ? overrideAdminKey : adminKey;
     try {
       setLoadingData(true);
+      const adminHeaders: Record<string, string> = {};
+      if (keyToUse) {
+        adminHeaders['X-Admin-Key'] = keyToUse;
+      }
+
       const [healthRes, agentsRes, bookingsRes, slotsRes, docsRes] = await Promise.all([
         fetch('/api/health').then(r => r.json()).catch(() => null),
         fetch('/api/agents').then(r => r.json()).catch(() => []),
-        fetch('/api/bookings', { headers: { 'X-Admin-Key': 'masryvoice_admin_secret_2026' } }).then(r => r.json()).catch(() => []),
+        fetch('/api/bookings', { headers: adminHeaders }).then(r => r.json()).catch(() => []),
         fetch('/api/slots').then(r => r.json()).catch(() => []),
-        fetch('/api/knowledge/documents', { headers: { 'X-Admin-Key': 'masryvoice_admin_secret_2026' } }).then(r => r.json()).catch(() => [])
+        fetch('/api/knowledge/documents', { headers: adminHeaders }).then(r => r.json()).catch(() => [])
       ]);
 
       if (healthRes) setHealth(healthRes);
@@ -185,9 +232,9 @@ export default function Dashboard() {
         setSelectedAgent(agentsRes[0]);
         setAgentForm(agentsRes[0]);
       }
-      if (bookingsRes) setBookings(bookingsRes);
+      if (bookingsRes && Array.isArray(bookingsRes)) setBookings(bookingsRes);
       if (slotsRes) setSlots(slotsRes);
-      if (docsRes) setKnowledgeDocs(docsRes);
+      if (docsRes && Array.isArray(docsRes)) setKnowledgeDocs(docsRes);
     } catch (err) {
       console.error('Error fetching state:', err);
     } finally {
@@ -197,9 +244,9 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchState();
-    const interval = setInterval(fetchState, 15000);
+    const interval = setInterval(() => fetchState(), 15000);
     return () => clearInterval(interval);
-  }, []);
+  }, [adminKey]);
 
   // Send message with SSE streaming
   const handleSendMessage = async (textToSend?: string) => {
@@ -216,12 +263,17 @@ export default function Dashboard() {
     setMessages(prev => [...prev, { role: 'assistant', content: '', time: 'جاري الكتابة...' }]);
 
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (customerToken) {
+        headers['X-Customer-Token'] = customerToken;
+      }
+
       const response = await fetch('/api/chat/stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           agentId: selectedAgent.id,
-          conversationId,
+          conversationId: conversationId || null,
           message: text
         })
       });
@@ -247,7 +299,9 @@ export default function Dashboard() {
 
             try {
               const data = JSON.parse(dataStr);
-              if (data.type === 'token') {
+              if (data.type === 'session') {
+                updateSessionCredentials(data.conversationId, data.customerToken);
+              } else if (data.type === 'token') {
                 assistantText += data.content;
                 setMessages(prev => {
                   const updated = [...prev];
@@ -272,9 +326,10 @@ export default function Dashboard() {
                 // If StageBooking created a pending booking, display the explicit confirmation card
                 if (data.content === 'StageBooking' && data.metadata?.Success && data.metadata?.Data?.pendingBookingId) {
                   const d = data.metadata.Data;
+                  if (d.customerToken) updateSessionCredentials(d.conversationId, d.customerToken);
                   setPendingCard({
                     id: d.pendingBookingId,
-                    conversationId,
+                    conversationId: d.conversationId || conversationId,
                     customerName: d.customerName,
                     customerPhone: d.customerPhone,
                     serviceName: d.service,
@@ -285,8 +340,7 @@ export default function Dashboard() {
                 }
 
                 // Refresh bookings and slots after tool execution
-                fetch('/api/bookings').then(r => r.json()).then(setBookings).catch(() => {});
-                fetch('/api/slots').then(r => r.json()).then(setSlots).catch(() => {});
+                fetchState();
               }
             } catch (e) {
               console.error('Error parsing SSE data:', e);
@@ -309,17 +363,23 @@ export default function Dashboard() {
     if (!pendingCard || isConfirming || pendingCard.status !== 'Pending') return;
     setIsConfirming(true);
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (customerToken) {
+        headers['X-Customer-Token'] = customerToken;
+      }
+
       const res = await fetch('/api/bookings/confirm', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
-          conversationId,
+          conversationId: pendingCard.conversationId || conversationId,
           pendingBookingId: pendingCard.id,
           expectedRequestHash: pendingCard.requestHash
         })
       });
       const data = await res.json();
       if (res.ok && data.Success) {
+        if (data.customerToken) updateSessionCredentials(conversationId, data.customerToken);
         setPendingCard(prev => prev ? {
           ...prev,
           status: 'Confirmed',
@@ -333,8 +393,7 @@ export default function Dashboard() {
             time: new Date().toLocaleTimeString('ar-EG')
           }
         ]);
-        fetch('/api/bookings').then(r => r.json()).then(setBookings).catch(() => {});
-        fetch('/api/slots').then(r => r.json()).then(setSlots).catch(() => {});
+        fetchState();
       } else {
         const err = data.Message || 'تعذر تأكيد الحجز';
         setPendingCard(prev => prev ? {
@@ -368,13 +427,17 @@ export default function Dashboard() {
   const handleIngestDoc = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newDocTitle.trim() || !newDocContent.trim()) return;
+    if (!adminKey) {
+      setShowAdminModal(true);
+      return;
+    }
     setIsIngesting(true);
     try {
       const res = await fetch('/api/knowledge/ingest', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Admin-Key': 'masryvoice_admin_secret_2026'
+          'X-Admin-Key': adminKey
         },
         body: JSON.stringify({
           title: newDocTitle,
@@ -387,6 +450,9 @@ export default function Dashboard() {
         setNewDocTitle('');
         setNewDocContent('');
         fetchState();
+      } else if (res.status === 401) {
+        alert('مفتاح الإدارة غير صحيح أو غير مصرح به');
+        setShowAdminModal(true);
       }
     } catch (err) {
       console.error(err);
@@ -416,14 +482,17 @@ export default function Dashboard() {
   // Voice Session & Barge-in handlers
   const handleStartVoiceSession = async () => {
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (customerToken) headers['X-Customer-Token'] = customerToken;
       const res = await fetch('/api/voice/session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ conversationId })
+        headers,
+        body: JSON.stringify({ conversationId: conversationId || null })
       });
       if (res.ok) {
         const data = await res.json();
         setVoiceSessionId(data.sessionId);
+        updateSessionCredentials(data.conversationId, data.customerToken);
         setVoiceInterrupted(false);
       }
     } catch (err) {
@@ -440,9 +509,11 @@ export default function Dashboard() {
       }
       setIsVoiceSpeaking(false);
       setVoiceInterrupted(true);
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (customerToken) headers['X-Customer-Token'] = customerToken;
       await fetch('/api/voice/interrupt', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ sessionId: voiceSessionId })
       });
     } catch (err) {
@@ -454,26 +525,33 @@ export default function Dashboard() {
     const textToSend = messageText || voiceText;
     if (!textToSend.trim() || !selectedAgent) return;
     let sId = voiceSessionId;
+    let currentConv = conversationId;
     if (!sId) {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (customerToken) headers['X-Customer-Token'] = customerToken;
       const res = await fetch('/api/voice/session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ conversationId })
+        headers,
+        body: JSON.stringify({ conversationId: conversationId || null })
       });
       const data = await res.json();
       sId = data.sessionId;
+      currentConv = data.conversationId;
       setVoiceSessionId(sId);
+      updateSessionCredentials(data.conversationId, data.customerToken);
     }
 
     setIsVoiceProcessing(true);
     setVoiceInterrupted(false);
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (customerToken) headers['X-Customer-Token'] = customerToken;
       const res = await fetch('/api/voice/turn', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           sessionId: sId,
-          conversationId,
+          conversationId: currentConv,
           agentId: selectedAgent.id,
           message: textToSend
         })
@@ -506,10 +584,18 @@ export default function Dashboard() {
     e.preventDefault();
     if (!selectedAgent) return;
 
+    if (!adminKey) {
+      setShowAdminModal(true);
+      return;
+    }
+
     try {
       const res = await fetch('/api/agents', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Key': adminKey
+        },
         body: JSON.stringify({
           ...selectedAgent,
           ...agentForm
@@ -520,6 +606,9 @@ export default function Dashboard() {
         setSaveSuccess(true);
         setTimeout(() => setSaveSuccess(false), 3000);
         fetchState();
+      } else if (res.status === 401) {
+        alert('مفتاح الإدارة غير صحيح أو غير مصرح به');
+        setShowAdminModal(true);
       }
     } catch (err) {
       alert('حدث خطأ أثناء حفظ الإعدادات');
@@ -603,8 +692,129 @@ export default function Dashboard() {
             <Activity size={14} />
             <span>النموذج: <strong>{health?.defaultModel || 'qwen2.5:1.5b'}</strong> ({health?.configuredLlmProvider || 'Ollama'})</span>
           </div>
+
+          {/* Admin Auth Status / Login Action */}
+          <button
+            onClick={() => {
+              setAdminKeyInput(adminKey);
+              setShowAdminModal(true);
+            }}
+            id="admin-auth-btn"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              background: adminKey ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)',
+              border: adminKey ? '1px solid rgba(16, 185, 129, 0.3)' : '1px solid rgba(239, 68, 68, 0.3)',
+              color: adminKey ? '#10b981' : '#f87171',
+              padding: '6px 14px',
+              borderRadius: '20px',
+              fontSize: '0.8rem',
+              cursor: 'pointer',
+              fontWeight: 600
+            }}
+          >
+            <ShieldCheck size={14} />
+            <span>{adminKey ? 'الإدارة: مصرح' : 'تسجيل الإدارة'}</span>
+          </button>
         </div>
       </header>
+
+      {/* Admin Auth Modal */}
+      {showAdminModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.7)',
+          zIndex: 100,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          backdropFilter: 'blur(4px)'
+        }}>
+          <div style={{
+            background: '#1f2937',
+            border: '1px solid var(--border-color)',
+            borderRadius: '16px',
+            padding: '24px',
+            width: '90%',
+            maxWidth: '440px',
+            boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.5)'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <ShieldCheck size={20} color="#10b981" />
+                <h3 style={{ margin: 0, color: '#f9fafb', fontSize: '1.1rem', fontWeight: 600 }}>تسجيل مصادقة الإدارة</h3>
+              </div>
+              <button
+                onClick={() => setShowAdminModal(false)}
+                style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}
+              >
+                <XCircle size={18} />
+              </button>
+            </div>
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '16px', lineHeight: 1.5 }}>
+              يرجى إدخال مفتاح الإدارة السري للوصول إلى سجل الحجوزات وإدارة المعرفة وتعديل إعدادات الوكيل.
+            </p>
+            <input
+              type="password"
+              id="admin-key-modal-input"
+              value={adminKeyInput}
+              onChange={e => setAdminKeyInput(e.target.value)}
+              placeholder="أدخل مفتاح الإدارة (X-Admin-Key)..."
+              style={{
+                width: '100%',
+                padding: '10px 14px',
+                borderRadius: '8px',
+                border: '1px solid var(--border-color)',
+                background: '#111827',
+                color: '#fff',
+                fontSize: '0.9rem',
+                marginBottom: '16px',
+                outline: 'none',
+                boxSizing: 'border-box'
+              }}
+            />
+            <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+              {adminKey && (
+                <button
+                  onClick={() => handleAdminLogin('')}
+                  style={{
+                    padding: '8px 16px',
+                    borderRadius: '8px',
+                    border: '1px solid rgba(239, 68, 68, 0.4)',
+                    background: 'rgba(239, 68, 68, 0.15)',
+                    color: '#f87171',
+                    fontSize: '0.85rem',
+                    cursor: 'pointer'
+                  }}
+                >
+                  تسجيل خروج
+                </button>
+              )}
+              <button
+                onClick={() => handleAdminLogin(adminKeyInput)}
+                id="save-admin-key-btn"
+                style={{
+                  padding: '8px 18px',
+                  borderRadius: '8px',
+                  border: 'none',
+                  background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+                  color: '#fff',
+                  fontSize: '0.85rem',
+                  fontWeight: 600,
+                  cursor: 'pointer'
+                }}
+              >
+                حفظ والمصادقة
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Main Layout */}
       <div style={{ display: 'flex', flex: 1, padding: '24px', gap: '24px' }}>
@@ -1174,7 +1384,7 @@ export default function Dashboard() {
                     الحجوزات المسجلة المؤكدة (قاعدة بيانات ACID)
                   </h3>
                   <button
-                    onClick={fetchState}
+                    onClick={() => fetchState()}
                     style={{
                       background: 'rgba(255, 255, 255, 0.05)',
                       border: '1px solid var(--border-color)',

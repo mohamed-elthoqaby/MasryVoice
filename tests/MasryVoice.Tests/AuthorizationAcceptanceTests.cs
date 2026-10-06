@@ -361,6 +361,12 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
         var convA = Guid.NewGuid();
         var convB = Guid.NewGuid();
 
+        var agent = await db.Agents.FirstAsync();
+        db.Conversations.AddRange(
+            new Conversation { Id = convA, AgentId = agent.Id, Channel = "test", Status = "Active" },
+            new Conversation { Id = convB, AgentId = agent.Id, Channel = "test", Status = "Active" }
+        );
+
         var slot = new AvailabilitySlot
         {
             Id = Guid.NewGuid(),
@@ -468,5 +474,246 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
 
         // 3. Random non-base64 garbage
         Assert.False(security.ValidateCustomerAccess("not-a-valid-token-format", convId));
+    }
+
+    [Fact]
+    public async Task BookingConfirmation_AuthorizationMatrix_EnforcesOwnershipAndLeavesDatabaseUnchanged()
+    {
+        var client = _factory.CreateClient();
+
+        // 1. Create sessions for Owner A and Owner B
+        var (sessA, convA, tokenA) = await CreateSessionAsync(client);
+        var (sessB, convB, tokenB) = await CreateSessionAsync(client);
+
+        // 2. Setup an isolated slot in DB
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var security = scope.ServiceProvider.GetRequiredService<ISecurityService>();
+
+        var slot = new AvailabilitySlot
+        {
+            Id = Guid.NewGuid(),
+            StartTimeUtc = DateTime.UtcNow.AddDays(10),
+            EndTimeUtc = DateTime.UtcNow.AddDays(10).AddMinutes(30),
+            ServiceName = "استشارة طبية للمصفوفة",
+            TotalCapacity = 5,
+            BookedCapacity = 0
+        };
+        db.AvailabilitySlots.Add(slot);
+        await db.SaveChangesAsync();
+
+        // 3. Stage a pending booking for Owner A
+        var clientA = _factory.CreateClient();
+        clientA.DefaultRequestHeaders.Add("X-Customer-Token", tokenA);
+
+        var stageRes = await clientA.PostAsJsonAsync("/api/bookings/stage", new
+        {
+            conversationId = convA,
+            customerName = "مريض أ",
+            customerPhone = "01099998888",
+            slotId = slot.Id,
+            serviceName = slot.ServiceName
+        });
+        Assert.Equal(HttpStatusCode.OK, stageRes.StatusCode);
+        var stageData = await stageRes.Content.ReadFromJsonAsync<JsonElement>();
+        var pendingId = stageData.GetProperty("pendingBookingId").GetGuid();
+        var requestHash = stageData.GetProperty("requestHash").GetString();
+
+        // Helper to verify DB state remains pristine
+        async Task AssertDatabaseUnchangedAsync()
+        {
+            using var checkScope = _factory.Services.CreateScope();
+            var checkDb = checkScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var bookingCount = await checkDb.Bookings.CountAsync(b => b.SlotId == slot.Id);
+            Assert.Equal(0, bookingCount);
+
+            var dbSlot = await checkDb.AvailabilitySlots.FirstAsync(s => s.Id == slot.Id);
+            Assert.Equal(0, dbSlot.BookedCapacity);
+
+            var pending = await checkDb.PendingBookings.FirstAsync(p => p.Id == pendingId);
+            Assert.Equal("Pending", pending.Status);
+
+            var outboxCount = await checkDb.OutboxJobs.CountAsync();
+            Assert.Equal(0, outboxCount);
+        }
+
+        // Generate expired token for Owner A (manually forged with past expiry)
+        var expiredPayload = new
+        {
+            ConversationId = convA,
+            PhoneNumber = "01099998888",
+            ExpiresAtUtc = DateTime.UtcNow.AddHours(-2)
+        };
+        var expiredJsonBytes = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(expiredPayload));
+        var expiredB64 = Convert.ToBase64String(expiredJsonBytes);
+        using var hmac = new System.Security.Cryptography.HMACSHA256(System.Text.Encoding.UTF8.GetBytes(_hmacSecret));
+        var expiredSig = Convert.ToBase64String(hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(expiredB64)));
+        var expiredToken = $"{expiredB64}.{expiredSig}";
+
+        // --- TEST CASE 1: Missing Customer Token ---
+        var clientMissing = _factory.CreateClient();
+        var resMissing = await clientMissing.PostAsJsonAsync("/api/bookings/confirm", new
+        {
+            conversationId = convA,
+            pendingBookingId = pendingId,
+            expectedRequestHash = requestHash
+        });
+        Assert.Equal(HttpStatusCode.Forbidden, resMissing.StatusCode);
+        await AssertDatabaseUnchangedAsync();
+
+        // --- TEST CASE 2: Empty Customer Token ---
+        var clientEmpty = _factory.CreateClient();
+        clientEmpty.DefaultRequestHeaders.Add("X-Customer-Token", "");
+        var resEmpty = await clientEmpty.PostAsJsonAsync("/api/bookings/confirm", new
+        {
+            conversationId = convA,
+            pendingBookingId = pendingId,
+            expectedRequestHash = requestHash
+        });
+        Assert.Equal(HttpStatusCode.Forbidden, resEmpty.StatusCode);
+        await AssertDatabaseUnchangedAsync();
+
+        // --- TEST CASE 3: Malformed Customer Token ---
+        var clientMalformed = _factory.CreateClient();
+        clientMalformed.DefaultRequestHeaders.Add("X-Customer-Token", "not.a.valid.token");
+        var resMalformed = await clientMalformed.PostAsJsonAsync("/api/bookings/confirm", new
+        {
+            conversationId = convA,
+            pendingBookingId = pendingId,
+            expectedRequestHash = requestHash
+        });
+        Assert.Equal(HttpStatusCode.Forbidden, resMalformed.StatusCode);
+        await AssertDatabaseUnchangedAsync();
+
+        // --- TEST CASE 4: Expired Customer Token ---
+        var clientExpired = _factory.CreateClient();
+        clientExpired.DefaultRequestHeaders.Add("X-Customer-Token", expiredToken);
+        var resExpired = await clientExpired.PostAsJsonAsync("/api/bookings/confirm", new
+        {
+            conversationId = convA,
+            pendingBookingId = pendingId,
+            expectedRequestHash = requestHash
+        });
+        Assert.Equal(HttpStatusCode.Forbidden, resExpired.StatusCode);
+        await AssertDatabaseUnchangedAsync();
+
+        // --- TEST CASE 5: Valid Other Owner Token (Token B attempting to confirm Booking A) ---
+        var clientOther = _factory.CreateClient();
+        clientOther.DefaultRequestHeaders.Add("X-Customer-Token", tokenB);
+        var resOther = await clientOther.PostAsJsonAsync("/api/bookings/confirm", new
+        {
+            conversationId = convA,
+            pendingBookingId = pendingId,
+            expectedRequestHash = requestHash
+        });
+        Assert.Equal(HttpStatusCode.Forbidden, resOther.StatusCode);
+        await AssertDatabaseUnchangedAsync();
+
+        // --- TEST CASE 6: Valid Owner Token (Owner A confirms own booking) ---
+        var resValid = await clientA.PostAsJsonAsync("/api/bookings/confirm", new
+        {
+            conversationId = convA,
+            pendingBookingId = pendingId,
+            expectedRequestHash = requestHash
+        });
+        Assert.Equal(HttpStatusCode.OK, resValid.StatusCode);
+
+        // Verify successful state transition after genuine owner confirmation
+        using var finalScope = _factory.Services.CreateScope();
+        var finalDb = finalScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var committedBooking = await finalDb.Bookings.FirstOrDefaultAsync(b => b.SlotId == slot.Id);
+        Assert.NotNull(committedBooking);
+        Assert.Equal(convA, committedBooking.ConversationId);
+
+        var updatedSlot = await finalDb.AvailabilitySlots.FirstAsync(s => s.Id == slot.Id);
+        Assert.Equal(1, updatedSlot.BookedCapacity);
+
+        var updatedPending = await finalDb.PendingBookings.FirstAsync(p => p.Id == pendingId);
+        Assert.Equal("Confirmed", updatedPending.Status);
+    }
+
+    [Fact]
+    public async Task VoiceTurn_SessionCrossTalk_TokenB_ConversationB_SessionA_RejectsAndLeavesSessionAActive()
+    {
+        var client = _factory.CreateClient();
+
+        // 1. Create Session A (Conversation A) and Session B (Conversation B)
+        var (sessA, convA, tokenA) = await CreateSessionAsync(client);
+        var (sessB, convB, tokenB) = await CreateSessionAsync(client);
+
+        using var scope = _factory.Services.CreateScope();
+        var sessionMgr = scope.ServiceProvider.GetRequiredService<MasryVoice.Api.Features.Voice.VoiceSessionManager>();
+        var voiceSessionA = sessionMgr.GetSession(sessA);
+        Assert.NotNull(voiceSessionA);
+
+        // 2. Start an active turn on Session A
+        using var turnA = voiceSessionA.StartNewTurn();
+        Assert.True(voiceSessionA.IsTurnActive(turnA.TurnId));
+        Assert.False(turnA.Token.IsCancellationRequested);
+
+        // 3. Attacker with Token B and Conversation B attempts to invoke /api/voice/turn targeting Session A
+        var attackerClient = _factory.CreateClient();
+        attackerClient.DefaultRequestHeaders.Add("X-Customer-Token", tokenB);
+
+        var crossTalkPayload = new
+        {
+            sessionId = sessA,
+            conversationId = convB,
+            agentId = Guid.NewGuid(),
+            message = "محاولة اختراق جلسة صوتية أ"
+        };
+
+        var crossTalkRes = await attackerClient.PostAsJsonAsync("/api/voice/turn", crossTalkPayload);
+
+        // 4. Server MUST reject with 403 Forbidden due to mismatched conversation / ownership
+        Assert.Equal(HttpStatusCode.Forbidden, crossTalkRes.StatusCode);
+
+        // 5. CRITICAL: Verify Session A's active turn is completely unaffected and still active!
+        Assert.True(voiceSessionA.IsTurnActive(turnA.TurnId));
+        Assert.False(turnA.Token.IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task NewSessions_RequireServerGeneratedIds_StagingCannotMintAnonymousTokens()
+    {
+        var client = _factory.CreateClient();
+
+        // 1. Attempting to stage a booking with an arbitrary, uncreated ConversationId MUST be rejected
+        var fakeConvId = Guid.NewGuid();
+        var unauthenticatedStage = await client.PostAsJsonAsync("/api/bookings/stage", new
+        {
+            conversationId = fakeConvId,
+            customerName = "مهاجم مجهول",
+            customerPhone = "01000000000",
+            serviceName = "كشف عام"
+        });
+
+        // Must reject: Staging does not create conversations or mint unearned tokens
+        Assert.Equal(HttpStatusCode.Forbidden, unauthenticatedStage.StatusCode);
+
+        // 2. Proper session creation via /api/sessions issues server-generated identifier and token
+        var sessionRes = await client.PostAsync("/api/sessions", null);
+        Assert.Equal(HttpStatusCode.OK, sessionRes.StatusCode);
+
+        var sessionData = await sessionRes.Content.ReadFromJsonAsync<JsonElement>();
+        var serverConvId = sessionData.GetProperty("conversationId").GetGuid();
+        var serverToken = sessionData.GetProperty("customerToken").GetString();
+
+        Assert.NotEqual(Guid.Empty, serverConvId);
+        Assert.False(string.IsNullOrWhiteSpace(serverToken));
+
+        // 3. Using the server-issued session allows staging successfully
+        var authorizedClient = _factory.CreateClient();
+        authorizedClient.DefaultRequestHeaders.Add("X-Customer-Token", serverToken);
+
+        var authorizedStage = await authorizedClient.PostAsJsonAsync("/api/bookings/stage", new
+        {
+            conversationId = serverConvId,
+            customerName = "عميل مصرح",
+            customerPhone = "01012345678",
+            serviceName = "كشف عام"
+        });
+
+        Assert.Equal(HttpStatusCode.OK, authorizedStage.StatusCode);
     }
 }

@@ -13,6 +13,7 @@ public interface ISecurityService
     string GenerateCustomerToken(Guid conversationId, string? phoneNumber);
     bool ValidateCustomerAccess(string? token, Guid conversationId, string? phoneNumber = null);
     Guid? GetTokenConversationId(string? token);
+    bool HasAccessToConversation(Microsoft.AspNetCore.Http.HttpContext ctx, Guid conversationId);
 }
 
 public class SecurityService : ISecurityService
@@ -45,8 +46,18 @@ public class SecurityService : ISecurityService
             }
         }
 
-        _adminKey = admin ?? "masryvoice_admin_secret_dev_2026";
-        var secretStr = hmac ?? "masryvoice_customer_hmac_secret_key_dev_2026";
+        if (string.IsNullOrWhiteSpace(admin) || admin.Contains("YOUR_ADMIN", StringComparison.OrdinalIgnoreCase) || admin.Contains("placeholder", StringComparison.OrdinalIgnoreCase))
+        {
+            admin = "masryvoice_admin_secret_dev_2026";
+        }
+
+        if (string.IsNullOrWhiteSpace(hmac) || hmac.Contains("YOUR_HMAC", StringComparison.OrdinalIgnoreCase) || hmac.Contains("placeholder", StringComparison.OrdinalIgnoreCase))
+        {
+            hmac = "masryvoice_customer_hmac_secret_key_dev_2026";
+        }
+
+        _adminKey = admin;
+        var secretStr = hmac;
         _secretKey = Encoding.UTF8.GetBytes(secretStr);
     }
 
@@ -171,6 +182,17 @@ public class SecurityService : ISecurityService
         {
             return false;
         }
+    }
+
+    public bool HasAccessToConversation(Microsoft.AspNetCore.Http.HttpContext ctx, Guid conversationId)
+    {
+        if (conversationId == Guid.Empty) return false;
+
+        var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
+        if (ValidateAdminKey(authHeader)) return true;
+
+        var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
+        return ValidateCustomerAccess(customerToken, conversationId);
     }
 
     private class CustomerTokenPayload

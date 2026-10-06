@@ -142,6 +142,7 @@ jobs:
           Security__AdminKey: "masryvoice_ci_admin_key_2026"
           Security__HmacSecret: "masryvoice_ci_customer_hmac_secret_2026"
           LlmProvider: "DeterministicFake"
+          RateLimiting__ApiPermitLimit: "300"
         run: |
           dotnet run --project backend/MasryVoice.Api/MasryVoice.Api.csproj -c Release --no-build &
           echo "Waiting for API readiness at http://localhost:5000/api/health/ready..."
@@ -165,18 +166,18 @@ jobs:
           echo "Checking liveness at http://localhost:5000/api/health/live..."
           curl -s -f http://localhost:5000/api/health/live | grep -q "Alive"
 
-      - name: Run Postman Acceptance Test Collection
+      - name: Run Postman Acceptance Test Collection (Run 1)
         run: |
           mkdir -p tests/postman/reports
           postman collection run tests/postman/MasryVoice.postman_collection.json \
             -e tests/postman/MasryVoice.postman_environment.json \
             --env-var "adminKey=masryvoice_ci_admin_key_2026" \
             -r cli,json \
-            --reporter-json-export tests/postman/reports/postman-acceptance.json
+            --reporter-json-export tests/postman/reports/postman-acceptance-run1.json
 
-      - name: Validate Postman Acceptance Report
+      - name: Validate Postman Acceptance Report (Run 1)
         run: |
-          REPORT="tests/postman/reports/postman-acceptance.json"
+          REPORT="tests/postman/reports/postman-acceptance-run1.json"
           if [ ! -f "$REPORT" ]; then
             echo "ERROR: Postman acceptance report not found at $REPORT!"
             exit 1
@@ -191,35 +192,73 @@ jobs:
             }
             const executed = summary.tests?.executed || 0;
             const failed = summary.tests?.failed || 0;
-            console.log(`Postman executed assertions: ${executed}, failed assertions: ${failed}`);
+            console.log(`Postman Run 1 executed assertions: ${executed}, failed assertions: ${failed}`);
             if (executed === 0) {
-              console.error("ERROR: Zero test assertions were executed in Postman run!");
+              console.error("ERROR: Zero test assertions were executed in Postman run 1!");
               process.exit(1);
             }
             if (failed > 0) {
-              console.error(`ERROR: ${failed} Postman assertions failed!`);
+              console.error(`ERROR: ${failed} Postman assertions failed in run 1!`);
               process.exit(1);
             }
-            console.log("Postman acceptance assertions verified successfully!");
+            console.log("Postman Run 1 acceptance assertions verified successfully!");
           '
 
-      - name: Redact Credentials from Acceptance Artifacts
+      - name: Run Postman Acceptance Test Collection (Run 2 - Re-verification against same isolated database)
+        run: |
+          postman collection run tests/postman/MasryVoice.postman_collection.json \
+            -e tests/postman/MasryVoice.postman_environment.json \
+            --env-var "adminKey=masryvoice_ci_admin_key_2026" \
+            -r cli,json \
+            --reporter-json-export tests/postman/reports/postman-acceptance-run2.json
+
+      - name: Validate Postman Acceptance Report (Run 2)
+        run: |
+          REPORT="tests/postman/reports/postman-acceptance-run2.json"
+          if [ ! -f "$REPORT" ]; then
+            echo "ERROR: Postman acceptance report not found at $REPORT!"
+            exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            const data = JSON.parse(fs.readFileSync("'$REPORT'", "utf8"));
+            const summary = data.run?.summary;
+            if (!summary) {
+              console.error("ERROR: Malformed Postman report JSON: summary missing");
+              process.exit(1);
+            }
+            const executed = summary.tests?.executed || 0;
+            const failed = summary.tests?.failed || 0;
+            console.log(`Postman Run 2 executed assertions: ${executed}, failed assertions: ${failed}`);
+            if (executed === 0) {
+              console.error("ERROR: Zero test assertions were executed in Postman run 2!");
+              process.exit(1);
+            }
+            if (failed > 0) {
+              console.error(`ERROR: ${failed} Postman assertions failed in run 2!`);
+              process.exit(1);
+            }
+            console.log("Postman Run 2 acceptance assertions verified successfully!");
+          '
+
+      - name: Sanitize and Scan Artifact Confidentiality
         if: always()
         run: |
-          REPORT="tests/postman/reports/postman-acceptance.json"
-          if [ -f "$REPORT" ]; then
-            sed -i -E 's/masryvoice_ci_admin_key_2026/[REDACTED]/g' "$REPORT"
-            sed -i -E 's/masryvoice_ci_customer_hmac_secret_2026/[REDACTED]/g' "$REPORT"
-            sed -i -E 's/masryvoice_ci_pass/[REDACTED]/g' "$REPORT"
-            echo "Redacted CI secrets from acceptance artifact."
+          if [ -f "tests/postman/reports/postman-acceptance-run1.json" ]; then
+            node tests/postman/sanitize-report.js tests/postman/reports/postman-acceptance-run1.json
+          fi
+          if [ -f "tests/postman/reports/postman-acceptance-run2.json" ]; then
+            node tests/postman/sanitize-report.js tests/postman/reports/postman-acceptance-run2.json
           fi
 
-      - name: Upload Postman Acceptance Report
+      - name: Upload Postman Acceptance Reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: postman-acceptance-report
-          path: tests/postman/reports/postman-acceptance.json
+          name: postman-acceptance-reports
+          path: |
+            tests/postman/reports/postman-acceptance-run1.json
+            tests/postman/reports/postman-acceptance-run2.json
           retention-days: 3
           if-no-files-found: error
 

@@ -35,6 +35,18 @@ public class PostgresCapacityIntegrationTests
     {
         using var db = CreatePostgresDbContext();
         await db.Database.EnsureCreatedAsync();
+        await db.Database.ExecuteSqlRawAsync("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name='Bookings' AND column_name='ConversationId'
+                ) THEN
+                    ALTER TABLE "Bookings" ADD COLUMN "ConversationId" uuid REFERENCES "Conversations"("Id") ON DELETE SET NULL;
+                    CREATE INDEX IF NOT EXISTS "IX_Bookings_ConversationId" ON "Bookings" ("ConversationId");
+                END IF;
+            END $$;
+        """);
         await db.SeedInitialDataAsync();
     }
 
