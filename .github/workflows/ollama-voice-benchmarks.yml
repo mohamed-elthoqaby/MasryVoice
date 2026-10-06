@@ -1,0 +1,33 @@
+name: Real Ollama & Voice Benchmarks (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Ollama Model to benchmark'
+        required: true
+        default: 'qwen2.5:3b'
+
+jobs:
+  ollama-voice-bench:
+    name: Real Ollama & Egyptian Voice Pipeline (Self-Hosted / GPU Required)
+    runs-on: self-hosted
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Verify Local Ollama Service
+        run: |
+          curl -f http://127.0.0.1:11434/api/tags || (echo "Local Ollama service not reachable on 11434" && exit 1)
+
+      - name: Run Real Ollama Booking Flow Tests
+        run: |
+          dotnet test tests/MasryVoice.Tests/MasryVoice.Tests.csproj \
+            --filter "FullyQualifiedName~RealOllamaBookingFlowTests|FullyQualifiedName~OllamaBenchmarkTests"
