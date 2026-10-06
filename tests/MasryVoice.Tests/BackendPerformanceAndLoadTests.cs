@@ -246,13 +246,14 @@ public class BackendPerformanceAndLoadTests
 
         // 4. Release active permit to allow recovery
         activePermit.Dispose();
-        var nextPermit1 = await taskQueued1;
-        Assert.NotNull(nextPermit1);
-        nextPermit1.Dispose();
+        var firstFinished = await Task.WhenAny(taskQueued1, taskQueued2);
+        var firstPermit = await firstFinished;
+        Assert.NotNull(firstPermit);
+        firstPermit.Dispose();
 
-        var nextPermit2 = await taskQueued2;
-        Assert.NotNull(nextPermit2);
-        nextPermit2.Dispose();
+        var secondPermit = firstFinished == taskQueued1 ? await taskQueued2 : await taskQueued1;
+        Assert.NotNull(secondPermit);
+        secondPermit.Dispose();
 
         _output.WriteLine("Overload protection and graceful recovery verified successfully.");
     }

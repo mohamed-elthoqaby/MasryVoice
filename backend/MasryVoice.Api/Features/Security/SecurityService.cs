@@ -63,6 +63,10 @@ public class SecurityService : ISecurityService
     {
         if (string.IsNullOrWhiteSpace(token)) return false;
 
+        token = token.Replace(@"\u002b", "+", StringComparison.OrdinalIgnoreCase)
+                     .Replace(@"\u002f", "/", StringComparison.OrdinalIgnoreCase)
+                     .Replace(@"\u003d", "=", StringComparison.OrdinalIgnoreCase);
+
         var parts = token.Split('.');
         if (parts.Length != 2) return false;
 

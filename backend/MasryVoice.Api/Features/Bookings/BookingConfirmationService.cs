@@ -145,6 +145,30 @@ public class BookingConfirmationService : IBookingConfirmationService
 
             if (affected == 0)
             {
+                // Check if a concurrent request with the same idempotency key already booked the slot
+                var concurrentBooking = await _db.Bookings
+                    .Include(b => b.Slot)
+                    .FirstOrDefaultAsync(b => b.IdempotencyKey == pending.IdempotencyKey, ct);
+
+                if (concurrentBooking != null)
+                {
+                    await tx.RollbackAsync(ct);
+                    return new ConfirmationResult(
+                        Success: true,
+                        Message: $"الحجز مسجل بالفعل مسبقاً برقم {concurrentBooking.Id}. تم إرجاع الحجز الأصلي.",
+                        Data: new
+                        {
+                            bookingId = concurrentBooking.Id,
+                            customerName = concurrentBooking.CustomerName,
+                            customerPhone = concurrentBooking.CustomerPhone,
+                            service = concurrentBooking.ServiceName,
+                            cairoTime = CairoTimeHelper.FormatCairoFriendly(concurrentBooking.BookingDateUtc),
+                            status = concurrentBooking.Status,
+                            isDuplicateReplayed = true
+                        }
+                    );
+                }
+
                 var slotExists = await _db.AvailabilitySlots.AnyAsync(s => s.Id == pending.SlotId, ct);
                 if (!slotExists)
                 {
