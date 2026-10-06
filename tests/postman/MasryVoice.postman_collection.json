@@ -303,6 +303,9 @@
                   "    pm.expect(res.requestHash).to.be.a('string');",
                   "    pm.environment.set('stagedPendingBookingId', res.pendingBookingId);",
                   "    pm.environment.set('stagedRequestHash', res.requestHash);",
+                  "    if (res.customerToken) {",
+                  "        pm.environment.set('stagedCustomerToken', res.customerToken);",
+                  "    }",
                   "});"
                 ]
               }
@@ -337,7 +340,12 @@
           "name": "Verify Pending Booking In Pending List",
           "request": {
             "method": "GET",
-            "header": [],
+            "header": [
+              {
+                "key": "X-Customer-Token",
+                "value": "{{stagedCustomerToken}}"
+              }
+            ],
             "url": {
               "raw": "{{baseUrl}}/api/bookings/pending?conversationId={{currentConversationId}}",
               "host": [
@@ -670,6 +678,10 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{stagedCustomerToken}}"
               }
             ],
             "body": {
@@ -1040,6 +1052,9 @@
                   "    var res = pm.response.json();",
                   "    pm.expect(res.sessionId).to.be.a('string');",
                   "    pm.environment.set('activeVoiceSessionId', res.sessionId);",
+                  "    if (res.customerToken) {",
+                  "        pm.environment.set('voiceCustomerToken', res.customerToken);",
+                  "    }",
                   "});"
                 ]
               }
@@ -1077,6 +1092,10 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{voiceCustomerToken}}"
               }
             ],
             "body": {

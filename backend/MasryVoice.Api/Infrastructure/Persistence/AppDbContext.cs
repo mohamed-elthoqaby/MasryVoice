@@ -114,6 +114,7 @@ public class AppDbContext : DbContext
             b.HasIndex(bk => bk.IdempotencyKey).IsUnique();
             // Fast order-by-descending seek for recent bookings
             b.HasIndex(bk => bk.CreatedAtUtc);
+            b.HasIndex(bk => bk.ConversationId);
         });
 
         if (Database.IsNpgsql())

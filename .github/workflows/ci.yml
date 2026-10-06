@@ -144,15 +144,17 @@ jobs:
           LlmProvider: "DeterministicFake"
         run: |
           dotnet run --project backend/MasryVoice.Api/MasryVoice.Api.csproj -c Release --no-build &
-          echo "Waiting for API to respond at http://localhost:5000/api/health..."
+          echo "Waiting for API readiness at http://localhost:5000/api/health/ready..."
           READY=0
           for i in {1..30}; do
-            if curl -s http://localhost:5000/api/health | grep -q "Healthy"; then
-              echo "MasryVoice API is up and healthy!"
+            HTTP_CODE=$(curl -s -o /tmp/ready.json -w "%{http_code}" http://localhost:5000/api/health/ready || true)
+            if [ "$HTTP_CODE" = "200" ] && grep -q '"status":"Ready"' /tmp/ready.json; then
+              echo "MasryVoice API is ready (HTTP 200)!"
+              cat /tmp/ready.json
               READY=1
               break
             fi
-            echo "Waiting ($i/30)..."
+            echo "Waiting for readiness (HTTP $HTTP_CODE) ($i/30)..."
             sleep 1
           done
           if [ "$READY" -ne 1 ]; then
@@ -160,11 +162,57 @@ jobs:
             exit 1
           fi
 
+          echo "Checking liveness at http://localhost:5000/api/health/live..."
+          curl -s -f http://localhost:5000/api/health/live | grep -q "Alive"
+
       - name: Run Postman Acceptance Test Collection
         run: |
+          mkdir -p tests/postman/reports
           postman collection run tests/postman/MasryVoice.postman_collection.json \
             -e tests/postman/MasryVoice.postman_environment.json \
-            --env-var "adminKey=masryvoice_ci_admin_key_2026"
+            --env-var "adminKey=masryvoice_ci_admin_key_2026" \
+            -r cli,json \
+            --reporter-json-export tests/postman/reports/postman-acceptance.json
+
+      - name: Validate Postman Acceptance Report
+        run: |
+          REPORT="tests/postman/reports/postman-acceptance.json"
+          if [ ! -f "$REPORT" ]; then
+            echo "ERROR: Postman acceptance report not found at $REPORT!"
+            exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            const data = JSON.parse(fs.readFileSync("'$REPORT'", "utf8"));
+            const summary = data.run?.summary;
+            if (!summary) {
+              console.error("ERROR: Malformed Postman report JSON: summary missing");
+              process.exit(1);
+            }
+            const executed = summary.tests?.executed || 0;
+            const failed = summary.tests?.failed || 0;
+            console.log(`Postman executed assertions: ${executed}, failed assertions: ${failed}`);
+            if (executed === 0) {
+              console.error("ERROR: Zero test assertions were executed in Postman run!");
+              process.exit(1);
+            }
+            if (failed > 0) {
+              console.error(`ERROR: ${failed} Postman assertions failed!`);
+              process.exit(1);
+            }
+            console.log("Postman acceptance assertions verified successfully!");
+          '
+
+      - name: Redact Credentials from Acceptance Artifacts
+        if: always()
+        run: |
+          REPORT="tests/postman/reports/postman-acceptance.json"
+          if [ -f "$REPORT" ]; then
+            sed -i -E 's/masryvoice_ci_admin_key_2026/[REDACTED]/g' "$REPORT"
+            sed -i -E 's/masryvoice_ci_customer_hmac_secret_2026/[REDACTED]/g' "$REPORT"
+            sed -i -E 's/masryvoice_ci_pass/[REDACTED]/g' "$REPORT"
+            echo "Redacted CI secrets from acceptance artifact."
+          fi
 
       - name: Upload Postman Acceptance Report
         if: always()
@@ -173,7 +221,7 @@ jobs:
           name: postman-acceptance-report
           path: tests/postman/reports/postman-acceptance.json
           retention-days: 3
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   frontend-build:
     name: Frontend TypeScript & Production Build
