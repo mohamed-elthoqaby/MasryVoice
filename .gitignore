@@ -1,0 +1,72 @@
+# ====================================================================
+# MasryVoice Repository .gitignore
+# Excludes secrets, binaries, databases, temporary fixtures, and caches
+# ====================================================================
+
+# .NET / C# Build Artifacts
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+appsettings.Development.json
+appsettings.Local.json
+*.local.json
+
+# Node.js & Next.js
+node_modules/
+.next/
+out/
+.npm/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Environment & Secret Files
+.env
+.env.*
+!.env.example
+
+# Databases & Backups
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sql
+*.dump
+*.bak
+postgres_data/
+
+# Generated Test Reports & Coverage
+tests/postman/reports/
+TestResults/
+[Cc]overage/
+*.trx
+
+# Audio Recordings & Scratch Media
+*.wav
+*.mp3
+*.ogg
+*.webm
+recordings/
+audio_samples/
+
+# External Tools / Downloaded Repositories
+skills-main/
+scratch/
+
+# IDE & Operating System Files
+.vscode/
+.idea/
+.vs/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,116 @@
+using System.Collections.Concurrent;
+
+namespace MasryVoice.Api.Features.Voice;
+
+public class VoiceTurnContext : IDisposable
+{
+    public long TurnId { get; }
+    public CancellationTokenSource Cts { get; }
+    public CancellationToken Token => Cts.Token;
+    public DateTime StartedAtUtc { get; } = DateTime.UtcNow;
+
+    public VoiceTurnContext(long turnId)
+    {
+        TurnId = turnId;
+        Cts = new CancellationTokenSource();
+    }
+
+    public void Dispose()
+    {
+        Cts.Dispose();
+    }
+}
+
+public class VoiceSession
+{
+    public Guid SessionId { get; }
+    public Guid ConversationId { get; }
+    private long _currentTurnId = 0;
+    private VoiceTurnContext? _currentTurn;
+    private readonly object _lock = new();
+
+    public VoiceSession(Guid sessionId, Guid conversationId)
+    {
+        SessionId = sessionId;
+        ConversationId = conversationId;
+    }
+
+    public long CurrentTurnId
+    {
+        get
+        {
+            lock (_lock) return _currentTurnId;
+        }
+    }
+
+    public VoiceTurnContext StartNewTurn()
+    {
+        lock (_lock)
+        {
+            // Cancel existing turn if still running
+            if (_currentTurn != null && !_currentTurn.Cts.IsCancellationRequested)
+            {
+                _currentTurn.Cts.Cancel();
+            }
+
+            _currentTurnId++;
+            _currentTurn = new VoiceTurnContext(_currentTurnId);
+            return _currentTurn;
+        }
+    }
+
+    public bool InterruptCurrentTurn()
+    {
+        lock (_lock)
+        {
+            if (_currentTurn != null && !_currentTurn.Cts.IsCancellationRequested)
+            {
+                _currentTurn.Cts.Cancel();
+                _currentTurnId++; // Increment to invalidate any pending synthesis in flight
+                return true;
+            }
+            return false;
+        }
+    }
+
+    public bool IsTurnActive(long turnId)
+    {
+        lock (_lock)
+        {
+            return _currentTurnId == turnId && (_currentTurn == null || !_currentTurn.Cts.IsCancellationRequested);
+        }
+    }
+}
+
+public class VoiceSessionManager
+{
+    private readonly ConcurrentDictionary<Guid, VoiceSession> _sessions = new();
+
+    public VoiceSession GetOrCreateSession(Guid sessionId, Guid conversationId)
+    {
+        return _sessions.GetOrAdd(sessionId, id => new VoiceSession(id, conversationId));
+    }
+
+    public VoiceSession? GetSession(Guid sessionId)
+    {
+        _sessions.TryGetValue(sessionId, out var session);
+        return session;
+    }
+
+    public bool Interrupt(Guid sessionId)
+    {
+        if (_sessions.TryGetValue(sessionId, out var session))
+        {
+            return session.InterruptCurrentTurn();
+        }
+        return false;
+    }
+
+    public void RemoveSession(Guid sessionId)
+    {
+        if (_sessions.TryRemove(sessionId, out var session))
+        {
+            session.InterruptCurrentTurn();
+        }
+    }
+}
