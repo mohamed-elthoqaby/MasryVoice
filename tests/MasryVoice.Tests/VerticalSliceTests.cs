@@ -629,6 +629,13 @@ public class VerticalSliceTests
         Assert.Equal("إيه المواعيد المتاحة بكرة؟", userMessage.Content);
     }
 
+    [Fact]
+    public void Deliberate_Failing_Test_For_CI_Gate_Verification()
+    {
+        // Deliberate test failure to prove GitHub Actions CI fails and branch protection blocks merging into main
+        Assert.True(false, "Deliberate failure to verify CI Gate enforcement on branch main");
+    }
+
     private class MockAttemptConfirmationProvider : ILlmProvider
     {
         public string ProviderName => "MockAttemptConfirmation";
