@@ -124,10 +124,14 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install Postman CLI
+      - name: Install Postman CLI & Acceptance Test Tools
         run: |
-          curl -o- "https://config-cli.postman.com/scripts/install/linux64.sh" | sh
-          postman --version
+          curl -o- "https://dl-cli.pstmn.io/install/unix.sh" | sh || true
+          if command -v postman &> /dev/null; then
+            postman --version || true
+          fi
+          npm install -g newman
+          newman --version
 
       - name: Build Backend API (Release)
         run: |
@@ -154,14 +158,19 @@ jobs:
             sleep 1
           done
 
-      - name: Run Postman CLI Acceptance Collection
+      - name: Run Postman Acceptance Test Collection
         run: |
           mkdir -p tests/postman/reports
-          postman collection run tests/postman/MasryVoice.postman_collection.json \
-            -e tests/postman/MasryVoice.postman_environment.json \
-            --env-var "adminKey=masryvoice_ci_admin_key_2026" \
-            -r cli,json \
-            --reporter-json-export tests/postman/reports/postman-acceptance.json
+          if command -v postman &> /dev/null && postman collection run tests/postman/MasryVoice.postman_collection.json -e tests/postman/MasryVoice.postman_environment.json --env-var "adminKey=masryvoice_ci_admin_key_2026" -r cli,json --reporter-json-export tests/postman/reports/postman-acceptance.json; then
+            echo "Postman CLI run succeeded!"
+          else
+            echo "Running collection via Newman..."
+            newman run tests/postman/MasryVoice.postman_collection.json \
+              -e tests/postman/MasryVoice.postman_environment.json \
+              --env-var "adminKey=masryvoice_ci_admin_key_2026" \
+              -r cli,json \
+              --reporter-json-export tests/postman/reports/postman-acceptance.json
+          fi
 
       - name: Upload Postman Acceptance Report
         if: always()

@@ -16,7 +16,9 @@ namespace MasryVoice.Tests;
 /// </summary>
 public class PostgresCapacityIntegrationTests
 {
-    private const string PostgresConnectionString =
+    private static readonly string PostgresConnectionString =
+        Environment.GetEnvironmentVariable("ConnectionStrings__PostgreSql") ??
+        Environment.GetEnvironmentVariable("POSTGRES_CONNECTION_STRING") ??
         "Host=localhost;Port=5432;Database=masryvoice_db;Username=masryvoice;Password=masryvoice_secret_pass;Include Error Detail=true;";
 
     private AppDbContext CreatePostgresDbContext()
