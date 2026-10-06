@@ -186,7 +186,7 @@ public class ProductionFeatureTests
     [Fact]
     public async Task Voice_TtsSynthesizer_GeneratesValidPcmWavAudio()
     {
-        var tts = new LocalEgyptianTtsProvider(new HttpClient(), NullLogger<LocalEgyptianTtsProvider>.Instance);
+        ITtsProvider tts = new SimulatedTtsProvider();
         var text = "أهلاً بحضرتك يا فندم في عيادة النور التخصصية";
 
         var audio = await tts.SynthesizeSpeechAsync(text, "ar-EG");

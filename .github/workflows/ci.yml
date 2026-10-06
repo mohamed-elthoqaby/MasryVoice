@@ -43,7 +43,7 @@ jobs:
         run: |
           dotnet test tests/MasryVoice.Tests/MasryVoice.Tests.csproj \
             -c Release --no-build \
-            --filter "FullyQualifiedName~VerticalSliceTests|FullyQualifiedName~ProductionFeatureTests|FullyQualifiedName~BackendPerformanceAndLoadTests" \
+            --filter "Category!=ExternalModel&Category!=PostgresIntegration" \
             --logger "console;verbosity=normal"
 
   postgres-integration-test:
@@ -87,7 +87,7 @@ jobs:
         run: |
           dotnet test tests/MasryVoice.Tests/MasryVoice.Tests.csproj \
             -c Release --no-build \
-            --filter "FullyQualifiedName~PostgresCapacityIntegrationTests" \
+            --filter "Category=PostgresIntegration" \
             --logger "console;verbosity=normal"
 
   api-acceptance-test:
@@ -124,14 +124,10 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install Postman CLI & Acceptance Test Tools
+      - name: Install Postman CLI
         run: |
-          curl -o- "https://dl-cli.pstmn.io/install/unix.sh" | sh || true
-          if command -v postman &> /dev/null; then
-            postman --version || true
-          fi
-          npm install -g newman
-          newman --version
+          curl -o- "https://dl-cli.pstmn.io/install/unix.sh" | sh
+          postman --version
 
       - name: Build Backend API (Release)
         run: |
@@ -149,28 +145,26 @@ jobs:
         run: |
           dotnet run --project backend/MasryVoice.Api/MasryVoice.Api.csproj -c Release --no-build &
           echo "Waiting for API to respond at http://localhost:5000/api/health..."
+          READY=0
           for i in {1..30}; do
             if curl -s http://localhost:5000/api/health | grep -q "Healthy"; then
               echo "MasryVoice API is up and healthy!"
+              READY=1
               break
             fi
             echo "Waiting ($i/30)..."
             sleep 1
           done
+          if [ "$READY" -ne 1 ]; then
+            echo "MasryVoice API failed to reach readiness!"
+            exit 1
+          fi
 
       - name: Run Postman Acceptance Test Collection
         run: |
-          mkdir -p tests/postman/reports
-          if command -v postman &> /dev/null && postman collection run tests/postman/MasryVoice.postman_collection.json -e tests/postman/MasryVoice.postman_environment.json --env-var "adminKey=masryvoice_ci_admin_key_2026" -r cli,json --reporter-json-export tests/postman/reports/postman-acceptance.json; then
-            echo "Postman CLI run succeeded!"
-          else
-            echo "Running collection via Newman..."
-            newman run tests/postman/MasryVoice.postman_collection.json \
-              -e tests/postman/MasryVoice.postman_environment.json \
-              --env-var "adminKey=masryvoice_ci_admin_key_2026" \
-              -r cli,json \
-              --reporter-json-export tests/postman/reports/postman-acceptance.json
-          fi
+          postman collection run tests/postman/MasryVoice.postman_collection.json \
+            -e tests/postman/MasryVoice.postman_environment.json \
+            --env-var "adminKey=masryvoice_ci_admin_key_2026"
 
       - name: Upload Postman Acceptance Report
         if: always()
@@ -179,6 +173,7 @@ jobs:
           name: postman-acceptance-report
           path: tests/postman/reports/postman-acceptance.json
           retention-days: 3
+          if-no-files-found: ignore
 
   frontend-build:
     name: Frontend TypeScript & Production Build

@@ -10,6 +10,7 @@ namespace MasryVoice.Tests;
 /// Side-by-side benchmark comparing qwen2.5:1.5b and qwen2.5:3b on real local Ollama
 /// running on Intel Core i5-12450H CPU without dedicated GPU, alongside DeterministicFake baseline.
 /// </summary>
+[Trait("Category", "ExternalModel")]
 public class OllamaBenchmarkTests
 {
     private readonly ITestOutputHelper _output;

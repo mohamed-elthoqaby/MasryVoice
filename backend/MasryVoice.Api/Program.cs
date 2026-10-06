@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using MasryVoice.Api.Infrastructure.Persistence;
 using MasryVoice.Api.Infrastructure.Providers;
@@ -44,10 +46,67 @@ builder.Services.AddSingleton(sp =>
     return new InferenceThrottlingManager(opts);
 });
 
-// ASP.NET Core RateLimiter for general API traffic
+// ASP.NET Core Bounded RateLimiter for general API traffic and expensive inference
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    options.OnRejected = async (context, token) =>
+    {
+        context.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        string retryAfterSeconds = "10";
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+        {
+            retryAfterSeconds = Math.Max(1, (int)retryAfter.TotalSeconds).ToString();
+        }
+        context.HttpContext.Response.Headers.RetryAfter = retryAfterSeconds;
+        context.HttpContext.Response.ContentType = "application/json";
+        await context.HttpContext.Response.WriteAsync(JsonSerializer.Serialize(new
+        {
+            error = "TOO_MANY_REQUESTS",
+            message = "تم تجاوز حد الطلبات المسموح به. يرجى الانتظار والمحاولة لاحقاً.",
+            retryAfterSeconds = int.Parse(retryAfterSeconds)
+        }), token);
+    };
+
+    // Global / API policy: 60 req/min per IP
+    options.AddPolicy("api", httpContext =>
+    {
+        var clientIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown-client";
+        return RateLimitPartition.GetFixedWindowLimiter(clientIp, _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 60,
+            Window = TimeSpan.FromMinutes(1),
+            QueueLimit = 0
+        });
+    });
+
+    // Dedicated policy for expensive LLM / Speech inference endpoints
+    options.AddPolicy("inference", httpContext =>
+    {
+        var clientIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown-client";
+        return RateLimitPartition.GetTokenBucketLimiter(clientIp, _ => new TokenBucketRateLimiterOptions
+        {
+            TokenLimit = 20,
+            TokensPerPeriod = 5,
+            ReplenishmentPeriod = TimeSpan.FromSeconds(10),
+            QueueLimit = 0
+        });
+    });
+
+    // Test-controllable policy for rate limit verification
+    options.AddPolicy("test-rate-limit", httpContext =>
+    {
+        var partitionKey = httpContext.Request.Headers["X-Test-Client-Id"].FirstOrDefault()
+            ?? httpContext.Connection.RemoteIpAddress?.ToString()
+            ?? "default-client";
+        return RateLimitPartition.GetFixedWindowLimiter(partitionKey, _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 3,
+            Window = TimeSpan.FromSeconds(5),
+            QueueLimit = 0
+        });
+    });
 });
 
 // 4. Configure Database (PostgreSQL or SQLite fallback)
@@ -83,9 +142,22 @@ else
 // 6. Register Security & Auth Service
 builder.Services.AddSingleton<ISecurityService, SecurityService>();
 
-// 7. Register Knowledge & RAG Services
-builder.Services.AddHttpClient<OllamaEmbeddingProvider>();
-builder.Services.AddScoped<IEmbeddingProvider, OllamaEmbeddingProvider>();
+// 7. Register Knowledge & Embedding Services
+var embProviderType = builder.Configuration["Inference:EmbeddingProvider"] ?? "Deterministic";
+if (embProviderType.Equals("Ollama", StringComparison.OrdinalIgnoreCase) ||
+    embProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
+{
+    var ollamaUrl = builder.Configuration["Ollama:BaseUrl"] ?? "http://127.0.0.1:11434";
+    builder.Services.AddHttpClient<IEmbeddingProvider, OllamaEmbeddingProvider>(c =>
+    {
+        c.BaseAddress = new Uri(ollamaUrl);
+        c.Timeout = TimeSpan.FromSeconds(30);
+    });
+}
+else
+{
+    builder.Services.AddSingleton<IEmbeddingProvider, DeterministicEmbeddingProvider>();
+}
 builder.Services.AddScoped<IKnowledgeService, KnowledgeService>();
 
 // 8. Register Booking Confirmation Application Service (Server-Side Customer Action)
@@ -106,10 +178,37 @@ builder.Services.AddScoped<ToolRegistry>();
 builder.Services.AddScoped<AgentOrchestrator>();
 
 // 11. Register Speech Pipeline & Voice Session
-builder.Services.AddHttpClient<WhisperSttProvider>();
-builder.Services.AddScoped<ISttProvider, WhisperSttProvider>();
-builder.Services.AddHttpClient<LocalEgyptianTtsProvider>();
-builder.Services.AddScoped<ITtsProvider, LocalEgyptianTtsProvider>();
+var sttProviderType = builder.Configuration["Voice:SttProvider"] ?? "Simulated";
+if (sttProviderType.Equals("Whisper", StringComparison.OrdinalIgnoreCase) ||
+    sttProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
+{
+    var sttBaseUrl = builder.Configuration["Voice:SttBaseUrl"] ?? "http://127.0.0.1:8000";
+    builder.Services.AddHttpClient<ISttProvider, WhisperSttProvider>(c =>
+    {
+        c.BaseAddress = new Uri(sttBaseUrl);
+        c.Timeout = TimeSpan.FromSeconds(30);
+    });
+}
+else
+{
+    builder.Services.AddSingleton<ISttProvider, SimulatedSttProvider>();
+}
+
+var ttsProviderType = builder.Configuration["Voice:TtsProvider"] ?? "Simulated";
+if (ttsProviderType.Equals("LocalEgyptian", StringComparison.OrdinalIgnoreCase) ||
+    ttsProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
+{
+    var ttsBaseUrl = builder.Configuration["Voice:TtsBaseUrl"] ?? "http://127.0.0.1:8000";
+    builder.Services.AddHttpClient<ITtsProvider, LocalEgyptianTtsProvider>(c =>
+    {
+        c.BaseAddress = new Uri(ttsBaseUrl);
+        c.Timeout = TimeSpan.FromSeconds(30);
+    });
+}
+else
+{
+    builder.Services.AddSingleton<ITtsProvider, SimulatedTtsProvider>();
+}
 builder.Services.AddSingleton<VoiceSessionManager>();
 
 // 12. Register Durable Outbox Processor Background Service
@@ -125,12 +224,25 @@ var app = builder.Build();
 app.UseCors();
 app.UseRateLimiter();
 
-// Auto-migrate & Seed demo data on startup
+// Schema initialization & optional development/test seeding
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    await db.Database.EnsureCreatedAsync();
-    await db.SeedInitialDataAsync();
+    var env = scope.ServiceProvider.GetRequiredService<IWebHostEnvironment>();
+    var cfg = scope.ServiceProvider.GetRequiredService<IConfiguration>();
+
+    bool shouldInitSchema = cfg.GetValue<bool>("Database:InitializeSchema", true);
+    bool shouldSeed = cfg.GetValue<bool>("Database:AutoSeed", env.IsDevelopment() || env.EnvironmentName == "Testing");
+
+    if (shouldInitSchema)
+    {
+        await db.Database.EnsureCreatedAsync();
+    }
+
+    if (shouldSeed)
+    {
+        await db.SeedInitialDataAsync();
+    }
 }
 
 // ----------------------------------------------------
@@ -613,7 +725,7 @@ app.MapPost("/api/chat/stream", async (
     {
         // Client disconnected; cancellation propagated to release locks & permits
     }
-});
+}).RequireRateLimiting("inference");
 
 // ----------------------------------------------------
 // Knowledge Management & RAG Endpoints
@@ -679,14 +791,14 @@ app.MapPost("/api/voice/stt", async (ISttProvider stt, HttpRequest request, Canc
     await using var stream = file.OpenReadStream();
     var transcribed = await stt.TranscribeAudioAsync(stream, file.ContentType, "ar", ct);
     return Results.Ok(new { text = transcribed });
-});
+}).RequireRateLimiting("inference");
 
 app.MapPost("/api/voice/tts", async (ITtsProvider tts, [Microsoft.AspNetCore.Mvc.FromBody] TtsSynthesizeRequest req, CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(req.Text)) return Results.BadRequest();
     var audio = await tts.SynthesizeSpeechAsync(req.Text, req.LanguageCode ?? "ar-EG", ct);
     return Results.File(audio.ToArray(), "audio/wav");
-});
+}).RequireRateLimiting("inference");
 
 app.MapPost("/api/voice/turn", async (
     VoiceSessionManager sessionMgr,
@@ -731,7 +843,11 @@ app.MapPost("/api/voice/turn", async (
     {
         return Results.StatusCode(499); // Graceful barge-in interruption status
     }
-});
+}).RequireRateLimiting("inference");
+
+// Test endpoint for validating rate limiting behavior and headers
+app.MapGet("/api/test/rate-limited", () => Results.Ok(new { status = "ok" }))
+    .RequireRateLimiting("test-rate-limit");
 
 app.Run();
 
@@ -795,3 +911,5 @@ public record VoiceTurnRequest(
     Guid AgentId,
     string Message
 );
+
+public partial class Program { }

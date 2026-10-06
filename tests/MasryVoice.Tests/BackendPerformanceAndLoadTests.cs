@@ -297,6 +297,7 @@ public class BackendPerformanceAndLoadTests
     // TEST 5: Small Real-Ollama Concurrency Within Laptop Resource Limits
     // -----------------------------------------------------------------------------------------
     [Fact]
+    [Trait("Category", "ExternalModel")]
     public async Task RealOllama_SmallConcurrencyTest_LaptopResourceLimits()
     {
         var dbName = $"real_ollama_load_{Guid.NewGuid():N}.db";

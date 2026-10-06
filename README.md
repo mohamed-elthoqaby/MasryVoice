@@ -11,10 +11,12 @@ The platform is architected as a clean modular monolith adhering to a zero-cost 
 - **Backend:** .NET 10 Minimal APIs modular monolith (`backend/MasryVoice.Api`).
 - **Database & Vectors:** PostgreSQL 16 with `pgvector` extension for 384-dimensional vector embeddings and ACID-safe booking reservation.
 - **Frontend Dashboard:** Next.js 14+ React interface (`frontend`).
-- **Inference Pipeline:** Local Ollama (`qwen2.5:3b` / `qwen2.5:1.5b`) with bounded concurrency admission control (`InferenceThrottlingManager`).
-- **Voice Pipeline:** Egyptian Arabic STT adapter, 16kHz WAV TTS synthesizer, barge-in interruption handling, and Asterisk AudioSocket (TCP port 9092).
+- **Inference Pipeline:** Local Ollama (`qwen2.5:3b` / `qwen2.5:1.5b`) with bounded concurrency admission control (`InferenceThrottlingManager`) and rate limiting (`TokenBucketLimiter`).
+- **Voice Pipeline:** Egyptian Arabic STT (`WhisperSttProvider`), 16kHz WAV TTS (`LocalEgyptianTtsProvider`), barge-in interruption handling, and Asterisk AudioSocket (TCP port 9092). Test/demo modes use explicit `SimulatedSttProvider` and `SimulatedTtsProvider`.
+- **Knowledge & Vectors:** 384-dimensional embeddings (`OllamaEmbeddingProvider` or `DeterministicEmbeddingProvider`) with strict vector space dimension validation.
+- **Rate Limiting:** Built-in ASP.NET Core rate limiting with 429 Too Many Requests and `Retry-After` headers for ordinary APIs and inference endpoints.
 - **Automation & Recovery:** Transactional Outbox pattern (`OutboxJobs`) with background processor and dead-letter queue.
-- **Acceptance Testing:** Automated Postman CLI v2.1.0 acceptance test suite with machine-readable JSON reports.
+- **Acceptance Testing:** Automated Postman CLI acceptance test suite with strict CI enforcement.
 
 ---
 
@@ -23,8 +25,8 @@ The platform is architected as a clean modular monolith adhering to a zero-cost 
 1. **Docker & Docker Compose** (for PostgreSQL with `pgvector`).
 2. **.NET SDK** (.NET 10.0 or .NET 9.0).
 3. **Node.js** (v18+ or v20+ with npm).
-4. **Ollama** (running locally on port 11434 with models `qwen2.5:3b` and `nomic-embed-text`).
-5. **Postman CLI / Newman** (optional, for running API acceptance test suite).
+4. **Ollama** (running locally on port 11434 with models `qwen2.5:3b` and `all-minilm`).
+5. **Postman CLI** (for running API acceptance tests).
 
 ---
 
@@ -42,8 +44,21 @@ Create `backend/MasryVoice.Api/appsettings.Development.json` (or set environment
 
 ```json
 {
+  "DatabaseProvider": "PostgreSql",
   "ConnectionStrings": {
     "PostgreSql": "Host=localhost;Port=5432;Database=masryvoice_db;Username=masryvoice;Password=masryvoice_secret_pass"
+  },
+  "Database": {
+    "InitializeSchema": true,
+    "AutoSeed": true
+  },
+  "Voice": {
+    "SttProvider": "Whisper",
+    "TtsProvider": "LocalEgyptian"
+  },
+  "Inference": {
+    "EmbeddingProvider": "Ollama",
+    "EmbeddingModel": "all-minilm"
   },
   "Security": {
     "AdminKey": "your_secure_admin_key_here",
@@ -57,6 +72,7 @@ Create `backend/MasryVoice.Api/appsettings.Development.json` (or set environment
 ```bash
 dotnet run --project backend/MasryVoice.Api/MasryVoice.Api.csproj
 ```
+The API will start at `http://localhost:5000` (Swagger / Health check at `http://localhost:5000/api/health`).
 The API will start at `http://localhost:5000` (Swagger / Health check at `http://localhost:5000/api/health`).
 
 ### 4. Run Frontend

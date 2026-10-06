@@ -1,4 +1,7 @@
-name: Real Ollama & Voice Benchmarks (Manual)
+name: Real Ollama Model Benchmarks (Manual)
+
+# NOTE: This manual workflow executes local Ollama LLM integration and benchmark tests only.
+# It does NOT execute or verify Egyptian Arabic voice coverage (STT / TTS audio pipelines).
 
 on:
   workflow_dispatch:
@@ -9,8 +12,8 @@ on:
         default: 'qwen2.5:3b'
 
 jobs:
-  ollama-voice-bench:
-    name: Real Ollama & Egyptian Voice Pipeline (Self-Hosted / GPU Required)
+  ollama-model-bench:
+    name: Real Ollama Model Execution (Requires Local Ollama Host)
     runs-on: self-hosted
     timeout-minutes: 30
 
@@ -30,4 +33,4 @@ jobs:
       - name: Run Real Ollama Booking Flow Tests
         run: |
           dotnet test tests/MasryVoice.Tests/MasryVoice.Tests.csproj \
-            --filter "FullyQualifiedName~RealOllamaBookingFlowTests|FullyQualifiedName~OllamaBenchmarkTests"
+            --filter "Category=ExternalModel"
