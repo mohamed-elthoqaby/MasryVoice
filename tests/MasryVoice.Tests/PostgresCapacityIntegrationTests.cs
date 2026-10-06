@@ -14,6 +14,7 @@ namespace MasryVoice.Tests;
 /// using independent connections and concurrent requests to verify that row-level locking (FOR UPDATE)
 /// and database constraints strictly prevent overbooking without relying on an in-process lock.
 /// </summary>
+[Trait("Category", "PostgresIntegration")]
 public class PostgresCapacityIntegrationTests
 {
     private static readonly string PostgresConnectionString =

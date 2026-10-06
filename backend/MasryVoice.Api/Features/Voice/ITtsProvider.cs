@@ -10,8 +10,10 @@ public interface ITtsProvider
 }
 
 /// <summary>
-/// Text-To-Speech provider generating natural Arabic audio streams (Piper / Edge-TTS / Kokoro compatible).
-/// Generates compliant standard WAV audio headers (RIFF 16kHz 16-bit Mono) for browser Web Audio playback.
+/// Production Egyptian Arabic Text-To-Speech Provider calling a real OpenAI-compatible TTS endpoint
+/// (e.g. Piper, Kokoro, Edge-TTS bridge, or local neural voice server).
+/// Strictly fails when the real endpoint is unavailable or returns errors.
+/// Never fabricates synthetic sine tones on failure.
 /// </summary>
 public class LocalEgyptianTtsProvider : ITtsProvider
 {
@@ -26,43 +28,67 @@ public class LocalEgyptianTtsProvider : ITtsProvider
 
     public async Task<ReadOnlyMemory<byte>> SynthesizeSpeechAsync(string text, string languageCode = "ar-EG", CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
+
         if (string.IsNullOrWhiteSpace(text))
         {
-            return ReadOnlyMemory<byte>.Empty;
+            throw new ArgumentException("Text to synthesize cannot be null or empty.", nameof(text));
         }
 
-        try
+        var body = new
         {
-            var body = new { input = text, voice = "ar-EG-SalmaNeural", response_format = "wav" };
-            var response = await _httpClient.PostAsJsonAsync("/v1/audio/speech", body, ct);
+            input = text,
+            voice = "ar-EG-SalmaNeural",
+            response_format = "wav"
+        };
 
-            if (response.IsSuccessStatusCode)
-            {
-                var bytes = await response.Content.ReadAsByteArrayAsync(ct);
-                if (bytes.Length > 0)
-                {
-                    return bytes;
-                }
-            }
-        }
-        catch (Exception ex)
+        var response = await _httpClient.PostAsJsonAsync("/v1/audio/speech", body, ct);
+
+        if (!response.IsSuccessStatusCode)
         {
-            _logger.LogDebug(ex, "TTS local endpoint unavailable. Generating synthetic WAV audio frame.");
+            var err = await response.Content.ReadAsStringAsync(ct);
+            _logger.LogError("TTS request failed with status code {StatusCode}: {Error}", (int)response.StatusCode, err);
+            throw new HttpRequestException($"Local Egyptian TTS service returned HTTP {(int)response.StatusCode}: {err}");
         }
 
-        // Return compliant synthetic 16kHz 16-bit mono PCM WAV chunk for browser playback
-        return GenerateSyntheticWav(text.Length);
+        var bytes = await response.Content.ReadAsByteArrayAsync(ct);
+        if (bytes.Length == 0)
+        {
+            throw new InvalidOperationException("TTS service returned an empty audio response.");
+        }
+
+        return bytes;
+    }
+}
+
+/// <summary>
+/// Explicitly selected Simulated/Demo TTS Provider for headless CI runs and offline test environments.
+/// Generates compliant standard WAV audio containers (RIFF 16kHz 16-bit Mono) for browser Web Audio playback
+/// without requiring a live TTS neural model server.
+/// </summary>
+public class SimulatedTtsProvider : ITtsProvider
+{
+    public Task<ReadOnlyMemory<byte>> SynthesizeSpeechAsync(string text, string languageCode = "ar-EG", CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return Task.FromResult(ReadOnlyMemory<byte>.Empty);
+        }
+
+        return Task.FromResult(GenerateSyntheticWav(text.Length));
     }
 
     /// <summary>
-    /// Generates valid PCM WAV audio container (16kHz, 16-bit, Mono) with subtle audio waveform
+    /// Generates valid PCM WAV audio container (16kHz, 16-bit, Mono) for testing
     /// </summary>
     public static ReadOnlyMemory<byte> GenerateSyntheticWav(int textLength)
     {
         int sampleRate = 16000;
-        int durationMs = Math.Clamp(textLength * 45, 300, 4000); // Approximate duration based on text length
+        int durationMs = Math.Clamp(textLength * 45, 300, 4000);
         int numSamples = (sampleRate * durationMs) / 1000;
-        int subChunk2Size = numSamples * 2; // 16-bit = 2 bytes per sample
+        int subChunk2Size = numSamples * 2;
         int chunkSize = 36 + subChunk2Size;
 
         using var ms = new MemoryStream();
@@ -75,24 +101,23 @@ public class LocalEgyptianTtsProvider : ITtsProvider
 
         // fmt chunk
         writer.Write("fmt "u8);
-        writer.Write(16); // subchunk1 size
-        writer.Write((short)1); // PCM format
+        writer.Write(16);
+        writer.Write((short)1); // PCM
         writer.Write((short)1); // Mono
         writer.Write(sampleRate);
-        writer.Write(sampleRate * 2); // Byte rate
-        writer.Write((short)2); // Block align
-        writer.Write((short)16); // Bits per sample
+        writer.Write(sampleRate * 2);
+        writer.Write((short)2);
+        writer.Write((short)16);
 
         // data chunk
         writer.Write("data"u8);
         writer.Write(subChunk2Size);
 
-        // Synthetic gentle tone (440Hz modulated, very quiet tone)
         double freq = 440.0;
         for (int i = 0; i < numSamples; i++)
         {
             double t = (double)i / sampleRate;
-            short sample = (short)(Math.Sin(2 * Math.PI * freq * t) * 1500.0); // Gentle amplitude
+            short sample = (short)(Math.Sin(2 * Math.PI * freq * t) * 1500.0);
             writer.Write(sample);
         }
 

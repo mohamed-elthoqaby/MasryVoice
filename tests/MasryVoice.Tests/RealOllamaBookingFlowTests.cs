@@ -19,6 +19,7 @@ namespace MasryVoice.Tests;
 /// End-to-end acceptance tests verifying the complete booking conversation using real local Ollama:
 /// availability -> customer details -> StageBooking -> pending confirmation -> explicit customer confirmation -> persisted booking.
 /// </summary>
+[Trait("Category", "ExternalModel")]
 public class RealOllamaBookingFlowTests
 {
     private readonly ITestOutputHelper _output;
