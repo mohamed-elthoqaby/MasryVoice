@@ -495,6 +495,7 @@ app.MapGet("/api/bookings", async (HttpContext ctx, AppDbContext db, ISecuritySe
     {
         id = b.Id,
         slotId = b.SlotId,
+        conversationId = b.ConversationId,
         customerName = b.CustomerName,
         customerPhone = b.CustomerPhone,
         serviceName = b.ServiceName,
