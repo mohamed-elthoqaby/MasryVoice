@@ -160,6 +160,14 @@ export default function Dashboard() {
   const isInterruptedRef = useRef<boolean>(false);
   const activeVoiceRequestIdRef = useRef<number>(0);
 
+  // Real browser microphone recording state (Web Audio / MediaRecorder)
+  const [isRecordingMic, setIsRecordingMic] = useState(false);
+  const [micDuration, setMicDuration] = useState(0);
+  const [micError, setMicError] = useState<string | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const micIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
   // Settings form state
   const [agentForm, setAgentForm] = useState<Partial<Agent>>({});
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -417,17 +425,134 @@ export default function Dashboard() {
     }
   };
 
-  // Push to talk microphone toggle (Web Audio simulator)
-  const toggleRecording = () => {
-    if (!isRecording) {
-      setIsRecording(true);
-      // Simulate listening and transcribe after 2 seconds
-      setTimeout(() => {
+  // Real push-to-talk microphone audio recording (Web Audio / MediaRecorder API)
+  const startVoiceRecording = async (targetMode: 'voice' | 'chat' = 'voice') => {
+    setMicError(null);
+    if (typeof window === 'undefined' || !navigator?.mediaDevices?.getUserMedia) {
+      setMicError('المتصفح الحالي لا يدعم تسجيل الصوت من الميكروفون.');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          sampleRate: 16000
+        }
+      });
+
+      const mimeTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4', ''];
+      const supportedMime = mimeTypes.find(t => !t || (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t))) || '';
+
+      const recorder = supportedMime ? new MediaRecorder(stream, { mimeType: supportedMime }) : new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+      audioChunksRef.current = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          audioChunksRef.current.push(e.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        stream.getTracks().forEach(track => track.stop());
+        if (micIntervalRef.current) {
+          clearInterval(micIntervalRef.current);
+          micIntervalRef.current = null;
+        }
+        setIsRecordingMic(false);
         setIsRecording(false);
-        handleSendMessage('عايز أعرف إيه المواعيد المتاحة بكرة لكشف الباطنة؟');
-      }, 2500);
-    } else {
+        setMicDuration(0);
+
+        const chunks = audioChunksRef.current;
+        if (chunks.length === 0) return;
+
+        const mime = recorder.mimeType || 'audio/webm';
+        const audioBlob = new Blob(chunks, { type: mime });
+
+        // Enforce maximum upload size of 10 MB
+        if (audioBlob.size > 10 * 1024 * 1024) {
+          setMicError('حجم الملف الصوتي المسجل يتجاوز الحد الأقصى (10 ميجابايت).');
+          return;
+        }
+
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+          const base64Data = (reader.result as string)?.split(',')[1];
+          if (base64Data) {
+            if (targetMode === 'voice') {
+              await handleSendVoiceTurn(undefined, base64Data);
+            } else {
+              // For chat, send audio to STT then send user message
+              try {
+                const sId = voiceSessionId;
+                const tokenToUse = customerToken || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_customer_token') : null);
+                const headers: Record<string, string> = {};
+                if (tokenToUse) headers['X-Customer-Token'] = tokenToUse;
+                if (conversationId) headers['X-Conversation-Id'] = conversationId;
+
+                const formData = new FormData();
+                formData.append('file', audioBlob, 'mic_recording.webm');
+                const sttRes = await fetch('/api/voice/stt', {
+                  method: 'POST',
+                  headers,
+                  body: formData
+                });
+                if (sttRes.ok) {
+                  const data = await sttRes.json();
+                  if (data.text) {
+                    handleSendMessage(data.text);
+                  }
+                }
+              } catch (sttErr) {
+                console.error('Chat STT error:', sttErr);
+              }
+            }
+          }
+        };
+        reader.readAsDataURL(audioBlob);
+      };
+
+      recorder.start(250);
+      setIsRecordingMic(true);
+      setIsRecording(true);
+      setMicDuration(0);
+
+      // Enforce client-side maximum duration limit (30 seconds)
+      const startTime = Date.now();
+      micIntervalRef.current = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        setMicDuration(elapsed);
+        if (elapsed >= 30) {
+          stopVoiceRecording();
+        }
+      }, 500);
+    } catch (err: any) {
+      console.error('Microphone access error:', err);
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setMicError('تم رفض إذن الوصول للميكروفون من قِبل المستخدم أو إعدادات المتصفح.');
+      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        setMicError('لم يتم العثور على ميكروفون متصل بالجهاز.');
+      } else {
+        setMicError(`فشل الوصول للميكروفون: ${err.message || 'خطأ غير معروف'}`);
+      }
+      setIsRecordingMic(false);
       setIsRecording(false);
+    }
+  };
+
+  const stopVoiceRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  const toggleRecording = () => {
+    if (!isRecordingMic && !isRecording) {
+      startVoiceRecording('chat');
+    } else {
+      stopVoiceRecording();
     }
   };
 
@@ -539,9 +664,9 @@ export default function Dashboard() {
     }
   };
 
-  const handleSendVoiceTurn = async (messageText?: string) => {
-    const textToSend = messageText || voiceText;
-    if (!textToSend.trim() || !selectedAgent) return;
+  const handleSendVoiceTurn = async (messageText?: string, audioBase64?: string) => {
+    const textToSend = messageText !== undefined ? messageText : voiceText;
+    if ((!textToSend.trim() && !audioBase64) || !selectedAgent) return;
     isInterruptedRef.current = false;
     const currentRequestId = ++activeVoiceRequestIdRef.current;
     let sId = voiceSessionId;
@@ -578,7 +703,8 @@ export default function Dashboard() {
           sessionId: sId,
           conversationId: currentConv,
           agentId: selectedAgent.id,
-          message: textToSend
+          message: textToSend || null,
+          audioBase64: audioBase64 || null
         })
       });
 
@@ -600,7 +726,11 @@ export default function Dashboard() {
 
         setVoiceTurnId(data.turnId);
         setVoiceResponseText(data.text || '');
-        setVoiceText('');
+        if (data.userText) {
+          setVoiceText(data.userText);
+        } else {
+          setVoiceText('');
+        }
 
         if (data.audioBase64) {
           const audioSrc = `data:audio/wav;base64,${data.audioBase64}`;
@@ -1362,6 +1492,7 @@ export default function Dashboard() {
                 gap: '12px'
               }}>
                 <button
+                  id="chat-mic-btn"
                   type="button"
                   onClick={toggleRecording}
                   title={isRecording ? 'إيقاف التسجيل' : 'تحدث عبر الميكروفون (Push to Talk)'}
@@ -1723,55 +1854,167 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {/* Voice Turn Input Box */}
+              {/* Microphone Error Banner */}
+              {micError && (
+                <div
+                  id="voice-mic-error"
+                  style={{
+                    background: 'rgba(239, 68, 68, 0.15)',
+                    border: '1px solid #ef4444',
+                    borderRadius: '8px',
+                    padding: '10px 14px',
+                    color: '#fca5a5',
+                    fontSize: '0.85rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '8px'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <AlertCircle size={16} color="#ef4444" />
+                    <span>{micError}</span>
+                  </div>
+                  <button
+                    onClick={() => setMicError(null)}
+                    style={{
+                      background: 'transparent',
+                      border: 'none',
+                      color: '#fca5a5',
+                      cursor: 'pointer',
+                      fontSize: '1rem',
+                      padding: '0 4px'
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* Voice Turn Input Box & Real Push-to-Talk Recording */}
               <div style={{
                 background: 'rgba(0, 0, 0, 0.25)',
                 border: '1px solid var(--border-color)',
                 borderRadius: '12px',
                 padding: '16px',
                 display: 'flex',
+                flexDirection: 'column',
                 gap: '12px'
               }}>
-                <input
-                  id="voice-input-text"
-                  type="text"
-                  placeholder="اكتب رسالة صوتية أو استفسار باللهجة المصرية..."
-                  value={voiceText}
-                  onChange={e => setVoiceText(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleSendVoiceTurn()}
-                  disabled={isVoiceProcessing}
-                  style={{
-                    flex: 1,
-                    background: 'rgba(255, 255, 255, 0.05)',
-                    border: '1px solid var(--border-color)',
-                    borderRadius: '8px',
-                    padding: '12px 16px',
-                    color: '#fff',
-                    fontSize: '0.9rem',
-                    fontFamily: 'inherit'
-                  }}
-                />
-                <button
-                  id="send-voice-turn-btn"
-                  onClick={() => handleSendVoiceTurn()}
-                  disabled={isVoiceProcessing || !voiceText.trim()}
-                  style={{
-                    background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
-                    border: 'none',
-                    borderRadius: '8px',
-                    padding: '0 20px',
-                    color: '#fff',
-                    fontWeight: 700,
-                    cursor: (isVoiceProcessing || !voiceText.trim()) ? 'not-allowed' : 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '8px',
-                    opacity: (isVoiceProcessing || !voiceText.trim()) ? 0.6 : 1
-                  }}
-                >
-                  <Send size={16} />
-                  <span>توليد وتحدث</span>
-                </button>
+                <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                  <input
+                    id="voice-input-text"
+                    type="text"
+                    placeholder="اكتب رسالة صوتية أو استفسار باللهجة المصرية..."
+                    value={voiceText}
+                    onChange={e => setVoiceText(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && handleSendVoiceTurn()}
+                    disabled={isVoiceProcessing || isRecordingMic}
+                    style={{
+                      flex: 1,
+                      background: 'rgba(255, 255, 255, 0.05)',
+                      border: '1px solid var(--border-color)',
+                      borderRadius: '8px',
+                      padding: '12px 16px',
+                      color: '#fff',
+                      fontSize: '0.9rem',
+                      fontFamily: 'inherit'
+                    }}
+                  />
+                  <button
+                    id="send-voice-turn-btn"
+                    onClick={() => handleSendVoiceTurn()}
+                    disabled={isVoiceProcessing || !voiceText.trim() || isRecordingMic}
+                    style={{
+                      background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+                      border: 'none',
+                      borderRadius: '8px',
+                      padding: '0 20px',
+                      height: '46px',
+                      color: '#fff',
+                      fontWeight: 700,
+                      cursor: (isVoiceProcessing || !voiceText.trim() || isRecordingMic) ? 'not-allowed' : 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                      opacity: (isVoiceProcessing || !voiceText.trim() || isRecordingMic) ? 0.6 : 1
+                    }}
+                  >
+                    <Send size={16} />
+                    <span>توليد وتحدث</span>
+                  </button>
+                </div>
+
+                {/* Real Microphone Push-to-Talk Controls */}
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  paddingTop: '8px',
+                  borderTop: '1px solid rgba(255, 255, 255, 0.06)',
+                  flexWrap: 'wrap',
+                  gap: '10px'
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <button
+                      id="voice-record-btn"
+                      type="button"
+                      onClick={() => {
+                        if (isRecordingMic) {
+                          stopVoiceRecording();
+                        } else {
+                          startVoiceRecording('voice');
+                        }
+                      }}
+                      disabled={isVoiceProcessing}
+                      style={{
+                        background: isRecordingMic ? '#ef4444' : 'rgba(16, 185, 129, 0.15)',
+                        border: isRecordingMic ? '1px solid #ef4444' : '1px solid #10b981',
+                        borderRadius: '8px',
+                        padding: '8px 16px',
+                        color: '#fff',
+                        fontWeight: 600,
+                        cursor: isVoiceProcessing ? 'not-allowed' : 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                        boxShadow: isRecordingMic ? '0 0 15px rgba(239, 68, 68, 0.6)' : 'none',
+                        transition: 'all 0.2s'
+                      }}
+                    >
+                      {isRecordingMic ? <MicOff size={16} /> : <Mic size={16} />}
+                      <span>{isRecordingMic ? `إيقاف وإرسال (${micDuration}s / 30s)` : 'تسجيل صوتي حي بالميكروفون'}</span>
+                    </button>
+
+                    {isRecordingMic && (
+                      <div
+                        id="voice-recording-indicator"
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          color: '#ef4444',
+                          fontSize: '0.85rem',
+                          fontWeight: 600
+                        }}
+                      >
+                        <span style={{
+                          display: 'inline-block',
+                          width: '10px',
+                          height: '10px',
+                          borderRadius: '50%',
+                          backgroundColor: '#ef4444',
+                          boxShadow: '0 0 8px #ef4444'
+                        }} />
+                        <span>جاري التسجيل الصوتي الحقيقي (بحد أقصى 30 ثانية)...</span>
+                      </div>
+                    )}
+                  </div>
+
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                    يدعم Web Audio / MediaRecorder API، استهلاك STT محلي (faster-whisper) وTTS مصري.
+                  </span>
+                </div>
               </div>
 
               {/* Active Voice Response Content Display */}

@@ -144,6 +144,32 @@ async function runBrowserSmokeSuite() {
     await page.waitForSelector('#voice-input-text', { timeout: 5000 });
     console.log(' Switched to Voice tab. Session NOT explicitly started.');
 
+    // Verify Real Voice Microphone Controls and Push-to-Talk UI
+    console.log(' - Verifying Real Voice Push-to-Talk microphone controls (#voice-record-btn)...');
+    await page.waitForSelector('#voice-record-btn', { timeout: 5000 });
+    const recordBtnVisible = await page.isVisible('#voice-record-btn');
+    assert.strictEqual(recordBtnVisible, true, '#voice-record-btn must be visible and interactive');
+
+    // Test clicking voice record button handles mic permissions / browser devices gracefully
+    await page.click('#voice-record-btn');
+    await page.waitForTimeout(500);
+    const hasRecordingIndicator = await page.$('#voice-recording-indicator');
+    const hasMicError = await page.$('#voice-mic-error');
+    assert.ok(hasRecordingIndicator !== null || hasMicError !== null, 'Push-to-talk click must either activate recording or display permission/device status');
+    if (hasRecordingIndicator) {
+      console.log('   Microphone recording actively started, clicking again to stop...');
+      await page.click('#voice-record-btn');
+      await page.waitForTimeout(300);
+    } else if (hasMicError) {
+      console.log('   Microphone error handled gracefully with UI banner (#voice-mic-error).');
+      // Dismiss error banner
+      await page.click('#voice-mic-error button');
+      await page.waitForTimeout(200);
+      const errorDismissed = await page.$('#voice-mic-error');
+      assert.strictEqual(errorDismissed, null, '#voice-mic-error should dismiss when closed');
+    }
+    assertNoPageErrors('Voice Record Button UI');
+
     // Turn 1: First turn WITHOUT manually starting session (exercises automatic session creation in handleSendVoiceTurn)
     console.log(' - Sending Voice Turn 1 without manual session start (exercises automatic session creation)...');
     await page.fill('#voice-input-text', 'مساء الخير عايز استفسار عن مواعيد العيادة');

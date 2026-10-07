@@ -921,4 +921,142 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
             Assert.True(await db.Conversations.AnyAsync(c => c.Id == unrelatedConvId));
         }
     }
+
+    [Fact]
+    public async Task VoiceEndpoints_EnforceAuthorization_And_CrossCustomerIsolation()
+    {
+        var clientA = _factory.CreateClient();
+        var clientB = _factory.CreateClient();
+        var clientAnon = _factory.CreateClient();
+
+        var (sessA, convA, tokenA) = await CreateSessionAsync(clientA);
+        var (sessB, convB, tokenB) = await CreateSessionAsync(clientB);
+
+        // 1. STT: Anonymous request is rejected with 403 Forbidden
+        using var emptyContent = new MultipartFormDataContent();
+        emptyContent.Add(new ByteArrayContent(new byte[] { 1, 2, 3, 4 }), "file", "audio.wav");
+        var sttAnonRes = await clientAnon.PostAsync("/api/voice/stt", emptyContent);
+        Assert.Equal(HttpStatusCode.Forbidden, sttAnonRes.StatusCode);
+
+        // 2. STT: Cross-customer token attack (Customer B token attempting to access conversation A) -> 403 Forbidden
+        using var crossCustomerContent = new MultipartFormDataContent();
+        crossCustomerContent.Add(new ByteArrayContent(new byte[] { 1, 2, 3, 4 }), "file", "audio.wav");
+        var crossSttReq = new HttpRequestMessage(HttpMethod.Post, "/api/voice/stt")
+        {
+            Content = crossCustomerContent
+        };
+        crossSttReq.Headers.Add("X-Customer-Token", tokenB);
+        crossSttReq.Headers.Add("X-Conversation-Id", convA.ToString());
+        var crossSttRes = await clientB.SendAsync(crossSttReq);
+        Assert.Equal(HttpStatusCode.Forbidden, crossSttRes.StatusCode);
+
+        // 3. STT: Valid customer token for owning conversation -> 200 OK
+        using var validContentA = new MultipartFormDataContent();
+        validContentA.Add(new ByteArrayContent(new byte[] { 1, 2, 3, 4 }), "file", "audio.wav");
+        var validSttReq = new HttpRequestMessage(HttpMethod.Post, "/api/voice/stt")
+        {
+            Content = validContentA
+        };
+        validSttReq.Headers.Add("X-Customer-Token", tokenA);
+        validSttReq.Headers.Add("X-Conversation-Id", convA.ToString());
+        var validSttRes = await clientA.SendAsync(validSttReq);
+        Assert.Equal(HttpStatusCode.OK, validSttRes.StatusCode);
+
+        // 4. STT: Valid Admin Key -> 200 OK
+        using var adminContent = new MultipartFormDataContent();
+        adminContent.Add(new ByteArrayContent(new byte[] { 1, 2, 3, 4 }), "file", "audio.wav");
+        var adminSttReq = new HttpRequestMessage(HttpMethod.Post, "/api/voice/stt")
+        {
+            Content = adminContent
+        };
+        adminSttReq.Headers.Add("X-Admin-Key", _adminKey);
+        var adminSttRes = await clientAnon.SendAsync(adminSttReq);
+        Assert.Equal(HttpStatusCode.OK, adminSttRes.StatusCode);
+
+        // 5. TTS: Anonymous request is rejected with 403 Forbidden
+        var ttsAnonRes = await clientAnon.PostAsJsonAsync("/api/voice/tts", new { text = "أهلاً بك" });
+        Assert.Equal(HttpStatusCode.Forbidden, ttsAnonRes.StatusCode);
+
+        // 6. TTS: Cross-customer token attack -> 403 Forbidden
+        var crossTtsReq = new HttpRequestMessage(HttpMethod.Post, "/api/voice/tts")
+        {
+            Content = JsonContent.Create(new { text = "أهلاً بك", conversationId = convA })
+        };
+        crossTtsReq.Headers.Add("X-Customer-Token", tokenB);
+        var crossTtsRes = await clientB.SendAsync(crossTtsReq);
+        Assert.Equal(HttpStatusCode.Forbidden, crossTtsRes.StatusCode);
+
+        // 7. TTS: Valid customer token for owning conversation -> 200 OK with audio/wav
+        var validTtsReq = new HttpRequestMessage(HttpMethod.Post, "/api/voice/tts")
+        {
+            Content = JsonContent.Create(new { text = "أهلاً بك", conversationId = convA })
+        };
+        validTtsReq.Headers.Add("X-Customer-Token", tokenA);
+        var validTtsRes = await clientA.SendAsync(validTtsReq);
+        Assert.Equal(HttpStatusCode.OK, validTtsRes.StatusCode);
+        Assert.Equal("audio/wav", validTtsRes.Content.Headers.ContentType?.MediaType);
+
+        // 8. TTS: Valid Admin Key -> 200 OK
+        var adminTtsReq = new HttpRequestMessage(HttpMethod.Post, "/api/voice/tts")
+        {
+            Content = JsonContent.Create(new { text = "أهلاً بك" })
+        };
+        adminTtsReq.Headers.Add("X-Admin-Key", _adminKey);
+        var adminTtsRes = await clientAnon.SendAsync(adminTtsReq);
+        Assert.Equal(HttpStatusCode.OK, adminTtsRes.StatusCode);
+        Assert.Equal("audio/wav", adminTtsRes.Content.Headers.ContentType?.MediaType);
+    }
+
+    [Fact]
+    public async Task VoiceEndpoints_Enforce_Size_And_Length_Limits()
+    {
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Admin-Key", _adminKey);
+
+        // 1. STT rejects file > 10MB with 413 Payload Too Large
+        // Simulate oversized stream without allocating 11MB RAM using custom Stream
+        var oversizedBytes = new byte[10 * 1024 * 1024 + 1024]; // 10MB + 1KB
+        using var oversizedContent = new MultipartFormDataContent();
+        oversizedContent.Add(new ByteArrayContent(oversizedBytes), "file", "oversized.wav");
+        var sttOversizedRes = await client.PostAsync("/api/voice/stt", oversizedContent);
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, sttOversizedRes.StatusCode);
+
+        // 2. TTS rejects text > 2000 chars with 400 Bad Request
+        var longText = new string('ا', 2001);
+        var ttsLongRes = await client.PostAsJsonAsync("/api/voice/tts", new { text = longText });
+        Assert.Equal(HttpStatusCode.BadRequest, ttsLongRes.StatusCode);
+
+        // 3. TTS rejects empty text with 400 Bad Request
+        var ttsEmptyRes = await client.PostAsJsonAsync("/api/voice/tts", new { text = "   " });
+        Assert.Equal(HttpStatusCode.BadRequest, ttsEmptyRes.StatusCode);
+    }
+
+    [Fact]
+    public async Task VoiceTurn_WithAudioBase64_ExecutesSequentially_WithoutNestedDeadlock()
+    {
+        var client = _factory.CreateClient();
+        var (sessionId, convId, token) = await CreateSessionAsync(client);
+        client.DefaultRequestHeaders.Add("X-Customer-Token", token);
+
+        // Provide a valid small audio base64 payload
+        var dummyAudioBase64 = Convert.ToBase64String(new byte[] { 82, 73, 70, 70, 36, 0, 0, 0, 87, 65, 86, 69 });
+        var turnRequest = new
+        {
+            sessionId = sessionId,
+            conversationId = convId,
+            audioBase64 = dummyAudioBase64
+        };
+
+        var res = await client.PostAsJsonAsync("/api/voice/turn", turnRequest);
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.True(json.TryGetProperty("turnId", out var turnIdProp));
+        Assert.Equal(1, turnIdProp.GetInt32());
+        Assert.True(json.TryGetProperty("text", out var textProp));
+        Assert.False(string.IsNullOrWhiteSpace(textProp.GetString()));
+        Assert.True(json.TryGetProperty("audioBase64", out var audioBase64Prop));
+        Assert.False(string.IsNullOrWhiteSpace(audioBase64Prop.GetString()));
+    }
 }
+

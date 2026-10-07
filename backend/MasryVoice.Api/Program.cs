@@ -241,6 +241,7 @@ else
     builder.Services.AddSingleton<ITtsProvider, SimulatedTtsProvider>();
 }
 builder.Services.AddSingleton<VoiceSessionManager>();
+builder.Services.AddSingleton<VoiceAdmissionManager>();
 
 // 12. Register Durable Outbox Processor Background Service
 builder.Services.AddHostedService<DurableOutboxProcessor>();
@@ -1098,33 +1099,146 @@ app.MapPost("/api/voice/interrupt", (
     return Results.Ok(new { sessionId = req.SessionId, interrupted });
 }).RequireRateLimiting("inference");
 
-app.MapPost("/api/voice/stt", async (ISttProvider stt, HttpRequest request, CancellationToken ct) =>
+app.MapPost("/api/voice/stt", async (
+    HttpContext ctx,
+    ISecurityService security,
+    VoiceAdmissionManager admission,
+    ISttProvider stt,
+    HttpRequest request,
+    CancellationToken ct) =>
 {
-    if (!request.HasFormContentType || request.Form.Files.Count == 0)
+    // Authorization check: Require AdminKey or ownership of conversation
+    var convIdStr = request.Headers["X-Conversation-Id"].FirstOrDefault() 
+                    ?? request.Query["conversationId"].FirstOrDefault();
+    bool authorized = false;
+    var adminKey = request.Headers["X-Admin-Key"].FirstOrDefault();
+    if (security.ValidateAdminKey(adminKey))
     {
-        var text = await stt.TranscribeAudioAsync(request.Body, request.ContentType ?? "audio/wav", "ar", ct);
-        return Results.Ok(new { text });
+        authorized = true;
+    }
+    else if (!string.IsNullOrEmpty(convIdStr) && Guid.TryParse(convIdStr, out var parsedConvId))
+    {
+        authorized = security.HasAccessToConversation(ctx, parsedConvId);
+    }
+    else
+    {
+        var token = request.Headers["X-Customer-Token"].FirstOrDefault();
+        var tokenConvId = security.GetTokenConversationId(token);
+        if (tokenConvId.HasValue && tokenConvId.Value != Guid.Empty)
+        {
+            authorized = security.ValidateCustomerAccess(token, tokenConvId.Value);
+        }
     }
 
-    var file = request.Form.Files[0];
-    await using var stream = file.OpenReadStream();
-    var transcribed = await stt.TranscribeAudioAsync(stream, file.ContentType, "ar", ct);
-    return Results.Ok(new { text = transcribed });
+    if (!authorized)
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
+    // Enforce audio size limit (10 MB max)
+    const long MaxAudioSizeBytes = 10 * 1024 * 1024;
+    if (request.ContentLength.HasValue && request.ContentLength.Value > MaxAudioSizeBytes)
+    {
+        return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+    }
+
+    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, ctx.RequestAborted);
+    try
+    {
+        using var permit = await admission.AcquireSttPermitAsync(linkedCts.Token);
+
+        if (!request.HasFormContentType || request.Form.Files.Count == 0)
+        {
+            var text = await stt.TranscribeAudioAsync(request.Body, request.ContentType ?? "audio/wav", "ar", linkedCts.Token);
+            return Results.Ok(new { text });
+        }
+
+        var file = request.Form.Files[0];
+        if (file.Length > MaxAudioSizeBytes)
+        {
+            return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+        }
+
+        await using var stream = file.OpenReadStream();
+        var transcribed = await stt.TranscribeAudioAsync(stream, file.ContentType ?? "audio/wav", "ar", linkedCts.Token);
+        return Results.Ok(new { text = transcribed });
+    }
+    catch (VoiceOverloadException)
+    {
+        return Results.StatusCode(StatusCodes.Status429TooManyRequests);
+    }
+    catch (OperationCanceledException)
+    {
+        return Results.StatusCode(499);
+    }
 }).RequireRateLimiting("inference");
 
-app.MapPost("/api/voice/tts", async (ITtsProvider tts, [Microsoft.AspNetCore.Mvc.FromBody] TtsSynthesizeRequest req, CancellationToken ct) =>
+app.MapPost("/api/voice/tts", async (
+    HttpContext ctx,
+    ISecurityService security,
+    VoiceAdmissionManager admission,
+    ITtsProvider tts,
+    [Microsoft.AspNetCore.Mvc.FromBody] TtsSynthesizeRequest req,
+    CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(req.Text)) return Results.BadRequest();
-    var audio = await tts.SynthesizeSpeechAsync(req.Text, req.LanguageCode ?? "ar-EG", ct);
-    return Results.File(audio.ToArray(), "audio/wav");
+    if (req.Text.Length > 2000)
+    {
+        return Results.BadRequest(new { message = "Text exceeds maximum limit of 2000 characters." });
+    }
+
+    // Authorization check
+    bool authorized = false;
+    var adminKey = ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
+    if (security.ValidateAdminKey(adminKey))
+    {
+        authorized = true;
+    }
+    else if (req.ConversationId.HasValue && req.ConversationId.Value != Guid.Empty)
+    {
+        authorized = security.HasAccessToConversation(ctx, req.ConversationId.Value);
+    }
+    else
+    {
+        var token = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
+        var tokenConvId = security.GetTokenConversationId(token);
+        if (tokenConvId.HasValue && tokenConvId.Value != Guid.Empty)
+        {
+            authorized = security.ValidateCustomerAccess(token, tokenConvId.Value);
+        }
+    }
+
+    if (!authorized)
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
+    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, ctx.RequestAborted);
+    try
+    {
+        using var permit = await admission.AcquireTtsPermitAsync(linkedCts.Token);
+        var audio = await tts.SynthesizeSpeechAsync(req.Text, req.LanguageCode ?? "ar-EG", linkedCts.Token);
+        return Results.File(audio.ToArray(), "audio/wav");
+    }
+    catch (VoiceOverloadException)
+    {
+        return Results.StatusCode(StatusCodes.Status429TooManyRequests);
+    }
+    catch (OperationCanceledException)
+    {
+        return Results.StatusCode(499);
+    }
 }).RequireRateLimiting("inference");
 
 app.MapPost("/api/voice/turn", async (
     HttpContext ctx,
     VoiceSessionManager sessionMgr,
+    VoiceAdmissionManager admission,
     AgentOrchestrator orchestrator,
+    ISttProvider stt,
     ITtsProvider tts,
     ISecurityService security,
+    AppDbContext db,
     [Microsoft.AspNetCore.Mvc.FromBody] VoiceTurnRequest req,
     CancellationToken ct) =>
 {
@@ -1148,35 +1262,78 @@ app.MapPost("/api/voice/turn", async (
     }
 
     using var turnContext = session.StartNewTurn();
+    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(turnContext.Token, ctx.RequestAborted);
+    var token = linkedCts.Token;
 
     var assistantText = new System.Text.StringBuilder();
     try
     {
-        await foreach (var chatEvent in orchestrator.ProcessUserMessageAsync(req.AgentId, req.ConversationId, req.Message, turnContext.Token))
+        string userMessage = req.Message ?? string.Empty;
+
+        // If audio base64 is provided instead of text, transcribe with STT under bounded admission
+        if (string.IsNullOrWhiteSpace(userMessage) && !string.IsNullOrWhiteSpace(req.AudioBase64))
         {
-            if (turnContext.Token.IsCancellationRequested) break;
+            var audioBytes = Convert.FromBase64String(req.AudioBase64);
+            using (var sttPermit = await admission.AcquireSttPermitAsync(token))
+            using (var audioStream = new MemoryStream(audioBytes))
+            {
+                userMessage = await stt.TranscribeAudioAsync(audioStream, "audio/wav", "ar", token);
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(userMessage))
+        {
+            return Results.BadRequest(new { message = "Message text or audio is required." });
+        }
+
+        // Fallback to active agent if AgentId is empty
+        Guid effectiveAgentId = req.AgentId;
+        if (effectiveAgentId == Guid.Empty)
+        {
+            var activeAgent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.IsActive, token);
+            if (activeAgent != null)
+            {
+                effectiveAgentId = activeAgent.Id;
+            }
+        }
+
+        // Process user message through LLM orchestrator (acquires and releases LLM permit internally)
+        await foreach (var chatEvent in orchestrator.ProcessUserMessageAsync(effectiveAgentId, req.ConversationId, userMessage, token))
+        {
+            if (token.IsCancellationRequested) break;
             if (chatEvent.EventType == "token" && !string.IsNullOrEmpty(chatEvent.Content))
             {
                 assistantText.Append(chatEvent.Content);
             }
         }
 
-        if (turnContext.Token.IsCancellationRequested || !session.IsTurnActive(turnContext.TurnId))
+        if (token.IsCancellationRequested || !session.IsTurnActive(turnContext.TurnId))
         {
             return Results.StatusCode(499); // Client Closed Request / Interrupted
         }
 
         var reply = assistantText.ToString();
-        var audioBytes = await tts.SynthesizeSpeechAsync(reply, "ar-EG", turnContext.Token);
+
+        // Synthesize response speech with TTS under separate bounded admission (Zero nested deadlock!)
+        ReadOnlyMemory<byte> audioBytesOut;
+        using (var ttsPermit = await admission.AcquireTtsPermitAsync(token))
+        {
+            audioBytesOut = await tts.SynthesizeSpeechAsync(reply, "ar-EG", token);
+        }
 
         return Results.Ok(new
         {
             turnId = turnContext.TurnId,
             sessionId = req.SessionId,
             conversationId = req.ConversationId,
+            userText = userMessage,
             text = reply,
-            audioBase64 = Convert.ToBase64String(audioBytes.ToArray())
+            audioBase64 = Convert.ToBase64String(audioBytesOut.ToArray())
         });
+    }
+    catch (VoiceOverloadException)
+    {
+        return Results.StatusCode(StatusCodes.Status429TooManyRequests);
     }
     catch (OperationCanceledException)
     {
@@ -1244,14 +1401,16 @@ public record VoiceInterruptRequest(
 
 public record TtsSynthesizeRequest(
     string Text,
-    string? LanguageCode = "ar-EG"
+    string? LanguageCode = "ar-EG",
+    Guid? ConversationId = null
 );
 
 public record VoiceTurnRequest(
     Guid SessionId,
     Guid ConversationId,
     Guid AgentId,
-    string Message
+    string? Message = null,
+    string? AudioBase64 = null
 );
 
 public partial class Program { }

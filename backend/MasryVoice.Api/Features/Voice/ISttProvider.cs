@@ -30,7 +30,7 @@ public class WhisperSttProvider : ISttProvider
     {
         ct.ThrowIfCancellationRequested();
 
-        if (audioStream == null || audioStream.Length == 0)
+        if (audioStream == null || (audioStream.CanSeek && audioStream.Length == 0))
         {
             throw new ArgumentException("Audio stream cannot be null or empty.", nameof(audioStream));
         }

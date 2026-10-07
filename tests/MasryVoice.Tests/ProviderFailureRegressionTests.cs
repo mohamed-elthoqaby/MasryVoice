@@ -161,4 +161,56 @@ public class ProviderFailureRegressionTests
         var vec = await detEmb.GenerateEmbeddingAsync("test");
         Assert.Equal(384, vec.Length);
     }
+
+    [Fact]
+    public async Task VoiceAdmissionManager_EnforcesBoundedConcurrency_AndRejectsWhenQueueFull()
+    {
+        var manager = new VoiceAdmissionManager(new VoiceAdmissionOptions
+        {
+            MaxConcurrentStt = 1,
+            MaxQueueLength = 1,
+            QueueWaitTimeoutSeconds = 1
+        });
+
+        // 1. Acquire the only available permit
+        var permit1 = await manager.AcquireSttPermitAsync();
+        Assert.Equal(1, manager.ActiveSttCount);
+
+        // 2. Queue permit 2 (now in waiting queue)
+        var waitingTask = Task.Run(async () =>
+        {
+            using var p = await manager.AcquireSttPermitAsync();
+        });
+        await Task.Delay(50); // allow waitingTask to increment waiting count
+
+        // 3. Caller 3 exceeds queue length -> must throw VoiceOverloadException immediately
+        var ex = await Assert.ThrowsAsync<VoiceOverloadException>(() => manager.AcquireSttPermitAsync());
+        Assert.Equal("STT_QUEUE_FULL", ex.Code);
+
+        // Release permit 1 and allow waitingTask to complete
+        permit1.Dispose();
+        await waitingTask;
+        Assert.Equal(0, manager.ActiveSttCount);
+    }
+
+    [Fact]
+    public async Task WhisperSttProvider_ThrowsArgumentException_OnEmptyAudio()
+    {
+        var httpClient = new HttpClient { BaseAddress = new Uri("http://127.0.0.1:8000") };
+        var provider = new WhisperSttProvider(httpClient, NullLogger<WhisperSttProvider>.Instance);
+
+        using var emptyStream = new MemoryStream();
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            provider.TranscribeAudioAsync(emptyStream, "audio/wav", "ar", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task LocalEgyptianTtsProvider_ThrowsArgumentException_OnEmptyText()
+    {
+        var httpClient = new HttpClient { BaseAddress = new Uri("http://127.0.0.1:8000") };
+        var provider = new LocalEgyptianTtsProvider(httpClient, NullLogger<LocalEgyptianTtsProvider>.Instance);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            provider.SynthesizeSpeechAsync("   ", "ar-EG", CancellationToken.None));
+    }
 }
