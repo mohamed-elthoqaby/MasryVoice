@@ -4,10 +4,12 @@ namespace MasryVoice.Api.Features.Voice;
 
 public class VoiceTurnContext : IDisposable
 {
+    private bool _disposed;
     public long TurnId { get; }
     public CancellationTokenSource Cts { get; }
     public CancellationToken Token => Cts.Token;
     public DateTime StartedAtUtc { get; } = DateTime.UtcNow;
+    public bool IsDisposed => _disposed;
 
     public VoiceTurnContext(long turnId)
     {
@@ -15,9 +17,26 @@ public class VoiceTurnContext : IDisposable
         Cts = new CancellationTokenSource();
     }
 
+    public void CancelSafely()
+    {
+        if (_disposed) return;
+        try
+        {
+            if (!Cts.IsCancellationRequested)
+            {
+                Cts.Cancel();
+            }
+        }
+        catch (ObjectDisposedException) { }
+    }
+
     public void Dispose()
     {
-        Cts.Dispose();
+        if (!_disposed)
+        {
+            _disposed = true;
+            Cts.Dispose();
+        }
     }
 }
 
@@ -48,10 +67,7 @@ public class VoiceSession
         lock (_lock)
         {
             // Cancel existing turn if still running
-            if (_currentTurn != null && !_currentTurn.Cts.IsCancellationRequested)
-            {
-                _currentTurn.Cts.Cancel();
-            }
+            _currentTurn?.CancelSafely();
 
             _currentTurnId++;
             _currentTurn = new VoiceTurnContext(_currentTurnId);
@@ -63,9 +79,9 @@ public class VoiceSession
     {
         lock (_lock)
         {
-            if (_currentTurn != null && !_currentTurn.Cts.IsCancellationRequested)
+            if (_currentTurn != null && !_currentTurn.IsDisposed)
             {
-                _currentTurn.Cts.Cancel();
+                _currentTurn.CancelSafely();
                 _currentTurnId++; // Increment to invalidate any pending synthesis in flight
                 return true;
             }
@@ -77,7 +93,16 @@ public class VoiceSession
     {
         lock (_lock)
         {
-            return _currentTurnId == turnId && (_currentTurn == null || !_currentTurn.Cts.IsCancellationRequested);
+            if (_currentTurnId != turnId) return false;
+            if (_currentTurn == null || _currentTurn.IsDisposed) return true;
+            try
+            {
+                return !_currentTurn.Cts.IsCancellationRequested;
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
         }
     }
 }

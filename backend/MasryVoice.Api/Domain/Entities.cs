@@ -122,6 +122,7 @@ public class PendingBooking
 public class Booking
 {
     public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid? ConversationId { get; set; }
     public Guid SlotId { get; set; }
     public string CustomerName { get; set; } = string.Empty;
     public string CustomerPhone { get; set; } = string.Empty;

@@ -283,6 +283,12 @@ public class GetBookingTool : ITool
 
         var query = _db.Bookings.AsQueryable();
 
+        // Strict ownership: Bind query to the current conversation to prevent cross-conversation disclosure
+        if (conversationId != Guid.Empty)
+        {
+            query = query.Where(b => b.ConversationId == conversationId);
+        }
+
         if (parsedBookingId.HasValue)
         {
             query = query.Where(b => b.Id == parsedBookingId.Value);

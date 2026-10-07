@@ -21,6 +21,12 @@ public class AppDbContext : DbContext
     public DbSet<DocumentChunk> DocumentChunks => Set<DocumentChunk>();
     public DbSet<OutboxJob> OutboxJobs => Set<OutboxJob>();
 
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+    {
+        base.OnConfiguring(optionsBuilder);
+        optionsBuilder.ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.PendingModelChangesWarning));
+    }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
@@ -110,10 +116,16 @@ public class AppDbContext : DbContext
              .HasForeignKey(bk => bk.SlotId)
              .OnDelete(DeleteBehavior.Restrict);
 
+            b.HasOne<Conversation>()
+             .WithMany()
+             .HasForeignKey(bk => bk.ConversationId)
+             .OnDelete(DeleteBehavior.SetNull);
+
             // Unique index on IdempotencyKey to prevent duplicate booking creation
             b.HasIndex(bk => bk.IdempotencyKey).IsUnique();
             // Fast order-by-descending seek for recent bookings
             b.HasIndex(bk => bk.CreatedAtUtc);
+            b.HasIndex(bk => bk.ConversationId);
         });
 
         if (Database.IsNpgsql())

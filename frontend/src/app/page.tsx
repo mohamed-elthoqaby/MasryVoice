@@ -123,7 +123,11 @@ export default function Dashboard() {
   ]);
   const [inputMessage, setInputMessage] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
-  const [conversationId, setConversationId] = useState<string>(() => createUUID());
+  const [conversationId, setConversationId] = useState<string>('');
+  const [customerToken, setCustomerToken] = useState<string>('');
+  const [adminKey, setAdminKey] = useState<string>('');
+  const [adminKeyInput, setAdminKeyInput] = useState<string>('');
+  const [showAdminModal, setShowAdminModal] = useState<boolean>(false);
   const [isRecording, setIsRecording] = useState(false);
   const [toolLogs, setToolLogs] = useState<any[]>([]);
   const [pendingCard, setPendingCard] = useState<PendingBookingCard | null>(null);
@@ -147,11 +151,14 @@ export default function Dashboard() {
   // Voice tab state
   const [voiceSessionId, setVoiceSessionId] = useState<string>('');
   const [voiceText, setVoiceText] = useState('');
+  const [voiceResponseText, setVoiceResponseText] = useState<string>('');
   const [isVoiceProcessing, setIsVoiceProcessing] = useState(false);
   const [isVoiceSpeaking, setIsVoiceSpeaking] = useState(false);
   const [voiceInterrupted, setVoiceInterrupted] = useState(false);
   const [voiceTurnId, setVoiceTurnId] = useState<number>(0);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
+  const isInterruptedRef = useRef<boolean>(false);
+  const activeVoiceRequestIdRef = useRef<number>(0);
 
   // Settings form state
   const [agentForm, setAgentForm] = useState<Partial<Agent>>({});
@@ -167,16 +174,59 @@ export default function Dashboard() {
     scrollToBottom();
   }, [messages]);
 
+  // Load persisted session and admin keys from browser sessionStorage on mount
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const savedAdmin = sessionStorage.getItem('masryvoice_admin_key');
+      if (savedAdmin) {
+        setAdminKey(savedAdmin);
+        setAdminKeyInput(savedAdmin);
+      }
+      const savedConv = sessionStorage.getItem('masryvoice_conversation_id');
+      const savedToken = sessionStorage.getItem('masryvoice_customer_token');
+      if (savedConv) setConversationId(savedConv);
+      if (savedToken) setCustomerToken(savedToken);
+    }
+  }, []);
+
+  const updateSessionCredentials = (newConvId?: string, newToken?: string) => {
+    if (newConvId) {
+      setConversationId(newConvId);
+      if (typeof window !== 'undefined') sessionStorage.setItem('masryvoice_conversation_id', newConvId);
+    }
+    if (newToken) {
+      setCustomerToken(newToken);
+      if (typeof window !== 'undefined') sessionStorage.setItem('masryvoice_customer_token', newToken);
+    }
+  };
+
+  const handleAdminLogin = (keyToSave: string) => {
+    const trimmed = keyToSave.trim();
+    setAdminKey(trimmed);
+    if (typeof window !== 'undefined') {
+      if (trimmed) sessionStorage.setItem('masryvoice_admin_key', trimmed);
+      else sessionStorage.removeItem('masryvoice_admin_key');
+    }
+    setShowAdminModal(false);
+    fetchState(trimmed);
+  };
+
   // Fetch initial system state
-  const fetchState = async () => {
+  const fetchState = async (overrideAdminKey?: string) => {
+    const keyToUse = overrideAdminKey !== undefined ? overrideAdminKey : adminKey;
     try {
       setLoadingData(true);
+      const adminHeaders: Record<string, string> = {};
+      if (keyToUse) {
+        adminHeaders['X-Admin-Key'] = keyToUse;
+      }
+
       const [healthRes, agentsRes, bookingsRes, slotsRes, docsRes] = await Promise.all([
         fetch('/api/health').then(r => r.json()).catch(() => null),
         fetch('/api/agents').then(r => r.json()).catch(() => []),
-        fetch('/api/bookings', { headers: { 'X-Admin-Key': 'masryvoice_admin_secret_2026' } }).then(r => r.json()).catch(() => []),
+        fetch('/api/bookings', { headers: adminHeaders }).then(r => r.json()).catch(() => []),
         fetch('/api/slots').then(r => r.json()).catch(() => []),
-        fetch('/api/knowledge/documents', { headers: { 'X-Admin-Key': 'masryvoice_admin_secret_2026' } }).then(r => r.json()).catch(() => [])
+        fetch('/api/knowledge/documents', { headers: adminHeaders }).then(r => r.json()).catch(() => [])
       ]);
 
       if (healthRes) setHealth(healthRes);
@@ -185,9 +235,9 @@ export default function Dashboard() {
         setSelectedAgent(agentsRes[0]);
         setAgentForm(agentsRes[0]);
       }
-      if (bookingsRes) setBookings(bookingsRes);
+      if (bookingsRes && Array.isArray(bookingsRes)) setBookings(bookingsRes);
       if (slotsRes) setSlots(slotsRes);
-      if (docsRes) setKnowledgeDocs(docsRes);
+      if (docsRes && Array.isArray(docsRes)) setKnowledgeDocs(docsRes);
     } catch (err) {
       console.error('Error fetching state:', err);
     } finally {
@@ -197,9 +247,9 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchState();
-    const interval = setInterval(fetchState, 15000);
+    const interval = setInterval(() => fetchState(), 15000);
     return () => clearInterval(interval);
-  }, []);
+  }, [adminKey]);
 
   // Send message with SSE streaming
   const handleSendMessage = async (textToSend?: string) => {
@@ -216,12 +266,17 @@ export default function Dashboard() {
     setMessages(prev => [...prev, { role: 'assistant', content: '', time: 'جاري الكتابة...' }]);
 
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (customerToken) {
+        headers['X-Customer-Token'] = customerToken;
+      }
+
       const response = await fetch('/api/chat/stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           agentId: selectedAgent.id,
-          conversationId,
+          conversationId: conversationId || null,
           message: text
         })
       });
@@ -247,7 +302,9 @@ export default function Dashboard() {
 
             try {
               const data = JSON.parse(dataStr);
-              if (data.type === 'token') {
+              if (data.type === 'session') {
+                updateSessionCredentials(data.conversationId, data.customerToken);
+              } else if (data.type === 'token') {
                 assistantText += data.content;
                 setMessages(prev => {
                   const updated = [...prev];
@@ -272,9 +329,10 @@ export default function Dashboard() {
                 // If StageBooking created a pending booking, display the explicit confirmation card
                 if (data.content === 'StageBooking' && data.metadata?.Success && data.metadata?.Data?.pendingBookingId) {
                   const d = data.metadata.Data;
+                  if (d.customerToken) updateSessionCredentials(d.conversationId, d.customerToken);
                   setPendingCard({
                     id: d.pendingBookingId,
-                    conversationId,
+                    conversationId: d.conversationId || conversationId,
                     customerName: d.customerName,
                     customerPhone: d.customerPhone,
                     serviceName: d.service,
@@ -285,8 +343,7 @@ export default function Dashboard() {
                 }
 
                 // Refresh bookings and slots after tool execution
-                fetch('/api/bookings').then(r => r.json()).then(setBookings).catch(() => {});
-                fetch('/api/slots').then(r => r.json()).then(setSlots).catch(() => {});
+                fetchState();
               }
             } catch (e) {
               console.error('Error parsing SSE data:', e);
@@ -309,37 +366,47 @@ export default function Dashboard() {
     if (!pendingCard || isConfirming || pendingCard.status !== 'Pending') return;
     setIsConfirming(true);
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (customerToken) {
+        headers['X-Customer-Token'] = customerToken;
+      }
+
       const res = await fetch('/api/bookings/confirm', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
-          conversationId,
+          conversationId: pendingCard.conversationId || conversationId,
           pendingBookingId: pendingCard.id,
           expectedRequestHash: pendingCard.requestHash
         })
       });
       const data = await res.json();
-      if (res.ok && data.Success) {
+      const isSuccess = data.success !== undefined ? Boolean(data.success) : Boolean(data.Success);
+      const resData = data.data !== undefined ? data.data : data.Data;
+      const resMsg = data.message !== undefined ? data.message : data.Message;
+      const resErrorCode = data.errorCode !== undefined ? data.errorCode : data.ErrorCode;
+
+      if (res.ok && isSuccess) {
+        if (data.customerToken) updateSessionCredentials(conversationId, data.customerToken);
         setPendingCard(prev => prev ? {
           ...prev,
           status: 'Confirmed',
-          confirmedBookingId: data.Data?.bookingId
+          confirmedBookingId: resData?.bookingId
         } : null);
         setMessages(prev => [
           ...prev,
           {
             role: 'assistant',
-            content: `✅ تم تأكيد وتثبيت الحجز بنجاح في قاعدة البيانات!\nرقم الحجز: ${data.Data?.bookingId}\nالاسم: ${data.Data?.customerName}\nالموعد: ${data.Data?.cairoTime}`,
+            content: `✅ تم تأكيد وتثبيت الحجز بنجاح في قاعدة البيانات!\nرقم الحجز: ${resData?.bookingId}\nالاسم: ${resData?.customerName}\nالموعد: ${resData?.cairoTime}`,
             time: new Date().toLocaleTimeString('ar-EG')
           }
         ]);
-        fetch('/api/bookings').then(r => r.json()).then(setBookings).catch(() => {});
-        fetch('/api/slots').then(r => r.json()).then(setSlots).catch(() => {});
+        fetchState();
       } else {
-        const err = data.Message || 'تعذر تأكيد الحجز';
+        const err = resMsg || 'تعذر تأكيد الحجز';
         setPendingCard(prev => prev ? {
           ...prev,
-          status: data.ErrorCode === 'STALE_PENDING_BOOKING' ? 'Invalidated' : prev.status,
+          status: resErrorCode === 'STALE_PENDING_BOOKING' ? 'Invalidated' : prev.status,
           errorMessage: err
         } : null);
       }
@@ -368,13 +435,17 @@ export default function Dashboard() {
   const handleIngestDoc = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newDocTitle.trim() || !newDocContent.trim()) return;
+    if (!adminKey) {
+      setShowAdminModal(true);
+      return;
+    }
     setIsIngesting(true);
     try {
       const res = await fetch('/api/knowledge/ingest', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Admin-Key': 'masryvoice_admin_secret_2026'
+          'X-Admin-Key': adminKey
         },
         body: JSON.stringify({
           title: newDocTitle,
@@ -387,6 +458,9 @@ export default function Dashboard() {
         setNewDocTitle('');
         setNewDocContent('');
         fetchState();
+      } else if (res.status === 401) {
+        alert('مفتاح الإدارة غير صحيح أو غير مصرح به');
+        setShowAdminModal(true);
       }
     } catch (err) {
       console.error(err);
@@ -415,16 +489,24 @@ export default function Dashboard() {
 
   // Voice Session & Barge-in handlers
   const handleStartVoiceSession = async () => {
+    isInterruptedRef.current = false;
     try {
+      const tokenToUse = customerToken || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_customer_token') : null);
+      const convToUse = conversationId || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_conversation_id') : null);
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (tokenToUse) headers['X-Customer-Token'] = tokenToUse;
       const res = await fetch('/api/voice/session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ conversationId })
+        headers,
+        body: JSON.stringify({ conversationId: convToUse || null })
       });
       if (res.ok) {
         const data = await res.json();
         setVoiceSessionId(data.sessionId);
+        updateSessionCredentials(data.conversationId, data.customerToken);
         setVoiceInterrupted(false);
+      } else {
+        console.error('Failed to create voice session:', res.status, await res.text());
       }
     } catch (err) {
       console.error(err);
@@ -433,16 +515,23 @@ export default function Dashboard() {
 
   const handleBargeInInterrupt = async () => {
     if (!voiceSessionId) return;
+    isInterruptedRef.current = true;
+    activeVoiceRequestIdRef.current++; // Invalidate any pending in-flight request
+    setIsVoiceProcessing(false);
     try {
       if (audioPlayerRef.current) {
         audioPlayerRef.current.pause();
         audioPlayerRef.current.currentTime = 0;
+        audioPlayerRef.current.src = '';
       }
       setIsVoiceSpeaking(false);
       setVoiceInterrupted(true);
+      const tokenToUse = customerToken || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_customer_token') : null);
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (tokenToUse) headers['X-Customer-Token'] = tokenToUse;
       await fetch('/api/voice/interrupt', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ sessionId: voiceSessionId })
       });
     } catch (err) {
@@ -453,51 +542,94 @@ export default function Dashboard() {
   const handleSendVoiceTurn = async (messageText?: string) => {
     const textToSend = messageText || voiceText;
     if (!textToSend.trim() || !selectedAgent) return;
+    isInterruptedRef.current = false;
+    const currentRequestId = ++activeVoiceRequestIdRef.current;
     let sId = voiceSessionId;
+    let currentConv = conversationId || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_conversation_id') : null);
+    let currentToken = customerToken || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_customer_token') : null);
     if (!sId) {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (currentToken) headers['X-Customer-Token'] = currentToken;
       const res = await fetch('/api/voice/session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ conversationId })
+        headers,
+        body: JSON.stringify({ conversationId: currentConv || null })
       });
+      if (currentRequestId !== activeVoiceRequestIdRef.current) return;
       const data = await res.json();
+      if (currentRequestId !== activeVoiceRequestIdRef.current) return;
       sId = data.sessionId;
+      currentConv = data.conversationId;
+      currentToken = data.customerToken;
       setVoiceSessionId(sId);
+      updateSessionCredentials(data.conversationId, data.customerToken);
     }
 
+    if (currentRequestId !== activeVoiceRequestIdRef.current) return;
     setIsVoiceProcessing(true);
     setVoiceInterrupted(false);
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (currentToken) headers['X-Customer-Token'] = currentToken;
       const res = await fetch('/api/voice/turn', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           sessionId: sId,
-          conversationId,
+          conversationId: currentConv,
           agentId: selectedAgent.id,
           message: textToSend
         })
       });
 
+      // Ignore obsolete completions entirely: do not modify playback, text, turn ID, or interruption status
+      if (currentRequestId !== activeVoiceRequestIdRef.current) {
+        return;
+      }
+
       if (res.ok) {
         const data = await res.json();
+        if (currentRequestId !== activeVoiceRequestIdRef.current) return;
+
+        // If this specific active request was interrupted or returned interrupted flag
+        if (data.interrupted || isInterruptedRef.current) {
+          setIsVoiceSpeaking(false);
+          setVoiceInterrupted(true);
+          return;
+        }
+
         setVoiceTurnId(data.turnId);
+        setVoiceResponseText(data.text || '');
         setVoiceText('');
 
         if (data.audioBase64) {
           const audioSrc = `data:audio/wav;base64,${data.audioBase64}`;
-          if (audioPlayerRef.current) {
+          if (audioPlayerRef.current && !isInterruptedRef.current && currentRequestId === activeVoiceRequestIdRef.current) {
             audioPlayerRef.current.src = audioSrc;
             setIsVoiceSpeaking(true);
             audioPlayerRef.current.play().catch(() => {});
-            audioPlayerRef.current.onended = () => setIsVoiceSpeaking(false);
+            audioPlayerRef.current.onended = () => {
+              if (currentRequestId === activeVoiceRequestIdRef.current) {
+                setIsVoiceSpeaking(false);
+              }
+            };
           }
+        }
+      } else if (res.status === 499) {
+        if (currentRequestId === activeVoiceRequestIdRef.current) {
+          setIsVoiceSpeaking(false);
+          setVoiceInterrupted(true);
         }
       }
     } catch (err) {
-      console.error(err);
+      if (currentRequestId === activeVoiceRequestIdRef.current) {
+        console.error(err);
+      }
     } finally {
-      setIsVoiceProcessing(false);
+      // Only reset processing if this is still the active request
+      if (currentRequestId === activeVoiceRequestIdRef.current) {
+        setIsVoiceProcessing(false);
+      }
     }
   };
 
@@ -506,10 +638,18 @@ export default function Dashboard() {
     e.preventDefault();
     if (!selectedAgent) return;
 
+    if (!adminKey) {
+      setShowAdminModal(true);
+      return;
+    }
+
     try {
       const res = await fetch('/api/agents', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Key': adminKey
+        },
         body: JSON.stringify({
           ...selectedAgent,
           ...agentForm
@@ -520,6 +660,9 @@ export default function Dashboard() {
         setSaveSuccess(true);
         setTimeout(() => setSaveSuccess(false), 3000);
         fetchState();
+      } else if (res.status === 401) {
+        alert('مفتاح الإدارة غير صحيح أو غير مصرح به');
+        setShowAdminModal(true);
       }
     } catch (err) {
       alert('حدث خطأ أثناء حفظ الإعدادات');
@@ -603,14 +746,136 @@ export default function Dashboard() {
             <Activity size={14} />
             <span>النموذج: <strong>{health?.defaultModel || 'qwen2.5:1.5b'}</strong> ({health?.configuredLlmProvider || 'Ollama'})</span>
           </div>
+
+          {/* Admin Auth Status / Login Action */}
+          <button
+            onClick={() => {
+              setAdminKeyInput(adminKey);
+              setShowAdminModal(true);
+            }}
+            id="admin-auth-btn"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              background: adminKey ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)',
+              border: adminKey ? '1px solid rgba(16, 185, 129, 0.3)' : '1px solid rgba(239, 68, 68, 0.3)',
+              color: adminKey ? '#10b981' : '#f87171',
+              padding: '6px 14px',
+              borderRadius: '20px',
+              fontSize: '0.8rem',
+              cursor: 'pointer',
+              fontWeight: 600
+            }}
+          >
+            <ShieldCheck size={14} />
+            <span>{adminKey ? 'الإدارة: مصرح' : 'تسجيل الإدارة'}</span>
+          </button>
         </div>
       </header>
+
+      {/* Admin Auth Modal */}
+      {showAdminModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.7)',
+          zIndex: 100,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          backdropFilter: 'blur(4px)'
+        }}>
+          <div style={{
+            background: '#1f2937',
+            border: '1px solid var(--border-color)',
+            borderRadius: '16px',
+            padding: '24px',
+            width: '90%',
+            maxWidth: '440px',
+            boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.5)'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <ShieldCheck size={20} color="#10b981" />
+                <h3 style={{ margin: 0, color: '#f9fafb', fontSize: '1.1rem', fontWeight: 600 }}>تسجيل مصادقة الإدارة</h3>
+              </div>
+              <button
+                onClick={() => setShowAdminModal(false)}
+                style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}
+              >
+                <XCircle size={18} />
+              </button>
+            </div>
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '16px', lineHeight: 1.5 }}>
+              يرجى إدخال مفتاح الإدارة السري للوصول إلى سجل الحجوزات وإدارة المعرفة وتعديل إعدادات الوكيل.
+            </p>
+            <input
+              type="password"
+              id="admin-key-modal-input"
+              value={adminKeyInput}
+              onChange={e => setAdminKeyInput(e.target.value)}
+              placeholder="أدخل مفتاح الإدارة (X-Admin-Key)..."
+              style={{
+                width: '100%',
+                padding: '10px 14px',
+                borderRadius: '8px',
+                border: '1px solid var(--border-color)',
+                background: '#111827',
+                color: '#fff',
+                fontSize: '0.9rem',
+                marginBottom: '16px',
+                outline: 'none',
+                boxSizing: 'border-box'
+              }}
+            />
+            <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+              {adminKey && (
+                <button
+                  onClick={() => handleAdminLogin('')}
+                  style={{
+                    padding: '8px 16px',
+                    borderRadius: '8px',
+                    border: '1px solid rgba(239, 68, 68, 0.4)',
+                    background: 'rgba(239, 68, 68, 0.15)',
+                    color: '#f87171',
+                    fontSize: '0.85rem',
+                    cursor: 'pointer'
+                  }}
+                >
+                  تسجيل خروج
+                </button>
+              )}
+              <button
+                onClick={() => handleAdminLogin(adminKeyInput)}
+                id="save-admin-key-btn"
+                style={{
+                  padding: '8px 18px',
+                  borderRadius: '8px',
+                  border: 'none',
+                  background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+                  color: '#fff',
+                  fontSize: '0.85rem',
+                  fontWeight: 600,
+                  cursor: 'pointer'
+                }}
+              >
+                حفظ والمصادقة
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Main Layout */}
       <div style={{ display: 'flex', flex: 1, padding: '24px', gap: '24px' }}>
         {/* Sidebar Navigation */}
         <aside style={{ width: '260px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
           <button
+            id="tab-chat-btn"
             onClick={() => setActiveTab('chat')}
             style={{
               display: 'flex',
@@ -632,6 +897,7 @@ export default function Dashboard() {
           </button>
 
           <button
+            id="tab-bookings-btn"
             onClick={() => setActiveTab('bookings')}
             style={{
               display: 'flex',
@@ -666,6 +932,7 @@ export default function Dashboard() {
           </button>
 
           <button
+            id="tab-voice-btn"
             onClick={() => setActiveTab('voice')}
             style={{
               display: 'flex',
@@ -687,6 +954,7 @@ export default function Dashboard() {
           </button>
 
           <button
+            id="tab-knowledge-btn"
             onClick={() => setActiveTab('knowledge')}
             style={{
               display: 'flex',
@@ -721,6 +989,7 @@ export default function Dashboard() {
           </button>
 
           <button
+            id="tab-settings-btn"
             onClick={() => setActiveTab('settings')}
             style={{
               display: 'flex',
@@ -1116,6 +1385,7 @@ export default function Dashboard() {
                 </button>
 
                 <input
+                  id="chat-input-text"
                   type="text"
                   value={inputMessage}
                   onChange={e => setInputMessage(e.target.value)}
@@ -1136,6 +1406,7 @@ export default function Dashboard() {
                 />
 
                 <button
+                  id="chat-send-btn"
                   type="button"
                   onClick={() => handleSendMessage()}
                   disabled={isStreaming || !inputMessage.trim()}
@@ -1174,7 +1445,7 @@ export default function Dashboard() {
                     الحجوزات المسجلة المؤكدة (قاعدة بيانات ACID)
                   </h3>
                   <button
-                    onClick={fetchState}
+                    onClick={() => fetchState()}
                     style={{
                       background: 'rgba(255, 255, 255, 0.05)',
                       border: '1px solid var(--border-color)',
@@ -1299,6 +1570,7 @@ export default function Dashboard() {
 
                 <div style={{ display: 'flex', gap: '10px' }}>
                   <button
+                    id="start-voice-session-btn"
                     onClick={handleStartVoiceSession}
                     style={{
                       background: 'rgba(255, 255, 255, 0.08)',
@@ -1318,6 +1590,7 @@ export default function Dashboard() {
                   </button>
 
                   <button
+                    id="voice-barge-in-btn"
                     onClick={handleBargeInInterrupt}
                     disabled={!voiceSessionId}
                     style={{
@@ -1363,7 +1636,7 @@ export default function Dashboard() {
 
                   <div>
                     <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)', display: 'block' }}>رقم الدور (Turn Epoch)</span>
-                    <span style={{ fontWeight: 700, fontSize: '0.85rem', color: '#10b981' }}>
+                    <span id="voice-turn-id-display" style={{ fontWeight: 700, fontSize: '0.85rem', color: '#10b981' }}>
                       #{voiceTurnId}
                     </span>
                   </div>
@@ -1371,7 +1644,7 @@ export default function Dashboard() {
 
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                   {isVoiceSpeaking && (
-                    <span style={{
+                    <span id="voice-speaking-indicator" style={{
                       background: 'rgba(16, 185, 129, 0.2)',
                       border: '1px solid #10b981',
                       color: '#10b981',
@@ -1389,7 +1662,7 @@ export default function Dashboard() {
                   )}
 
                   {isVoiceProcessing && (
-                    <span style={{
+                    <span id="voice-processing-indicator" style={{
                       background: 'rgba(245, 158, 11, 0.2)',
                       border: '1px solid #f59e0b',
                       color: '#f59e0b',
@@ -1403,7 +1676,7 @@ export default function Dashboard() {
                   )}
 
                   {voiceInterrupted && (
-                    <span style={{
+                    <span id="voice-interrupted-indicator" style={{
                       background: 'rgba(239, 68, 68, 0.2)',
                       border: '1px solid #ef4444',
                       color: '#ef4444',
@@ -1460,6 +1733,7 @@ export default function Dashboard() {
                 gap: '12px'
               }}>
                 <input
+                  id="voice-input-text"
                   type="text"
                   placeholder="اكتب رسالة صوتية أو استفسار باللهجة المصرية..."
                   value={voiceText}
@@ -1478,6 +1752,7 @@ export default function Dashboard() {
                   }}
                 />
                 <button
+                  id="send-voice-turn-btn"
                   onClick={() => handleSendVoiceTurn()}
                   disabled={isVoiceProcessing || !voiceText.trim()}
                   style={{
@@ -1498,6 +1773,27 @@ export default function Dashboard() {
                   <span>توليد وتحدث</span>
                 </button>
               </div>
+
+              {/* Active Voice Response Content Display */}
+              {voiceResponseText && (
+                <div
+                  id="voice-response-content-display"
+                  style={{
+                    background: 'rgba(16, 185, 129, 0.08)',
+                    border: '1px solid rgba(16, 185, 129, 0.3)',
+                    borderRadius: '12px',
+                    padding: '16px',
+                    color: '#f3f4f6',
+                    fontSize: '0.9rem',
+                    lineHeight: '1.6'
+                  }}
+                >
+                  <div style={{ color: '#10b981', fontWeight: 600, fontSize: '0.8rem', marginBottom: '6px' }}>
+                    رد الوكيل الصوتي:
+                  </div>
+                  {voiceResponseText}
+                </div>
+              )}
 
               {/* Technical Specifications */}
               <div style={{
@@ -1795,6 +2091,7 @@ export default function Dashboard() {
                     اسم الوكيل
                   </label>
                   <input
+                    id="agent-name-input"
                     type="text"
                     value={agentForm.name || ''}
                     onChange={e => setAgentForm({ ...agentForm, name: e.target.value })}
@@ -1913,6 +2210,7 @@ export default function Dashboard() {
                 </div>
 
                 <button
+                  id="save-settings-btn"
                   type="submit"
                   style={{
                     background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',

@@ -127,4 +127,87 @@ public class RateLimitingIntegrationTests : IClassFixture<WebApplicationFactory<
         var recovered = await client.GetAsync("/api/test/rate-limited");
         Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
     }
+
+    [Fact]
+    public async Task RateLimiting_RealApiRoute_EnforcesPolicyAndRejectsWith429()
+    {
+        var dbName = $"ratelimit_api_{Guid.NewGuid():N}.db";
+        var customFactory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureAppConfiguration((_, config) =>
+            {
+                config.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["RateLimiting:ApiPermitLimit"] = "2",
+                    ["DatabaseProvider"] = "Sqlite",
+                    ["ConnectionStrings:Sqlite"] = $"Data Source={dbName}"
+                });
+            });
+        });
+
+        var clientA = customFactory.CreateClient();
+        var clientB = customFactory.CreateClient();
+        var idA = $"client-api-A-{Guid.NewGuid():N}";
+        var idB = $"client-api-B-{Guid.NewGuid():N}";
+        clientA.DefaultRequestHeaders.Add("X-Test-Client-Id", idA);
+        clientB.DefaultRequestHeaders.Add("X-Test-Client-Id", idB);
+
+        // 2 requests allowed under "api" policy on real endpoint /api/slots
+        var res1 = await clientA.GetAsync("/api/slots");
+        Assert.Equal(HttpStatusCode.OK, res1.StatusCode);
+
+        var res2 = await clientA.GetAsync("/api/slots");
+        Assert.Equal(HttpStatusCode.OK, res2.StatusCode);
+
+        // 3rd request rejected with 429 and Retry-After
+        var res3 = await clientA.GetAsync("/api/slots");
+        Assert.Equal(HttpStatusCode.TooManyRequests, res3.StatusCode);
+        Assert.True(res3.Headers.Contains("Retry-After") || res3.Headers.TryGetValues("Retry-After", out _));
+
+        // Isolated Client B can still make requests successfully
+        var resB = await clientB.GetAsync("/api/slots");
+        Assert.Equal(HttpStatusCode.OK, resB.StatusCode);
+    }
+
+    [Fact]
+    public async Task RateLimiting_RealInferenceRoute_EnforcesPolicyAndRejectsWith429()
+    {
+        var dbName = $"ratelimit_inf_{Guid.NewGuid():N}.db";
+        var customFactory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureAppConfiguration((_, config) =>
+            {
+                config.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["RateLimiting:InferenceTokenLimit"] = "2",
+                    ["RateLimiting:InferenceTokensPerPeriod"] = "1",
+                    ["DatabaseProvider"] = "Sqlite",
+                    ["ConnectionStrings:Sqlite"] = $"Data Source={dbName}"
+                });
+            });
+        });
+
+        var clientA = customFactory.CreateClient();
+        var clientB = customFactory.CreateClient();
+        var idA = $"client-inf-A-{Guid.NewGuid():N}";
+        var idB = $"client-inf-B-{Guid.NewGuid():N}";
+        clientA.DefaultRequestHeaders.Add("X-Test-Client-Id", idA);
+        clientB.DefaultRequestHeaders.Add("X-Test-Client-Id", idB);
+
+        // 2 requests allowed under "inference" policy on /api/knowledge/search
+        var res1 = await clientA.GetAsync("/api/knowledge/search?query=test");
+        Assert.Equal(HttpStatusCode.OK, res1.StatusCode);
+
+        var res2 = await clientA.GetAsync("/api/knowledge/search?query=test");
+        Assert.Equal(HttpStatusCode.OK, res2.StatusCode);
+
+        // 3rd request rejected with 429 and Retry-After
+        var res3 = await clientA.GetAsync("/api/knowledge/search?query=test");
+        Assert.Equal(HttpStatusCode.TooManyRequests, res3.StatusCode);
+        Assert.True(res3.Headers.Contains("Retry-After") || res3.Headers.TryGetValues("Retry-After", out _));
+
+        // Isolated Client B can still query knowledge base
+        var resB = await clientB.GetAsync("/api/knowledge/search?query=test");
+        Assert.Equal(HttpStatusCode.OK, resB.StatusCode);
+    }
 }
