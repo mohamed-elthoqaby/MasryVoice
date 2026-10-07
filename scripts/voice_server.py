@@ -386,12 +386,13 @@ async def transcribe_audio(
                             return None, info, True
                         text_chunks.append(segment.text.strip())
                     return " ".join(text_chunks).strip(), info, False
-
                 try:
                     return await asyncio.to_thread(_sync_work)
                 except Exception as ex:
-                    logger.warning(f"[STT Worker] Thread error observed: {ex}")
-                    return None, None, True
+                    if stop_event.is_set():
+                        logger.warning(f"[STT Worker] Thread error after disconnect/cancellation observed: {ex}")
+                        return None, None, True
+                    raise
             finally:
                 if cur_task:
                     _active_stt_tasks.discard(cur_task)
@@ -513,8 +514,10 @@ async def synthesize_speech(request: Request, req: SpeechRequest):
                 try:
                     return await asyncio.to_thread(_sync_work)
                 except Exception as ex:
-                    logger.warning(f"[TTS Worker] Thread error observed: {ex}")
-                    return None, True
+                    if stop_event.is_set():
+                        logger.warning(f"[TTS Worker] Thread error after disconnect/cancellation observed: {ex}")
+                        return None, True
+                    raise
             finally:
                 if cur_task:
                     _active_tts_tasks.discard(cur_task)

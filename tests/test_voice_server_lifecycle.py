@@ -407,5 +407,141 @@ class TestVoiceServerLifecycle(unittest.TestCase):
         asyncio.run(run_test())
 
 
+    def test_uncancelled_tts_provider_failure_returns_500_not_499(self):
+        """
+        Verifies that when a TTS provider fails while the client is still connected,
+        the route returns HTTP 500 (not 499 client disconnect), releases the semaphore permit,
+        and unregisters the worker task.
+        """
+        async def run_test():
+            mock_voice = MagicMock()
+            def failing_synthesize(text):
+                raise RuntimeError("Synthesizer model runtime failure")
+
+            mock_voice.synthesize = failing_synthesize
+            voice_server.piper_voice = mock_voice
+
+            async def mock_disc():
+                return False  # Client remains connected!
+
+            req = MagicMock(spec=Request)
+            req.is_disconnected = mock_disc
+            payload = voice_server.SpeechRequest(input="اختبار فشل المزود والعميل متصل")
+
+            with self.assertRaises(HTTPException) as ctx:
+                await voice_server.synthesize_speech(req, payload)
+
+            self.assertEqual(ctx.exception.status_code, 500)
+            self.assertEqual(len(voice_server._active_tts_tasks), 0)
+            self.assertEqual(voice_server.tts_semaphore._value, voice_server.TTS_CONCURRENCY)
+
+        asyncio.run(run_test())
+
+    def test_invalid_stt_container_returns_400_not_499(self):
+        """
+        Verifies that when an invalid/corrupt audio container is submitted and the client is connected,
+        the route returns HTTP 400 (not 499), releases the permit, and cleans up temp files.
+        """
+        async def run_test():
+            voice_server.whisper_model = MagicMock()
+
+            corrupt_bytes = b"RIFF\x20\x00\x00\x00WAVE" + b"\xff" * 50
+            upload_file = UploadFile(file=io.BytesIO(corrupt_bytes), filename="corrupt.wav")
+
+            async def mock_disc():
+                return False  # Client remains connected
+
+            req = MagicMock(spec=Request)
+            req.is_disconnected = mock_disc
+
+            with self.assertRaises(HTTPException) as ctx:
+                await voice_server.transcribe_audio(req, file=upload_file)
+
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertEqual(len(voice_server._active_stt_tasks), 0)
+            self.assertEqual(voice_server.stt_semaphore._value, voice_server.STT_CONCURRENCY)
+
+        asyncio.run(run_test())
+
+    def test_overlong_stt_audio_returns_400_not_499(self):
+        """
+        Verifies that audio exceeding 30s limit returns HTTP 400 with audio_duration_exceeded, not 499.
+        """
+        async def run_test():
+            voice_server.whisper_model = MagicMock()
+
+            # Create a 35s audio header
+            sample_rate = 8000
+            duration_sec = 35
+            byte_rate = sample_rate * 2
+            data_size = int(duration_sec * byte_rate)
+            buf = bytearray()
+            buf.extend(b"RIFF")
+            buf.extend((36 + data_size).to_bytes(4, "little"))
+            buf.extend(b"WAVEfmt ")
+            buf.extend((16).to_bytes(4, "little"))
+            buf.extend((1).to_bytes(2, "little"))
+            buf.extend((1).to_bytes(2, "little"))
+            buf.extend(sample_rate.to_bytes(4, "little"))
+            buf.extend(byte_rate.to_bytes(4, "little"))
+            buf.extend((2).to_bytes(2, "little"))
+            buf.extend((16).to_bytes(2, "little"))
+            buf.extend(b"data")
+            buf.extend(data_size.to_bytes(4, "little"))
+            buf.extend(bytes(data_size))
+            overlong_bytes = bytes(buf)
+
+            upload_file = UploadFile(file=io.BytesIO(overlong_bytes), filename="long.wav")
+
+            async def mock_disc():
+                return False
+
+            req = MagicMock(spec=Request)
+            req.is_disconnected = mock_disc
+
+            with self.assertRaises(HTTPException) as ctx:
+                await voice_server.transcribe_audio(req, file=upload_file)
+
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertEqual(ctx.exception.detail.get("code"), "audio_duration_exceeded")
+            self.assertEqual(len(voice_server._active_stt_tasks), 0)
+            self.assertEqual(voice_server.stt_semaphore._value, voice_server.STT_CONCURRENCY)
+
+        asyncio.run(run_test())
+
+    def test_uncancelled_stt_provider_failure_returns_500_not_499(self):
+        """
+        Verifies that when STT model inference raises an exception while client is connected,
+        the route returns HTTP 500 (not 499) and restores capacity.
+        """
+        async def run_test():
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+                w.writeframes(b"\x00" * 3200)
+            wav_bytes = buf.getvalue()
+
+            upload_file = UploadFile(file=io.BytesIO(wav_bytes), filename="valid.wav")
+
+            mock_model = MagicMock()
+            mock_model.transcribe.side_effect = RuntimeError("Whisper CTranslate2 memory fault")
+            voice_server.whisper_model = mock_model
+
+            async def mock_disc():
+                return False
+
+            req = MagicMock(spec=Request)
+            req.is_disconnected = mock_disc
+
+            with self.assertRaises(HTTPException) as ctx:
+                await voice_server.transcribe_audio(req, file=upload_file)
+
+            self.assertEqual(ctx.exception.status_code, 500)
+            self.assertEqual(len(voice_server._active_stt_tasks), 0)
+            self.assertEqual(voice_server.stt_semaphore._value, voice_server.STT_CONCURRENCY)
+
+        asyncio.run(run_test())
+
+
 if __name__ == "__main__":
     unittest.main()

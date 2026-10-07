@@ -168,7 +168,11 @@ builder.Services.AddTransient<ILlmProvider>(sp =>
     {
         return sp.GetRequiredService<DeterministicFakeLlmProvider>();
     }
-    return sp.GetRequiredService<OllamaLlmProvider>();
+    if (choice.Equals("Ollama", StringComparison.OrdinalIgnoreCase))
+    {
+        return sp.GetRequiredService<OllamaLlmProvider>();
+    }
+    throw new InvalidOperationException($"Unknown LLM provider configuration: '{choice}'");
 });
 
 // 6. Register Security & Auth Service
@@ -242,7 +246,11 @@ builder.Services.AddTransient<ISttProvider>(sp =>
     {
         return sp.GetRequiredService<WhisperSttProvider>();
     }
-    return sp.GetRequiredService<SimulatedSttProvider>();
+    if (sttProviderType.Equals("Simulated", StringComparison.OrdinalIgnoreCase))
+    {
+        return sp.GetRequiredService<SimulatedSttProvider>();
+    }
+    throw new InvalidOperationException($"Unknown STT provider configuration: '{sttProviderType}'");
 });
 
 builder.Services.AddTransient<ITtsProvider>(sp =>
@@ -256,7 +264,11 @@ builder.Services.AddTransient<ITtsProvider>(sp =>
     {
         return sp.GetRequiredService<LocalEgyptianTtsProvider>();
     }
-    return sp.GetRequiredService<SimulatedTtsProvider>();
+    if (ttsProviderType.Equals("Simulated", StringComparison.OrdinalIgnoreCase))
+    {
+        return sp.GetRequiredService<SimulatedTtsProvider>();
+    }
+    throw new InvalidOperationException($"Unknown TTS provider configuration: '{ttsProviderType}'");
 });
 builder.Services.AddSingleton<VoiceSessionManager>();
 var voiceAdmissionOptions = new VoiceAdmissionOptions
@@ -356,7 +368,10 @@ app.MapGet("/api/health", async (
     IConfiguration cfg,
     InferenceThrottlingManager throttling,
     ITelephonyAdapter telephony,
-    VoiceSessionManager voiceSessions) =>
+    VoiceSessionManager voiceSessions,
+    ILlmProvider llm,
+    ISttProvider stt,
+    ITtsProvider tts) =>
 {
     var nowCairo = CairoTimeHelper.NowCairo;
     var isBusinessHours = CairoTimeHelper.IsBusinessHours(nowCairo);
@@ -388,6 +403,9 @@ app.MapGet("/api/health", async (
         configuredLlmProvider = cfg["LlmProvider"] ?? "Ollama",
         configuredSttProvider = cfg["Voice:SttProvider"] ?? "Simulated",
         configuredTtsProvider = cfg["Voice:TtsProvider"] ?? "Simulated",
+        resolvedLlmType = llm.GetType().Name,
+        resolvedSttType = stt.GetType().Name,
+        resolvedTtsType = tts.GetType().Name,
         defaultModel = cfg["Ollama:DefaultModel"] ?? "qwen2.5:3b",
         inferenceLoad = new
         {
@@ -1434,21 +1452,57 @@ app.MapPost("/api/voice/turn", async (
                 if (currentTurnAvailability != null && currentTurnAvailability.Status == "Success" && !string.IsNullOrWhiteSpace(currentTurnAvailability.ResultJson))
                 {
                     bool hasSlots = false;
+                    bool isAlternativeDate = false;
+                    string toolMessage = "";
                     try
                     {
                         using var doc = JsonDocument.Parse(currentTurnAvailability.ResultJson);
-                        if (doc.RootElement.TryGetProperty("availableSlots", out var slotsElem) &&
-                            slotsElem.ValueKind == JsonValueKind.Array &&
-                            slotsElem.GetArrayLength() > 0)
+                        var root = doc.RootElement;
+
+                        if (root.TryGetProperty("Message", out var msgProp) || root.TryGetProperty("message", out msgProp))
+                        {
+                            toolMessage = msgProp.GetString() ?? "";
+                        }
+
+                        JsonElement dataElem = default;
+                        bool hasData = root.TryGetProperty("Data", out dataElem) || root.TryGetProperty("data", out dataElem);
+
+                        JsonElement slotsElem = default;
+                        bool foundSlots = false;
+                        if (hasData && dataElem.ValueKind == JsonValueKind.Object)
+                        {
+                            foundSlots = dataElem.TryGetProperty("availableSlots", out slotsElem) || dataElem.TryGetProperty("AvailableSlots", out slotsElem);
+                        }
+                        if (!foundSlots)
+                        {
+                            foundSlots = root.TryGetProperty("availableSlots", out slotsElem) || root.TryGetProperty("AvailableSlots", out slotsElem);
+                        }
+
+                        if (foundSlots && slotsElem.ValueKind == JsonValueKind.Array && slotsElem.GetArrayLength() > 0)
                         {
                             hasSlots = true;
+                            if (toolMessage.Contains("لا توجد مواعيد متاحة في تاريخ") || toolMessage.Contains("أقرب مواعيد أخرى"))
+                            {
+                                isAlternativeDate = true;
+                            }
                         }
                     }
                     catch { }
 
                     if (hasSlots)
                     {
-                        reply = "تم التحقق من المواعيد المتاحة في عيادة النور التخصصية، تحب أحجز لحضرتك ميعاد في المواعيد المتاحة؟";
+                        if (isAlternativeDate)
+                        {
+                            reply = !string.IsNullOrWhiteSpace(toolMessage)
+                                ? $"{toolMessage} تحب نقترح على حضرتك ميعاد من هذه البدائل؟"
+                                : "لا توجد مواعيد متاحة في التاريخ المطلوب، ولكن توجد أقرب مواعيد أخرى بديلة، تحب نقترح على حضرتك ميعاد منها؟";
+                        }
+                        else
+                        {
+                            reply = !string.IsNullOrWhiteSpace(toolMessage)
+                                ? $"{toolMessage} تحب أحجز لحضرتك ميعاد في المواعيد المتاحة؟"
+                                : "تم التحقق من المواعيد المتاحة في عيادة النور التخصصية، تحب أحجز لحضرتك ميعاد في المواعيد المتاحة؟";
+                        }
                     }
                     else
                     {

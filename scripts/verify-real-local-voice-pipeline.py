@@ -16,6 +16,7 @@ import argparse
 import urllib.request
 import urllib.error
 import threading
+from typing import Optional
 
 VOICE_SERVER_URL = os.environ.get("VOICE_SERVER_URL", "http://127.0.0.1:8000")
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:5000")
@@ -97,6 +98,57 @@ def build_overlong_wav_bytes(duration_sec=35):
     return bytes(buf)
 
 
+REAL_LLM_PROVIDERS = {"ollama"}
+REAL_STT_PROVIDERS = {"whisper", "localegyptian", "localegyptianvoice", "real"}
+REAL_TTS_PROVIDERS = {"piper", "localegyptian", "localegyptianvoice", "real"}
+
+REQUIRED_CRITERIA_COMPONENT = [
+    "health_status",
+    "active_supervision",
+    "overlong_rejection",
+    "corrupt_rejection",
+    "stt_benchmarks",
+    "tts_benchmark"
+]
+
+REQUIRED_CRITERIA_FULL = REQUIRED_CRITERIA_COMPONENT + [
+    "booking_lifecycle",
+    "active_barge_in",
+    "e2e_flow"
+]
+
+
+def validate_backend_providers(cfg_llm: str, cfg_stt: str, cfg_tts: str,
+                               resolved_llm: Optional[str] = None,
+                               resolved_stt: Optional[str] = None,
+                               resolved_tts: Optional[str] = None):
+    """
+    Strict whitelist validation of backend LLM, STT, and TTS providers.
+    Rejects fake, simulated, missing, unknown, and typo configurations.
+    Also validates concrete resolved DI types if provided.
+    """
+    clean_llm = (cfg_llm or "").strip().lower()
+    clean_stt = (cfg_stt or "").strip().lower()
+    clean_tts = (cfg_tts or "").strip().lower()
+
+    if clean_llm not in REAL_LLM_PROVIDERS:
+        raise ValueError(f"Strict mode requires real LLM provider (whitelisted: {REAL_LLM_PROVIDERS}), got '{cfg_llm}'")
+    if clean_stt not in REAL_STT_PROVIDERS:
+        raise ValueError(f"Strict mode requires real STT provider (whitelisted: {REAL_STT_PROVIDERS}), got '{cfg_stt}'")
+    if clean_tts not in REAL_TTS_PROVIDERS:
+        raise ValueError(f"Strict mode requires real TTS provider (whitelisted: {REAL_TTS_PROVIDERS}), got '{cfg_tts}'")
+
+    if resolved_llm:
+        if resolved_llm in {"DeterministicFakeLlmProvider"} or resolved_llm != "OllamaLlmProvider":
+            raise ValueError(f"Resolved LLM type '{resolved_llm}' is not an authorized real local LLM provider")
+    if resolved_stt:
+        if resolved_stt in {"SimulatedSttProvider"} or resolved_stt != "WhisperSttProvider":
+            raise ValueError(f"Resolved STT type '{resolved_stt}' is not an authorized real local STT provider")
+    if resolved_tts:
+        if resolved_tts in {"SimulatedTtsProvider"} or resolved_tts != "LocalEgyptianTtsProvider":
+            raise ValueError(f"Resolved TTS type '{resolved_tts}' is not an authorized real local TTS provider")
+
+
 def persist_report(report):
     report_file = os.path.join(ARTIFACTS_DIR, "real_voice_verification_report.json")
     try:
@@ -106,40 +158,10 @@ def persist_report(report):
         print(f" [WARNING] Failed to write report file: {e}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="MasryVoice Real Local Voice Verification")
-    parser.add_argument("--strict", action="store_true", help="Fail nonzero if any required stage is unavailable")
-    parser.add_argument("--skip-backend", action="store_true", help="Skip backend E2E turns and test speech server only")
-    args = parser.parse_args()
-
-    if args.strict and args.skip_backend:
-        print(" [ERROR] --strict cannot be used with --skip-backend. Full end-to-end verification is required.")
-        sys.exit(1)
-
-    print("=" * 78)
-    print("   MASRYVOICE REAL LOCAL VOICE PIPELINE ACCEPTANCE VERIFICATION ($0 Cost)   ")
-    print("=" * 78)
-
-    global DB_PATH
-    DB_PATH = resolve_db_path()
-
-    report = {
-        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "voice_server_url": VOICE_SERVER_URL,
-        "api_base_url": API_BASE_URL,
-        "mode": "strict" if args.strict else "standard",
-        "acceptance_database": DB_PATH,
-        "fixture_provenance": "synthetic spoken fixtures with real inference",
-        "hardware_profile": "100% Local $0 Cost CPU Benchmark",
-        "stages": {},
-        "timings_ms": {},
-        "verifications": {}
-    }
-
+def execute_verification(args, report):
     if args.strict and not os.path.exists(DB_PATH):
         print(f" [ERROR] Acceptance database not found at {DB_PATH} in strict mode.")
         report["verifications"]["acceptance_database"] = f"FAILED: Missing DB {DB_PATH}"
-        persist_report(report)
         sys.exit(1)
 
     # -----------------------------------------------------------------
@@ -326,17 +348,26 @@ def main():
             cfg_llm = (h_res.get("configuredLlmProvider") or "").strip()
             cfg_stt = (h_res.get("configuredSttProvider") or "").strip()
             cfg_tts = (h_res.get("configuredTtsProvider") or "").strip()
-            print(f" -> Backend reachable (LLM: {cfg_llm}, STT: {cfg_stt}, TTS: {cfg_tts})")
+            resolved_llm = h_res.get("resolvedLlmType")
+            resolved_stt = h_res.get("resolvedSttType")
+            resolved_tts = h_res.get("resolvedTtsType")
+            print(f" -> Backend reachable (LLM: {cfg_llm} [{resolved_llm}], STT: {cfg_stt} [{resolved_stt}], TTS: {cfg_tts} [{resolved_tts}])")
             report["stages"]["backend_providers"] = {
                 "llm": cfg_llm,
                 "stt": cfg_stt,
-                "tts": cfg_tts
+                "tts": cfg_tts,
+                "resolved_llm": resolved_llm,
+                "resolved_stt": resolved_stt,
+                "resolved_tts": resolved_tts
             }
             if args.strict:
-                disallowed = ["deterministicfake", "simulated", "fake", "none", ""]
-                assert cfg_llm.lower() not in disallowed, f"Strict mode requires real LLM provider (Ollama), got '{cfg_llm}'"
-                assert cfg_stt.lower() not in disallowed, f"Strict mode requires real STT provider, got '{cfg_stt}'"
-                assert cfg_tts.lower() not in disallowed, f"Strict mode requires real TTS provider, got '{cfg_tts}'"
+                try:
+                    validate_backend_providers(cfg_llm, cfg_stt, cfg_tts, resolved_llm, resolved_stt, resolved_tts)
+                except ValueError as ve:
+                    report["verifications"]["backend_providers"] = f"FAILED: {ve}"
+                    print(f" [ERROR] Provider validation failed: {ve}")
+                    sys.exit(1)
+            report["verifications"]["backend_providers"] = "PASSED"
         except Exception as e:
             print(f"\n[Notice] Backend on {API_BASE_URL} not reachable ({e}).")
             if args.strict:
@@ -592,6 +623,10 @@ def main():
                 pass
             time.sleep(0.01)
 
+        if not observable_work_started:
+            report["verifications"]["active_barge_in"] = "FAILED: Active worker work was not observed before interrupt"
+            assert observable_work_started, "Active worker work must be demonstrably observable in /health before issuing interrupt"
+
         t0 = time.perf_counter()
         code_int, int_res, _ = http_json(f"{API_BASE_URL}/api/voice/interrupt", method="POST", payload={"sessionId": s_id}, headers=hdrs)
         t_int = (time.perf_counter() - t0) * 1000
@@ -625,11 +660,40 @@ def main():
         report["timings_ms"]["active_barge_in_interrupt_ms"] = round(t_int, 2)
         report["verifications"]["active_barge_in"] = "PASSED"
         report["verifications"]["e2e_flow"] = "PASSED"
+def main():
+    parser = argparse.ArgumentParser(description="MasryVoice Real Local Voice Verification")
+    parser.add_argument("--strict", action="store_true", help="Fail nonzero if any required stage is unavailable")
+    parser.add_argument("--skip-backend", action="store_true", help="Skip backend E2E turns and test speech server only")
+    args = parser.parse_args()
 
-    # -----------------------------------------------------------------
-    # Stage 7: Persist & Report Artifacts (guaranteed persistence)
-    # -----------------------------------------------------------------
-    persist_report(report)
+    if args.strict and args.skip_backend:
+        print(" [ERROR] --strict cannot be used with --skip-backend. Full end-to-end verification is required.")
+        sys.exit(1)
+
+    print("=" * 78)
+    print("   MASRYVOICE REAL LOCAL VOICE PIPELINE ACCEPTANCE VERIFICATION ($0 Cost)   ")
+    print("=" * 78)
+
+    global DB_PATH
+    DB_PATH = resolve_db_path()
+
+    report = {
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "voice_server_url": VOICE_SERVER_URL,
+        "api_base_url": API_BASE_URL,
+        "mode": "strict" if args.strict else "standard",
+        "acceptance_database": DB_PATH,
+        "fixture_provenance": "synthetic spoken fixtures with real inference",
+        "hardware_profile": "100% Local $0 Cost CPU Benchmark",
+        "stages": {},
+        "timings_ms": {},
+        "verifications": {}
+    }
+
+    try:
+        execute_verification(args, report)
+    finally:
+        persist_report(report)
 
     print("\n" + "=" * 78)
     print("                      VERIFICATION SUMMARY REPORT                      ")
@@ -651,15 +715,19 @@ def main():
     print(f"Booking Lifecycle:       {report['verifications'].get('booking_lifecycle', 'N/A')}")
     print("=" * 78)
 
-    if args.skip_backend:
-        print("[PARTIAL] Component-only mode completed successfully (backend E2E turns skipped).\n")
-    elif all(v == "PASSED" for v in report.get("verifications", {}).values()):
-        print("[SUCCESS] All real local voice pipeline verifications passed.\n")
-    else:
-        failed_items = [k for k, v in report.get("verifications", {}).items() if v != "PASSED"]
-        print(f"[FAILURE] The following verifications did not pass: {failed_items}\n")
-        if args.strict:
+    required_criteria = REQUIRED_CRITERIA_COMPONENT if args.skip_backend else REQUIRED_CRITERIA_FULL
+    failed_items = [
+        crit for crit in required_criteria
+        if report.get("verifications", {}).get(crit) != "PASSED"
+    ]
+    if failed_items:
+        print(f"[FAILURE] The following required criteria did not pass: {failed_items}\n")
+        if args.strict or not args.skip_backend:
             sys.exit(1)
+    elif args.skip_backend:
+        print("[PARTIAL] Component-only mode completed successfully (backend E2E turns skipped).\n")
+    else:
+        print("[SUCCESS] All required real local voice pipeline criteria passed.\n")
 
 
 if __name__ == "__main__":

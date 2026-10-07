@@ -2,10 +2,9 @@
 Unit tests for verification script logic and failure-paths.
 Proves that:
 1. --strict rejects --skip-backend.
-2. --strict rejects missing acceptance database.
-3. Strict provider check rejects fake/simulated/none/case-insensitive providers.
+2. --strict rejects missing acceptance database and persists failure report into isolated temporary directory.
+3. validate_backend_providers whitelist rejects fake, simulated, missing, unknown typo configurations, and simulated concrete types.
 4. Component-only mode outputs PARTIAL.
-5. Report artifact is persisted on failure as well as success.
 """
 
 import os
@@ -33,39 +32,75 @@ class TestVerificationScriptLogic(unittest.TestCase):
                 vscript.main()
             self.assertEqual(ctx.exception.code, 1)
 
-    def test_strict_rejects_missing_database(self):
-        """Verifies that missing acceptance DB in strict mode fails and persists report."""
-        non_existent_db = os.path.join(tempfile.gettempdir(), "non_existent_voice_acceptance.db")
-        if os.path.exists(non_existent_db):
-            os.remove(non_existent_db)
+    def test_strict_rejects_missing_database_and_uses_isolated_dir(self):
+        """Verifies that missing acceptance DB in strict mode fails and writes to isolated directory without overwriting real report."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            non_existent_db = os.path.join(tmp_dir, "non_existent_voice_acceptance.db")
+            with patch.object(vscript, "resolve_db_path", return_value=non_existent_db), \
+                 patch.object(vscript, "ARTIFACTS_DIR", tmp_dir), \
+                 patch("sys.argv", ["verify.py", "--strict"]):
+                with self.assertRaises(SystemExit) as ctx:
+                    vscript.main()
+                self.assertEqual(ctx.exception.code, 1)
 
-        with patch.object(vscript, "resolve_db_path", return_value=non_existent_db), \
-             patch("sys.argv", ["verify.py", "--strict"]):
-            with self.assertRaises(SystemExit) as ctx:
-                vscript.main()
-            self.assertEqual(ctx.exception.code, 1)
+            # Verify report artifact was written to temporary directory
+            report_file = os.path.join(tmp_dir, "real_voice_verification_report.json")
+            self.assertTrue(os.path.exists(report_file))
+            with open(report_file, "r", encoding="utf-8") as f:
+                rep = json.load(f)
+            self.assertIn("acceptance_database", rep.get("verifications", {}))
+            self.assertIn("FAILED", rep["verifications"]["acceptance_database"])
 
-        # Verify report artifact was written with failure reason
-        report_file = os.path.join(vscript.ARTIFACTS_DIR, "real_voice_verification_report.json")
-        self.assertTrue(os.path.exists(report_file))
-        with open(report_file, "r", encoding="utf-8") as f:
-            rep = json.load(f)
-        self.assertIn("acceptance_database", rep.get("verifications", {}))
-        self.assertIn("FAILED", rep["verifications"]["acceptance_database"])
+    def test_validate_backend_providers_with_whitelist_and_concrete_types(self):
+        """
+        Directly exercises vscript.validate_backend_providers, proving that:
+        - Real authorized providers pass.
+        - Unknown typo configurations fail.
+        - Simulated / fake providers fail.
+        - Simulated resolved concrete DI types fail.
+        """
+        # 1. Valid real configurations
+        vscript.validate_backend_providers("Ollama", "Whisper", "Piper")
+        vscript.validate_backend_providers("ollama", "LocalEgyptian", "LocalEgyptian")
+        vscript.validate_backend_providers("OLLAMA", "real", "real",
+                                          resolved_llm="OllamaLlmProvider",
+                                          resolved_stt="WhisperSttProvider",
+                                          resolved_tts="LocalEgyptianTtsProvider")
 
-    def test_strict_provider_check_rejects_fake_and_simulated(self):
-        """Verifies strict provider validation rejects fake, simulated, and empty providers case-insensitively."""
-        disallowed = ["deterministicfake", "simulated", "fake", "none", ""]
-        for p in ["DeterministicFake", "simulated", "SIMULATED", "fake", "None", "", "   "]:
-            self.assertIn(p.strip().lower(), disallowed)
+        # 2. Typos and unknown configurations must fail
+        with self.assertRaises(ValueError) as ctx1:
+            vscript.validate_backend_providers("UnknownLlm", "Whisper", "Piper")
+        self.assertIn("LLM", str(ctx1.exception))
 
-        # Real providers are accepted
-        for real_llm in ["Ollama", "ollama", "qwen2.5:3b"]:
-            self.assertNotIn(real_llm.strip().lower(), disallowed)
-        for real_stt in ["Whisper", "faster-whisper"]:
-            self.assertNotIn(real_stt.strip().lower(), disallowed)
-        for real_tts in ["Piper", "piper-tts"]:
-            self.assertNotIn(real_tts.strip().lower(), disallowed)
+        with self.assertRaises(ValueError) as ctx2:
+            vscript.validate_backend_providers("Ollama", "WhisprTypo", "Piper")
+        self.assertIn("STT", str(ctx2.exception))
+
+        with self.assertRaises(ValueError) as ctx3:
+            vscript.validate_backend_providers("Ollama", "Whisper", "PiprTypo")
+        self.assertIn("TTS", str(ctx3.exception))
+
+        # 3. Simulated and fake configurations must fail
+        for fake in ["DeterministicFake", "Simulated", "fake", ""]:
+            with self.assertRaises(ValueError):
+                vscript.validate_backend_providers(fake, "Whisper", "Piper")
+            with self.assertRaises(ValueError):
+                vscript.validate_backend_providers("Ollama", fake, "Piper")
+            with self.assertRaises(ValueError):
+                vscript.validate_backend_providers("Ollama", "Whisper", fake)
+
+        # 4. Resolved concrete types mismatch must fail
+        with self.assertRaises(ValueError):
+            vscript.validate_backend_providers("Ollama", "Whisper", "Piper",
+                                              resolved_stt="SimulatedSttProvider")
+
+        with self.assertRaises(ValueError):
+            vscript.validate_backend_providers("Ollama", "Whisper", "Piper",
+                                              resolved_tts="SimulatedTtsProvider")
+
+        with self.assertRaises(ValueError):
+            vscript.validate_backend_providers("Ollama", "Whisper", "Piper",
+                                              resolved_llm="DeterministicFakeLlmProvider")
 
 
 if __name__ == "__main__":
