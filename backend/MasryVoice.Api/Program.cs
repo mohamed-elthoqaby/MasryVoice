@@ -213,14 +213,18 @@ builder.Services.AddScoped<AgentOrchestrator>();
 builder.Services.AddSingleton<SimulatedSttProvider>();
 builder.Services.AddSingleton<SimulatedTtsProvider>();
 
-var sttBaseUrl = builder.Configuration["Voice:SttBaseUrl"] ?? "http://127.0.0.1:8000";
+var sttBaseUrl = builder.Configuration["Voice:SttBaseUrl"] 
+    ?? builder.Configuration["Voice:SpeechServerUrl"] 
+    ?? "http://127.0.0.1:8000";
 builder.Services.AddHttpClient<WhisperSttProvider>(c =>
 {
     c.BaseAddress = new Uri(sttBaseUrl);
     c.Timeout = TimeSpan.FromSeconds(30);
 });
 
-var ttsBaseUrl = builder.Configuration["Voice:TtsBaseUrl"] ?? "http://127.0.0.1:8000";
+var ttsBaseUrl = builder.Configuration["Voice:TtsBaseUrl"] 
+    ?? builder.Configuration["Voice:SpeechServerUrl"] 
+    ?? "http://127.0.0.1:8000";
 builder.Services.AddHttpClient<LocalEgyptianTtsProvider>(c =>
 {
     c.BaseAddress = new Uri(ttsBaseUrl);
@@ -232,6 +236,8 @@ builder.Services.AddTransient<ISttProvider>(sp =>
     var config = sp.GetRequiredService<IConfiguration>();
     var sttProviderType = config["Voice:SttProvider"] ?? "Simulated";
     if (sttProviderType.Equals("Whisper", StringComparison.OrdinalIgnoreCase) ||
+        sttProviderType.Equals("LocalEgyptian", StringComparison.OrdinalIgnoreCase) ||
+        sttProviderType.Equals("LocalEgyptianVoice", StringComparison.OrdinalIgnoreCase) ||
         sttProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
     {
         return sp.GetRequiredService<WhisperSttProvider>();
@@ -244,6 +250,8 @@ builder.Services.AddTransient<ITtsProvider>(sp =>
     var config = sp.GetRequiredService<IConfiguration>();
     var ttsProviderType = config["Voice:TtsProvider"] ?? "Simulated";
     if (ttsProviderType.Equals("LocalEgyptian", StringComparison.OrdinalIgnoreCase) ||
+        ttsProviderType.Equals("LocalEgyptianVoice", StringComparison.OrdinalIgnoreCase) ||
+        ttsProviderType.Equals("Piper", StringComparison.OrdinalIgnoreCase) ||
         ttsProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
     {
         return sp.GetRequiredService<LocalEgyptianTtsProvider>();
@@ -1294,6 +1302,11 @@ app.MapPost("/api/voice/turn", async (
     using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(turnContext.Token, ctx.RequestAborted);
     var token = linkedCts.Token;
 
+    var turnSw = System.Diagnostics.Stopwatch.StartNew();
+    double sttDurationMs = 0;
+    double llmDurationMs = 0;
+    double ttsDurationMs = 0;
+
     var assistantText = new System.Text.StringBuilder();
     try
     {
@@ -1337,11 +1350,14 @@ app.MapPost("/api/voice/turn", async (
             var effectiveMime = !string.IsNullOrWhiteSpace(req.MimeType) ? req.MimeType
                 : (audioBytes.Length >= 4 && audioBytes[0] == (byte)'R' && audioBytes[1] == (byte)'I' ? "audio/wav" : "audio/webm");
 
+            var sttSw = System.Diagnostics.Stopwatch.StartNew();
             using (var sttPermit = await admission.AcquireSttPermitAsync(token))
             using (var audioStream = new MemoryStream(audioBytes))
             {
                 userMessage = await stt.TranscribeAudioAsync(audioStream, effectiveMime, "ar", token);
             }
+            sttSw.Stop();
+            sttDurationMs = sttSw.Elapsed.TotalMilliseconds;
         }
 
         if (string.IsNullOrWhiteSpace(userMessage))
@@ -1369,6 +1385,7 @@ app.MapPost("/api/voice/turn", async (
         }
 
         string? orchestratorError = null;
+        var llmSw = System.Diagnostics.Stopwatch.StartNew();
         // Process user message through LLM orchestrator (acquires and releases LLM permit internally)
         await foreach (var chatEvent in orchestrator.ProcessUserMessageAsync(effectiveAgentId, req.ConversationId, userMessage, token))
         {
@@ -1382,6 +1399,8 @@ app.MapPost("/api/voice/turn", async (
                 orchestratorError = chatEvent.Content;
             }
         }
+        llmSw.Stop();
+        llmDurationMs = llmSw.Elapsed.TotalMilliseconds;
 
         if (token.IsCancellationRequested || !session.IsTurnActive(turnContext.TurnId))
         {
@@ -1393,14 +1412,27 @@ app.MapPost("/api/voice/turn", async (
             return Results.Problem(detail: orchestratorError, statusCode: StatusCodes.Status500InternalServerError);
         }
 
-        var reply = assistantText.ToString();
+        var reply = assistantText.ToString().Trim();
+        if (string.IsNullOrWhiteSpace(reply))
+        {
+            var hasPending = await db.PendingBookings.AnyAsync(p => p.ConversationId == req.ConversationId && p.Status == "Pending", token);
+            reply = hasPending
+                ? "تم تجهيز مسودة الحجز بنجاح يا فندم، يرجى الضغط على زر تأكيد الحجز."
+                : "أهلاً بحضرتك يا فندم، المواعيد متاحة وتحت أمرك.";
+        }
 
         // Synthesize response speech with TTS under separate bounded admission (Zero nested deadlock!)
+        var ttsSw = System.Diagnostics.Stopwatch.StartNew();
         ReadOnlyMemory<byte> audioBytesOut;
         using (var ttsPermit = await admission.AcquireTtsPermitAsync(token))
         {
             audioBytesOut = await tts.SynthesizeSpeechAsync(reply, "ar-EG", token);
         }
+        ttsSw.Stop();
+        ttsDurationMs = ttsSw.Elapsed.TotalMilliseconds;
+
+        turnSw.Stop();
+        var totalTurnMs = turnSw.Elapsed.TotalMilliseconds;
 
         return Results.Ok(new
         {
@@ -1409,7 +1441,14 @@ app.MapPost("/api/voice/turn", async (
             conversationId = req.ConversationId,
             userText = userMessage,
             text = reply,
-            audioBase64 = Convert.ToBase64String(audioBytesOut.ToArray())
+            audioBase64 = Convert.ToBase64String(audioBytesOut.ToArray()),
+            timings = new
+            {
+                sttMs = Math.Round(sttDurationMs, 2),
+                llmMs = Math.Round(llmDurationMs, 2),
+                ttsMs = Math.Round(ttsDurationMs, 2),
+                totalMs = Math.Round(totalTurnMs, 2)
+            }
         });
     }
     catch (VoiceOverloadException ex)

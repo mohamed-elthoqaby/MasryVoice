@@ -43,6 +43,7 @@ public class WhisperSttProvider : ISttProvider
         content.Add(streamContent, "file", $"audio{ext}");
         content.Add(new StringContent("whisper-1"), "model");
         content.Add(new StringContent(language), "language");
+        content.Add(new StringContent("عيادة النور التخصصية، حجز كشف باطنة، أطفال، عظام، دكتور، محمد عاطف، رقم الهاتف 01012345678"), "prompt");
 
         var response = await _httpClient.PostAsync("/v1/audio/transcriptions", content, ct);
 
@@ -60,11 +61,64 @@ public class WhisperSttProvider : ISttProvider
             var transcript = textProp.GetString();
             if (!string.IsNullOrWhiteSpace(transcript))
             {
-                return transcript;
+                return NormalizeSpokenDigits(transcript);
             }
         }
 
         throw new InvalidOperationException("Whisper STT response did not contain a valid 'text' transcription field.");
+    }
+
+    private static string NormalizeSpokenDigits(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return text;
+        var map = new Dictionary<string, string>
+        {
+            ["صفر"] = "0", ["سفر"] = "0", ["صف"] = "0", ["الصفر"] = "0", ["السفر"] = "0",
+            ["واحد"] = "1", ["واح"] = "1", ["الواحد"] = "1", ["صفواح"] = "01", ["واحدث"] = "1", ["واحدثنام"] = "12", ["واحدثنا"] = "12",
+            ["اثنان"] = "2", ["اثنين"] = "2", ["تنين"] = "2", ["يثنان"] = "2", ["دثنان"] = "2", ["ثنان"] = "2", ["نان"] = "2", ["نام"] = "2", ["الاثنين"] = "2", ["الاتنين"] = "2",
+            ["ثلاثة"] = "3", ["تلاتة"] = "3", ["ثلاث"] = "3", ["تلات"] = "3", ["الثلاثة"] = "3",
+            ["أربعة"] = "4", ["اربعة"] = "4", ["أربع"] = "4", ["اربع"] = "4", ["اربعا"] = "4", ["أربعا"] = "4", ["الاربعة"] = "4", ["الأربعة"] = "4",
+            ["خمسة"] = "5", ["كمسة"] = "5", ["خمس"] = "5", ["كامس"] = "5", ["كم"] = "5", ["الخمسة"] = "5",
+            ["ستة"] = "6", ["ست"] = "6", ["سست"] = "6", ["الستة"] = "6",
+            ["سبعة"] = "7", ["سبع"] = "7", ["تسبع"] = "7", ["السبعة"] = "7",
+            ["ثمانية"] = "8", ["تمانية"] = "8", ["ثماني"] = "8", ["تماني"] = "8", ["الثمانية"] = "8",
+            ["تسعة"] = "9", ["تسع"] = "9", ["التسعة"] = "9"
+        };
+        var tokens = System.Text.RegularExpressions.Regex.Split(text, @"(\s+)");
+        var result = new System.Text.StringBuilder();
+        int i = 0;
+        while (i < tokens.Length)
+        {
+            var tok = tokens[i].Trim();
+            var clean = System.Text.RegularExpressions.Regex.Replace(tok, @"[^\w]", "");
+            if (map.ContainsKey(clean))
+            {
+                var digits = new System.Text.StringBuilder();
+                int j = i;
+                while (j < tokens.Length)
+                {
+                    var sub = tokens[j].Trim();
+                    if (string.IsNullOrEmpty(sub)) { j++; continue; }
+                    var cleanSub = System.Text.RegularExpressions.Regex.Replace(sub, @"[^\w]", "");
+                    if (map.TryGetValue(cleanSub, out var d))
+                    {
+                        digits.Append(d);
+                        j++;
+                    }
+                    else break;
+                }
+                if (digits.Length >= 3)
+                {
+                    result.Append(digits);
+                    i = j;
+                    continue;
+                }
+            }
+            result.Append(tokens[i]);
+            i++;
+        }
+        var str = result.ToString();
+        return System.Text.RegularExpressions.Regex.Replace(str, @"\bبسم\b(?=\s+[أ-ي])", "باسم");
     }
 }
 

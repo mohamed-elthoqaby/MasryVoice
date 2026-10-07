@@ -54,6 +54,7 @@ TestResults/
 *.mp3
 *.ogg
 *.webm
+!tests/fixtures/audio/*.wav
 recordings/
 audio_samples/
 

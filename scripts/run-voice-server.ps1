@@ -1,6 +1,6 @@
 param(
     [int]$Port = 8000,
-    [string]$WhisperModel = "tiny",
+    [string]$WhisperModel = "base",
     [string]$Voice = "ar_JO-kareem-low"
 )
 

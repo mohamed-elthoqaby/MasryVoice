@@ -40,7 +40,7 @@ public class LocalEgyptianTtsProvider : ITtsProvider
 
         if (string.IsNullOrWhiteSpace(text))
         {
-            throw new ArgumentException("Text to synthesize cannot be null or empty.", nameof(text));
+            throw new ArgumentException("Text cannot be null or empty.", nameof(text));
         }
 
         var voice = _config?["Voice:TtsVoice"] ?? "ar_JO-kareem-low";

@@ -1,0 +1,16 @@
+# Launcher for Backend API with dedicated isolated acceptance database ($0 Cost)
+$env:ASPNETCORE_ENVIRONMENT = "Testing"
+$env:ConnectionStrings__Sqlite = "Data Source=masryvoice_real_voice_acceptance.db"
+$env:DatabaseProvider = "Sqlite"
+$env:Database__InitializeSchema = "true"
+$env:Database__AutoSeed = "true"
+$env:LlmProvider = "Ollama"
+$env:Ollama__BaseUrl = "http://127.0.0.1:11434"
+$env:Ollama__DefaultModel = "qwen2.5:3b"
+$env:Voice__SttProvider = "LocalEgyptianVoice"
+$env:Voice__TtsProvider = "LocalEgyptianVoice"
+$env:Voice__SpeechServerUrl = "http://127.0.0.1:8000"
+$env:Security__AdminKey = "masryvoice_dev_admin_key"
+$env:Security__HmacSecret = "masryvoice_dev_hmac_secret_key_12345"
+
+& "C:\Users\Mohamed Atef\.dotnet\dotnet.exe" "backend/MasryVoice.Api/bin/Release/net10.0/MasryVoice.Api.dll" --urls "http://localhost:5000"
