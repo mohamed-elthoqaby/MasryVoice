@@ -60,6 +60,9 @@ audio_samples/
 # External Tools / Downloaded Repositories
 skills-main/
 scratch/
+.venv*/
+__pycache__/
+*.pyc
 
 # IDE & Operating System Files
 .vscode/
