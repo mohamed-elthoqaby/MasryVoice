@@ -1299,8 +1299,9 @@ app.MapPost("/api/voice/turn", async (
     {
         string userMessage = req.Message ?? string.Empty;
 
-        // If audio base64 is provided instead of text, transcribe with STT under bounded admission
-        if (string.IsNullOrWhiteSpace(userMessage) && !string.IsNullOrWhiteSpace(req.AudioBase64))
+        // If audio base64 is provided, prioritize STT transcription over any client-sent text
+        // This guarantees audio recordings are never bypassed by stale client transcripts
+        if (!string.IsNullOrWhiteSpace(req.AudioBase64))
         {
             // 1. Route-specific buffering check: max ~14MB base64 string
             if (req.AudioBase64.Length > 14 * 1024 * 1024)
@@ -1324,16 +1325,12 @@ app.MapPost("/api/voice/turn", async (
             {
                 return Results.Json(new { code = "AUDIO_SIZE_EXCEEDED", message = "حجم ملف الصوت يتجاوز الحد الأقصى المسموح به (10 ميجابايت)." }, statusCode: StatusCodes.Status413PayloadTooLarge);
             }
-            if (audioBytes.Length < 12)
-            {
-                return Results.BadRequest(new { code = "AUDIO_TRUNCATED_OR_CORRUPT", message = "ملف الصوت مبتور أو لا يحتوي على ترويسة صالحة." });
-            }
 
-            // 4. Server-side duration inspection (30s limit)
-            var durationSec = AudioDurationHelper.EstimateDurationSeconds(audioBytes);
-            if (durationSec.HasValue && durationSec.Value > 30.5)
+            // 4. Server-side container and duration inspection
+            var validation = AudioDurationHelper.Validate(audioBytes);
+            if (!validation.IsValid)
             {
-                return Results.BadRequest(new { code = "AUDIO_DURATION_EXCEEDED", message = $"مدة التسجيل الصوتي ({durationSec.Value:F1} ثانية) تتجاوز الحد الأقصى المسموح به وهو 30 ثانية." });
+                return Results.BadRequest(new { code = validation.ErrorCode ?? "AUDIO_TRUNCATED_OR_CORRUPT", message = validation.ErrorMessage ?? "ملف الصوت مبتور أو تالف." });
             }
 
             // 5. Container & MIME preservation

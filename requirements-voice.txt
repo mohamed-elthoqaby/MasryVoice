@@ -1,4 +1,10 @@
 # MasryVoice Local Speech Server Dependencies (100% Free & Local, Python 3.12, Windows x64)
+# Component Licenses:
+# - piper-tts 1.8.0 engine: GPL-3.0-or-later (https://pypi.org/project/piper-tts/1.8.0/)
+# - ar_JO-kareem-low voice weights: CC-BY (Trained by Ali Mokhammad on arabicttstrain dataset)
+# - faster-whisper 1.2.1 engine: MIT License (SYSTRAN)
+# - onnxruntime 1.30.0: MIT License (Microsoft)
+
 fastapi==0.142.2
 uvicorn==0.54.0
 python-multipart==0.0.32

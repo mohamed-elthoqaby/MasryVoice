@@ -150,7 +150,8 @@ export default function Dashboard() {
 
   // Voice tab state
   const [voiceSessionId, setVoiceSessionId] = useState<string>('');
-  const [voiceText, setVoiceText] = useState('');
+  const [voiceInputText, setVoiceInputText] = useState('');
+  const [voiceTranscript, setVoiceTranscript] = useState('');
   const [voiceResponseText, setVoiceResponseText] = useState<string>('');
   const [isVoiceProcessing, setIsVoiceProcessing] = useState(false);
   const [isVoiceSpeaking, setIsVoiceSpeaking] = useState(false);
@@ -475,8 +476,15 @@ export default function Dashboard() {
       };
 
       recorder.onstop = async () => {
-        if (mediaStreamRef.current) {
-          mediaStreamRef.current.getTracks().forEach(track => track.stop());
+        // 1. Immediately stop only this recording instance's audio tracks
+        stream.getTracks().forEach(track => track.stop());
+
+        // 2. Guard against obsolete recording identities BEFORE modifying active session state
+        if (currentRecId !== recordingSessionIdRef.current) {
+          return;
+        }
+
+        if (mediaStreamRef.current === stream) {
           mediaStreamRef.current = null;
         }
         if (micIntervalRef.current) {
@@ -486,11 +494,6 @@ export default function Dashboard() {
         setIsRecordingMic(false);
         setIsRecording(false);
         setMicDuration(0);
-
-        // Guard against obsolete recording identities
-        if (currentRecId !== recordingSessionIdRef.current) {
-          return;
-        }
 
         const chunks = audioChunksRef.current;
         if (chunks.length === 0) return;
@@ -704,8 +707,9 @@ export default function Dashboard() {
   };
 
   const handleSendVoiceTurn = async (messageText?: string, audioBase64?: string, mimeType?: string) => {
-    const textToSend = messageText !== undefined ? messageText : voiceText;
-    if ((!textToSend.trim() && !audioBase64) || !selectedAgent) return;
+    // If audio is provided, explicitly omit message text so previous turn's text or input is never sent as message
+    const textToSend = audioBase64 ? null : (messageText !== undefined ? messageText : voiceInputText).trim();
+    if ((!textToSend && !audioBase64) || !selectedAgent) return;
     isInterruptedRef.current = false;
     const currentRequestId = ++activeVoiceRequestIdRef.current;
     let sId = voiceSessionId;
@@ -767,10 +771,9 @@ export default function Dashboard() {
         setVoiceTurnId(data.turnId);
         setVoiceResponseText(data.text || '');
         if (data.userText) {
-          setVoiceText(data.userText);
-        } else {
-          setVoiceText('');
+          setVoiceTranscript(data.userText);
         }
+        setVoiceInputText('');
 
         if (data.audioBase64) {
           const audioSrc = `data:audio/wav;base64,${data.audioBase64}`;
@@ -1946,8 +1949,8 @@ export default function Dashboard() {
                     id="voice-input-text"
                     type="text"
                     placeholder="اكتب رسالة صوتية أو استفسار باللهجة المصرية..."
-                    value={voiceText}
-                    onChange={e => setVoiceText(e.target.value)}
+                    value={voiceInputText}
+                    onChange={e => setVoiceInputText(e.target.value)}
                     onKeyDown={e => e.key === 'Enter' && handleSendVoiceTurn()}
                     disabled={isVoiceProcessing || isRecordingMic}
                     style={{
@@ -1964,7 +1967,7 @@ export default function Dashboard() {
                   <button
                     id="send-voice-turn-btn"
                     onClick={() => handleSendVoiceTurn()}
-                    disabled={isVoiceProcessing || !voiceText.trim() || isRecordingMic}
+                    disabled={isVoiceProcessing || !voiceInputText.trim() || isRecordingMic}
                     style={{
                       background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
                       border: 'none',
@@ -1973,11 +1976,11 @@ export default function Dashboard() {
                       height: '46px',
                       color: '#fff',
                       fontWeight: 700,
-                      cursor: (isVoiceProcessing || !voiceText.trim() || isRecordingMic) ? 'not-allowed' : 'pointer',
+                      cursor: (isVoiceProcessing || !voiceInputText.trim() || isRecordingMic) ? 'not-allowed' : 'pointer',
                       display: 'flex',
                       alignItems: 'center',
                       gap: '8px',
-                      opacity: (isVoiceProcessing || !voiceText.trim() || isRecordingMic) ? 0.6 : 1
+                      opacity: (isVoiceProcessing || !voiceInputText.trim() || isRecordingMic) ? 0.6 : 1
                     }}
                   >
                     <Send size={16} />
@@ -2056,6 +2059,26 @@ export default function Dashboard() {
                   </span>
                 </div>
               </div>
+
+              {/* Active Voice User Transcript Display */}
+              {voiceTranscript && (
+                <div
+                  id="voice-transcript-content-display"
+                  style={{
+                    background: 'rgba(255, 255, 255, 0.05)',
+                    border: '1px solid rgba(255, 255, 255, 0.12)',
+                    borderRadius: '12px',
+                    padding: '14px 18px',
+                    color: '#e5e7eb',
+                    fontSize: '0.85rem'
+                  }}
+                >
+                  <div style={{ color: '#9ca3af', fontWeight: 600, fontSize: '0.75rem', marginBottom: '4px' }}>
+                    نص كلام المستخدم المكتشف (STT):
+                  </div>
+                  <div style={{ fontWeight: 500 }}>"{voiceTranscript}"</div>
+                </div>
+              )}
 
               {/* Active Voice Response Content Display */}
               {voiceResponseText && (

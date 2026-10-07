@@ -21,16 +21,17 @@ public class LocalEgyptianTtsProvider : ITtsProvider
     private readonly Microsoft.Extensions.Configuration.IConfiguration? _config;
     private readonly ILogger<LocalEgyptianTtsProvider> _logger;
 
-    public LocalEgyptianTtsProvider(HttpClient httpClient, ILogger<LocalEgyptianTtsProvider> logger)
-        : this(httpClient, null, logger)
-    {
-    }
-
+    [Microsoft.Extensions.DependencyInjection.ActivatorUtilitiesConstructor]
     public LocalEgyptianTtsProvider(HttpClient httpClient, Microsoft.Extensions.Configuration.IConfiguration? config, ILogger<LocalEgyptianTtsProvider> logger)
     {
         _httpClient = httpClient;
         _config = config;
         _logger = logger;
+    }
+
+    public LocalEgyptianTtsProvider(HttpClient httpClient, ILogger<LocalEgyptianTtsProvider> logger)
+        : this(httpClient, null, logger)
+    {
     }
 
     public async Task<ReadOnlyMemory<byte>> SynthesizeSpeechAsync(string text, string languageCode = "ar-EG", CancellationToken ct = default)

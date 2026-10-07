@@ -4,8 +4,11 @@ Provides OpenAI-compatible endpoints for:
 1. Whisper Speech-To-Text: POST /v1/audio/transcriptions
 2. Local Arabic Speech Synthesis (Piper ONNX): POST /v1/audio/speech
 
-Runs 100% locally on CPU without requiring GPU infrastructure, external networks, or paid APIs.
-Uses faster-whisper (CTranslate2 int8) and Piper TTS (ONNX / 16kHz PCM WAV).
+Runs 100% locally on CPU without requiring GPU infrastructure, external networks, or paid APIs ($0 Cost).
+Licenses:
+- faster-whisper: MIT License (SYSTRAN)
+- piper-tts 1.8.0 engine: GPL-3.0-or-later (Rhasspy / Michael Hansen)
+- ar_JO-kareem-low voice weights: Open Data / CC-BY (Ali Mokhammad / arabicttstrain)
 """
 
 import os
@@ -15,6 +18,7 @@ import time
 import glob
 import wave
 import asyncio
+import threading
 import tempfile
 import logging
 from typing import Optional
@@ -30,15 +34,16 @@ from piper.voice import PiperVoice
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("VoiceServer")
 
-# Configuration
+# Base directory configuration
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 
 # Whisper STT config
 WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
+WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "tiny")
 
-# Piper TTS config
+# Piper TTS config (GPL-3.0-or-later engine, ar_JO-kareem-low voice)
 DEFAULT_PIPER_ONNX = os.path.join(MODELS_DIR, "piper", "ar_JO-kareem-low", "ar_JO-kareem-low.onnx")
 DEFAULT_PIPER_JSON = os.path.join(MODELS_DIR, "piper", "ar_JO-kareem-low", "ar_JO-kareem-low.onnx.json")
 
@@ -64,31 +69,63 @@ piper_voice: Optional[PiperVoice] = None
 
 
 def find_local_whisper_snapshot() -> Optional[str]:
-    pattern = os.path.join(MODELS_DIR, "whisper", "models--Systran--faster-whisper-*", "snapshots", "*")
+    """Find strictly local Whisper model directory without remote fallback."""
+    explicit_path = os.environ.get("WHISPER_MODEL_PATH")
+    if explicit_path and os.path.exists(explicit_path):
+        return explicit_path
+
+    # Check for specific model snapshot first
+    pattern = os.path.join(MODELS_DIR, "whisper", f"models--Systran--faster-whisper-{WHISPER_MODEL_NAME}", "snapshots", "*")
     matches = glob.glob(pattern)
-    return matches[0] if matches else None
+    if matches and os.path.exists(matches[0]):
+        return matches[0]
+
+    # Check for any faster-whisper snapshot
+    any_pattern = os.path.join(MODELS_DIR, "whisper", "models--Systran--faster-whisper-*", "snapshots", "*")
+    any_matches = glob.glob(any_pattern)
+    if any_matches and os.path.exists(any_matches[0]):
+        return any_matches[0]
+
+    return None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global whisper_model, piper_voice
-    
-    # 1. Load Whisper STT (strictly local)
-    local_whisper_path = find_local_whisper_snapshot()
-    whisper_source = local_whisper_path if local_whisper_path and os.path.exists(local_whisper_path) else "tiny"
-    logger.info(f"Loading faster-whisper from '{whisper_source}' on {WHISPER_DEVICE} ({WHISPER_COMPUTE})...")
-    stt_start = time.perf_counter()
-    whisper_model = WhisperModel(whisper_source, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE, local_files_only=bool(local_whisper_path))
-    logger.info(f"faster-whisper loaded in {time.perf_counter() - stt_start:.2f}s")
 
-    # 2. Load Piper TTS (strictly local ONNX)
-    logger.info(f"Loading Piper TTS from '{TTS_MODEL_PATH}'...")
-    tts_start = time.perf_counter()
-    if os.path.exists(TTS_MODEL_PATH) and os.path.exists(TTS_CONFIG_PATH):
-        piper_voice = PiperVoice.load(TTS_MODEL_PATH, config_path=TTS_CONFIG_PATH)
-        logger.info(f"Piper TTS loaded in {time.perf_counter() - tts_start:.2f}s (voice={DEFAULT_VOICE})")
+    # 1. Load Whisper STT (strictly local, local_files_only=True)
+    local_whisper_path = find_local_whisper_snapshot()
+    if local_whisper_path and os.path.exists(local_whisper_path):
+        logger.info(f"Loading faster-whisper from local snapshot '{local_whisper_path}' on {WHISPER_DEVICE} ({WHISPER_COMPUTE})...")
+        stt_start = time.perf_counter()
+        try:
+            whisper_model = WhisperModel(
+                local_whisper_path,
+                device=WHISPER_DEVICE,
+                compute_type=WHISPER_COMPUTE,
+                local_files_only=True
+            )
+            logger.info(f"faster-whisper loaded in {time.perf_counter() - stt_start:.2f}s")
+        except Exception as e:
+            logger.error(f"Failed to load local Whisper model: {e}", exc_info=True)
+            whisper_model = None
     else:
-        logger.warning(f"Piper weights not found at {TTS_MODEL_PATH}. TTS will be unavailable until downloaded.")
+        logger.warning("No local faster-whisper model found. STT disabled (offline local_files_only=True enforced).")
+        whisper_model = None
+
+    # 2. Load Piper TTS (strictly local ONNX, GPL-3.0-or-later)
+    if os.path.exists(TTS_MODEL_PATH) and os.path.exists(TTS_CONFIG_PATH):
+        logger.info(f"Loading Piper TTS from '{TTS_MODEL_PATH}'...")
+        tts_start = time.perf_counter()
+        try:
+            piper_voice = PiperVoice.load(TTS_MODEL_PATH, config_path=TTS_CONFIG_PATH)
+            logger.info(f"Piper TTS loaded in {time.perf_counter() - tts_start:.2f}s (voice={DEFAULT_VOICE})")
+        except Exception as e:
+            logger.error(f"Failed to load Piper TTS model: {e}", exc_info=True)
+            piper_voice = None
+    else:
+        logger.warning(f"Piper weights not found at {TTS_MODEL_PATH}. TTS disabled.")
+        piper_voice = None
 
     yield
     logger.info("Shutting down MasryVoice Speech Server...")
@@ -107,15 +144,26 @@ class SpeechRequest(BaseModel):
 
 @app.get("/health")
 @app.get("/")
-async def health():
+async def health(response: Response):
+    stt_ok = whisper_model is not None
+    tts_ok = piper_voice is not None
+    is_healthy = stt_ok and tts_ok
+    if not is_healthy:
+        response.status_code = 503
+
     return {
-        "status": "healthy",
+        "status": "healthy" if is_healthy else "degraded",
         "stt_engine": "faster-whisper",
-        "stt_local_weights": bool(find_local_whisper_snapshot()),
+        "stt_license": "MIT",
+        "stt_ready": stt_ok,
+        "stt_local_weights": stt_ok,
         "device": WHISPER_DEVICE,
         "tts_engine": "piper-tts",
+        "tts_engine_license": "GPL-3.0-or-later",
+        "tts_voice_dataset_license": "CC-BY (AliMokhammad/arabicttstrain)",
+        "tts_ready": tts_ok,
         "tts_model": DEFAULT_VOICE,
-        "tts_local_weights": bool(piper_voice is not None),
+        "tts_local_weights": tts_ok,
         "free_and_local": True
     }
 
@@ -129,20 +177,24 @@ async def transcribe_audio(
     prompt: Optional[str] = Form(None)
 ):
     if not whisper_model:
-        raise HTTPException(status_code=503, detail={"code": "stt_unavailable", "message": "Whisper model not initialized"})
+        raise HTTPException(status_code=503, detail={"code": "stt_unavailable", "message": "Whisper STT model not loaded or offline"})
 
-    content = await file.read()
-    if not content or len(content) == 0:
-        raise HTTPException(status_code=400, detail={"code": "audio_empty", "message": "Audio file cannot be empty"})
-    if len(content) > MAX_AUDIO_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail={"code": "audio_size_exceeded", "message": f"Audio file ({len(content)} bytes) exceeds maximum size of {MAX_AUDIO_BYTES} bytes"}
-        )
-
-    # Check for client disconnect before waiting for permit
+    # Check client disconnect before doing any work
     if await request.is_disconnected():
         raise HTTPException(status_code=499, detail="Client Closed Request")
+
+    # 1. Bounded upload reading: read in 64KB chunks up to MAX_AUDIO_BYTES
+    content = bytearray()
+    while chunk := await file.read(64 * 1024):
+        content.extend(chunk)
+        if len(content) > MAX_AUDIO_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={"code": "audio_size_exceeded", "message": f"Audio file exceeds maximum size of {MAX_AUDIO_BYTES} bytes"}
+            )
+
+    if len(content) < 12:
+        raise HTTPException(status_code=400, detail={"code": "audio_truncated", "message": "Audio file is truncated or corrupted."})
 
     # Acquire STT admission permit with timeout
     try:
@@ -156,11 +208,10 @@ async def transcribe_audio(
 
     tmp_path = None
     try:
-        # Check disconnect again after permit acquisition
         if await request.is_disconnected():
             raise HTTPException(status_code=499, detail="Client Closed Request")
 
-        # Determine extension based on content-type or filename
+        # Determine extension based on filename or content-type
         ext = ".wav"
         if file.filename:
             _, file_ext = os.path.splitext(file.filename)
@@ -176,12 +227,20 @@ async def transcribe_audio(
             tmp.write(content)
             tmp_path = tmp.name
 
-        # Inspect duration server-side with PyAV
+        # 2. Strict audio container decoding and bounded sample validation via PyAV
         try:
             with av.open(tmp_path) as container:
-                if container.duration is not None:
-                    duration_sec = float(container.duration) / av.time_base
-                    if duration_sec > MAX_AUDIO_DURATION_SEC:
+                if not container.streams.audio:
+                    raise HTTPException(status_code=400, detail={"code": "audio_invalid_container", "message": "No audio stream found in container."})
+                audio_stream = container.streams.audio[0]
+                rate = audio_stream.rate or 16000
+                max_allowed_samples = int(rate * MAX_AUDIO_DURATION_SEC)
+                total_samples = 0
+
+                for frame in container.decode(audio_stream):
+                    total_samples += frame.samples
+                    if total_samples > max_allowed_samples:
+                        duration_sec = total_samples / rate
                         raise HTTPException(
                             status_code=400,
                             detail={
@@ -189,17 +248,21 @@ async def transcribe_audio(
                                 "message": f"Audio duration ({duration_sec:.1f}s) exceeds maximum allowed limit of 30 seconds."
                             }
                         )
+                if total_samples == 0:
+                    raise HTTPException(status_code=400, detail={"code": "audio_empty_frames", "message": "Audio stream contains 0 decodable frames."})
         except HTTPException:
             raise
         except Exception as e:
-            # If PyAV cannot inspect container, verify minimal headers
-            if len(content) < 12:
-                raise HTTPException(status_code=400, detail={"code": "audio_truncated", "message": "Audio file is truncated or corrupted."})
+            raise HTTPException(status_code=400, detail={"code": "audio_corrupted", "message": f"Failed to decode audio frames: {e}"})
 
         start_time = time.perf_counter()
 
-        def transcribe_generator():
-            return whisper_model.transcribe(
+        # 3. Completely offload model forward pass and segment iteration to a worker thread
+        # This prevents lazy CTranslate2 generator iteration from blocking the asyncio event loop!
+        stop_event = threading.Event()
+
+        def run_stt_worker():
+            segments_iter, info = whisper_model.transcribe(
                 tmp_path,
                 language=language if language and language != "auto" else "ar",
                 initial_prompt=prompt,
@@ -207,26 +270,35 @@ async def transcribe_audio(
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500)
             )
+            text_chunks = []
+            for segment in segments_iter:
+                if stop_event.is_set():
+                    return None, info, True
+                text_chunks.append(segment.text.strip())
+            return " ".join(text_chunks).strip(), info, False
 
-        segments_iter, info = await asyncio.to_thread(transcribe_generator)
+        worker_task = asyncio.create_task(asyncio.to_thread(run_stt_worker))
 
-        # Iterate segments with cooperative disconnect check
-        text_chunks = []
-        for segment in segments_iter:
+        # Monitor client disconnect and polling while worker thread executes
+        while not worker_task.done():
             if await request.is_disconnected():
-                logger.warning("[STT] Client disconnected during segment transcription. Aborting processing.")
+                stop_event.set()
+                logger.warning("[STT] Client disconnected during inference. Stop flag signaled to worker.")
                 raise HTTPException(status_code=499, detail="Client Closed Request")
-            text_chunks.append(segment.text.strip())
+            await asyncio.sleep(0.05)
 
-        transcribed_text = " ".join(text_chunks).strip()
+        transcribed_text, info, was_cancelled = await worker_task
+        if was_cancelled:
+            raise HTTPException(status_code=499, detail="Client Closed Request")
+
         latency = time.perf_counter() - start_time
-        logger.info(f"[STT] Transcribed {len(content)} bytes in {latency:.2f}s (lang={info.language}, prob={info.language_probability:.2f}): '{transcribed_text}'")
+        logger.info(f"[STT] Transcribed {len(content)} bytes in {latency:.2f}s (lang={info.language}): '{transcribed_text}'")
         return {"text": transcribed_text, "language": info.language, "duration": info.duration}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[STT] Transcription error: {e}", exc_info=True)
+        logger.error(f"[STT] Transcription failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail={"code": "stt_failed", "message": str(e)})
     finally:
         stt_semaphore.release()
@@ -240,7 +312,7 @@ async def transcribe_audio(
 @app.post("/v1/audio/speech")
 async def synthesize_speech(request: Request, req: SpeechRequest):
     if not piper_voice:
-        raise HTTPException(status_code=503, detail={"code": "tts_unavailable", "message": "Piper TTS voice not loaded"})
+        raise HTTPException(status_code=503, detail={"code": "tts_unavailable", "message": "Piper TTS voice not loaded or offline"})
 
     text = req.input.strip()
     if not text:
@@ -269,21 +341,35 @@ async def synthesize_speech(request: Request, req: SpeechRequest):
         if await request.is_disconnected():
             raise HTTPException(status_code=499, detail="Client Closed Request")
 
-        # Synthesize via local Piper ONNX model into 16kHz Mono 16-bit PCM WAV
-        buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(16000)
+        # 4. Offload Piper ONNX synthesis and chunk iteration to worker thread
+        # This prevents ONNX generator iteration from blocking the asyncio event loop!
+        stop_event = threading.Event()
 
-            # Generate chunks with cooperative cancellation check
-            for chunk in piper_voice.synthesize(text):
-                if await request.is_disconnected():
-                    logger.warning("[TTS] Client disconnected during chunk synthesis. Aborting processing.")
-                    raise HTTPException(status_code=499, detail="Client Closed Request")
-                wav_file.writeframes(chunk.audio_int16_bytes)
+        def run_tts_worker():
+            buffer = io.BytesIO()
+            with wave.open(buffer, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                for chunk in piper_voice.synthesize(text):
+                    if stop_event.is_set():
+                        return None, True
+                    wav_file.writeframes(chunk.audio_int16_bytes)
+            return buffer.getvalue(), False
 
-        wav_bytes = buffer.getvalue()
+        worker_task = asyncio.create_task(asyncio.to_thread(run_tts_worker))
+
+        while not worker_task.done():
+            if await request.is_disconnected():
+                stop_event.set()
+                logger.warning("[TTS] Client disconnected during synthesis. Stop flag signaled to worker.")
+                raise HTTPException(status_code=499, detail="Client Closed Request")
+            await asyncio.sleep(0.05)
+
+        wav_bytes, was_cancelled = await worker_task
+        if was_cancelled:
+            raise HTTPException(status_code=499, detail="Client Closed Request")
+
         if not wav_bytes or len(wav_bytes) <= 44:
             raise HTTPException(status_code=500, detail={"code": "tts_empty", "message": "TTS generated empty audio"})
 

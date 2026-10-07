@@ -74,16 +74,28 @@ public class WhisperSttProvider : ISttProvider
 /// </summary>
 public class SimulatedSttProvider : ISttProvider
 {
-    private readonly string _cannedTranscript;
+    private readonly string? _cannedTranscript;
 
     public SimulatedSttProvider(string? cannedTranscript = null)
     {
-        _cannedTranscript = cannedTranscript ?? "عايز أعرف المواعيد المتاحة بكرة للكشف يا سارة";
+        _cannedTranscript = cannedTranscript;
     }
 
     public Task<string> TranscribeAudioAsync(Stream audioStream, string contentType = "audio/wav", string language = "ar", CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        return Task.FromResult(_cannedTranscript);
+        if (!string.IsNullOrWhiteSpace(_cannedTranscript))
+        {
+            return Task.FromResult(_cannedTranscript);
+        }
+
+        // Differentiate fixtures deterministically based on fixture payload length
+        // turn1_inquiry.wav is ~176KB; turn2_booking.wav is ~374KB
+        if (audioStream.Length > 250000)
+        {
+            return Task.FromResult("احجزلي ميعاد بكرة باسم محمد عاطف ورقمي 01012345678");
+        }
+
+        return Task.FromResult("عايز أعرف المواعيد المتاحة بكرة للكشف يا سارة");
     }
 }

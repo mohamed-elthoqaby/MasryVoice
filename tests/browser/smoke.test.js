@@ -557,11 +557,45 @@ async function runBrowserSmokeSuite() {
     await page.unroute('**/api/voice/turn');
     assertNoPageErrors('Voice Race Regression 2');
 
+    // Part F: Virtual Microphone Recording & Audio Turn Dispatch (Simulated capture smoke)
+    console.log(' - Part F: Verifying virtual microphone capture and audio payload dispatch (Simulated)...');
+    let capturedVoiceTurnAudioRequest = null;
+    await page.route('**/api/voice/turn', async route => {
+      const postData = route.request().postDataJSON();
+      if (postData && postData.audioBase64) {
+        capturedVoiceTurnAudioRequest = postData;
+      }
+      await route.continue();
+    });
+
+    // Ensure not recording
+    await page.waitForSelector('#voice-record-btn:not([disabled])', { timeout: 15000 });
+    // Click record to start recording virtual mic
+    await page.click('#voice-record-btn');
+    await page.waitForSelector('#voice-recording-indicator', { timeout: 5000 });
+    console.log('   Virtual microphone recording active (indicator visible).');
+
+    // Wait for at least 500ms of frames to be recorded
+    await page.waitForTimeout(600);
+
+    // Click record again to stop and send
+    await page.click('#voice-record-btn');
+    console.log('   Stopped virtual microphone recording; dispatched audio turn.');
+
+    // Wait for /api/voice/turn network request to complete
+    await page.waitForResponse(resp => resp.url().includes('/api/voice/turn'), { timeout: 25000 });
+    assert.notStrictEqual(capturedVoiceTurnAudioRequest, null, 'Microphone recording must dispatch /api/voice/turn with audio payload');
+    assert.strictEqual(Boolean(capturedVoiceTurnAudioRequest.audioBase64), true, 'Request must contain audioBase64 string');
+    assert.strictEqual(capturedVoiceTurnAudioRequest.message, null, 'Recorded audio turn must omit client message text to prevent STT bypass');
+    console.log('   Verified audio turn dispatched with audioBase64 and null message text.');
+    await page.unroute('**/api/voice/turn');
+    assertNoPageErrors('Virtual Mic Audio Turn');
+
     // Verify completion before closing browser
     await page.waitForLoadState('networkidle');
 
     console.log('\n====================================================');
-    console.log('ALL BROWSER SMOKE CHECKS PASSED SUCCESSFULLY (5/5)!');
+    console.log('ALL BROWSER SMOKE CHECKS PASSED SUCCESSFULLY (6/6)!');
     console.log('====================================================');
   } finally {
     await browser.close();

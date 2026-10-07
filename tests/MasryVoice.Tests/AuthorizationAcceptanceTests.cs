@@ -1056,8 +1056,26 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var agent = await db.Agents.FirstAsync(a => a.IsActive);
 
-        // Provide a valid small audio base64 payload
-        var dummyAudioBase64 = Convert.ToBase64String(new byte[] { 82, 73, 70, 70, 36, 0, 0, 0, 87, 65, 86, 69 });
+        // Provide a valid small audio base64 payload (100ms 16kHz PCM WAV)
+        using var msDummy = new MemoryStream();
+        using (var w = new BinaryWriter(msDummy))
+        {
+            w.Write("RIFF"u8);
+            w.Write(36 + 3200);
+            w.Write("WAVE"u8);
+            w.Write("fmt "u8);
+            w.Write(16);
+            w.Write((short)1); // PCM
+            w.Write((short)1); // Mono
+            w.Write(16000);    // SampleRate
+            w.Write(32000);    // ByteRate
+            w.Write((short)2); // BlockAlign
+            w.Write((short)16);// BitsPerSample
+            w.Write("data"u8);
+            w.Write(3200);     // 100ms
+            w.Write(new byte[3200]);
+        }
+        var dummyAudioBase64 = Convert.ToBase64String(msDummy.ToArray());
         var turnRequest = new
         {
             sessionId = sessionId,
@@ -1115,7 +1133,7 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
         Assert.Equal("AUDIO_TRUNCATED_OR_CORRUPT", truncErr.GetProperty("code").GetString());
 
         // 3. Audio duration exceeded (> 30s) -> 400 Bad Request
-        // Build valid WAV header with byteRate=32000 (16kHz 16-bit Mono) and 35 seconds of data (35 * 32000 = 1120000 bytes)
+        // Build valid WAV with byteRate=32000 (16kHz 16-bit Mono) and 35 seconds of ACTUAL sample data (35 * 32000 = 1120000 bytes)
         using var ms = new MemoryStream();
         using (var writer = new BinaryWriter(ms))
         {
@@ -1132,7 +1150,7 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
             writer.Write((short)16);// BitsPerSample
             writer.Write("data"u8);
             writer.Write(1120000);  // 35 seconds
-            writer.Write(new byte[64]); // small buffer to satisfy length check
+            writer.Write(new byte[1120000]); // Real 35 seconds of samples
         }
         var overlongB64 = Convert.ToBase64String(ms.ToArray());
         var overlongRes = await client.PostAsJsonAsync("/api/voice/turn", new
@@ -1146,6 +1164,52 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
         var overlongErr = await overlongRes.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal("AUDIO_DURATION_EXCEEDED", overlongErr.GetProperty("code").GetString());
 
+        // 3b. Spoofed/truncated WAV header (claims 1120000 bytes but only 64 data bytes present) -> 400 Bad Request
+        using var msTrunc = new MemoryStream();
+        using (var writer = new BinaryWriter(msTrunc))
+        {
+            writer.Write("RIFF"u8);
+            writer.Write(36 + 1120000);
+            writer.Write("WAVE"u8);
+            writer.Write("fmt "u8);
+            writer.Write(16);
+            writer.Write((short)1);
+            writer.Write((short)1);
+            writer.Write(16000);
+            writer.Write(32000);
+            writer.Write((short)2);
+            writer.Write((short)16);
+            writer.Write("data"u8);
+            writer.Write(1120000);
+            writer.Write(new byte[64]); // Only 64 bytes -> truncated/spoofed!
+        }
+        var spoofedB64 = Convert.ToBase64String(msTrunc.ToArray());
+        var spoofedRes = await client.PostAsJsonAsync("/api/voice/turn", new
+        {
+            sessionId,
+            conversationId = convId,
+            agentId = agent.Id,
+            audioBase64 = spoofedB64
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, spoofedRes.StatusCode);
+        var spoofedErr = await spoofedRes.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("AUDIO_TRUNCATED_OR_CORRUPT", spoofedErr.GetProperty("code").GetString());
+
+        // 3c. Arbitrary corrupt payload (neither WAV nor WebM nor OGG) -> 400 Bad Request
+        var corruptBytes = new byte[256];
+        new Random(42).NextBytes(corruptBytes);
+        var corruptB64 = Convert.ToBase64String(corruptBytes);
+        var corruptRes = await client.PostAsJsonAsync("/api/voice/turn", new
+        {
+            sessionId,
+            conversationId = convId,
+            agentId = agent.Id,
+            audioBase64 = corruptB64
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, corruptRes.StatusCode);
+        var corruptErr = await corruptRes.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("AUDIO_TRUNCATED_OR_CORRUPT", corruptErr.GetProperty("code").GetString());
+
         // 4. Oversized payload (> 10MB) -> 413 Payload Too Large
         var oversizedBytes = new byte[10 * 1024 * 1024 + 1024];
         var oversizedB64 = Convert.ToBase64String(oversizedBytes);
@@ -1157,6 +1221,103 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
             audioBase64 = oversizedB64
         });
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedRes.StatusCode);
+    }
+
+    [Fact]
+    public async Task TwoConsecutiveRecordedVoiceTurns_ExecutesSttSeparately_AndPersistsDistinctTranscripts()
+    {
+        using var client = _factory.CreateClient();
+        var (sessionId, convId, custToken) = await CreateSessionAsync(client);
+        client.DefaultRequestHeaders.Add("X-Customer-Token", custToken);
+
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var agent = await db.Agents.FirstAsync();
+
+        // Turn 1: 176KB audio (turn1 fixture simulation)
+        // Send with a stale message text to prove server prioritizes audio over stale text
+        var turn1Audio = new byte[176684];
+        // Populate standard valid WAV header so validation passes
+        using (var ms1 = new MemoryStream(turn1Audio))
+        using (var w1 = new BinaryWriter(ms1))
+        {
+            w1.Write("RIFF"u8);
+            w1.Write(36 + (176684 - 44));
+            w1.Write("WAVE"u8);
+            w1.Write("fmt "u8);
+            w1.Write(16);
+            w1.Write((short)1);
+            w1.Write((short)1);
+            w1.Write(16000);
+            w1.Write(32000);
+            w1.Write((short)2);
+            w1.Write((short)16);
+            w1.Write("data"u8);
+            w1.Write(176684 - 44);
+        }
+        var turn1B64 = Convert.ToBase64String(turn1Audio);
+
+        var res1 = await client.PostAsJsonAsync("/api/voice/turn", new
+        {
+            sessionId,
+            conversationId = convId,
+            agentId = agent.Id,
+            message = "رسالة قديمة يجب تجاهلها لصالح الصوت",
+            audioBase64 = turn1B64,
+            mimeType = "audio/wav"
+        });
+        Assert.Equal(HttpStatusCode.OK, res1.StatusCode);
+        var doc1 = await res1.Content.ReadFromJsonAsync<JsonElement>();
+        var userText1 = doc1.GetProperty("userText").GetString();
+        Assert.Contains("المواعيد المتاحة", userText1);
+
+        // Turn 2: 374KB audio (turn2 fixture simulation)
+        var turn2Audio = new byte[374828];
+        using (var ms2 = new MemoryStream(turn2Audio))
+        using (var w2 = new BinaryWriter(ms2))
+        {
+            w2.Write("RIFF"u8);
+            w2.Write(36 + (374828 - 44));
+            w2.Write("WAVE"u8);
+            w2.Write("fmt "u8);
+            w2.Write(16);
+            w2.Write((short)1);
+            w2.Write((short)1);
+            w2.Write(16000);
+            w2.Write(32000);
+            w2.Write((short)2);
+            w2.Write((short)16);
+            w2.Write("data"u8);
+            w2.Write(374828 - 44);
+        }
+        var turn2B64 = Convert.ToBase64String(turn2Audio);
+
+        var res2 = await client.PostAsJsonAsync("/api/voice/turn", new
+        {
+            sessionId,
+            conversationId = convId,
+            agentId = agent.Id,
+            audioBase64 = turn2B64,
+            mimeType = "audio/wav"
+        });
+        Assert.Equal(HttpStatusCode.OK, res2.StatusCode);
+        var doc2 = await res2.Content.ReadFromJsonAsync<JsonElement>();
+        var userText2 = doc2.GetProperty("userText").GetString();
+
+        // Assert Turn 2 did NOT reuse Turn 1's text and reflects Turn 2's distinct audio transcription
+        Assert.NotEqual(userText1, userText2);
+        Assert.Contains("محمد عاطف", userText2);
+
+        // Verify database persistence has both distinct user messages
+        using var scope2 = _factory.Services.CreateScope();
+        var db2 = scope2.ServiceProvider.GetRequiredService<AppDbContext>();
+        var dbMessages = await db2.Messages
+            .Where(m => m.ConversationId == convId && m.Role == "user")
+            .OrderBy(m => m.CreatedAtUtc)
+            .ToListAsync();
+        Assert.Equal(2, dbMessages.Count);
+        Assert.Contains("المواعيد المتاحة", dbMessages[0].Content);
+        Assert.Contains("محمد عاطف", dbMessages[1].Content);
     }
 }
 
