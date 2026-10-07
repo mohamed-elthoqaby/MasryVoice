@@ -55,10 +55,14 @@ try {
         try {
             $h = Invoke-RestMethod -Uri "$BackendUrl/api/health/ready" -Method Get -TimeoutSec 2
             if ($h.status -eq "Ready" -or $h.databaseConnected -eq $true) {
+                if ($h.environment -ne "Testing") {
+                    throw "Backend runtime environment mismatch! Expected 'Testing', got '$($h.environment)'"
+                }
                 $ready = $true
                 break
             }
         } catch {
+            if ($_.Exception.Message -like "*mismatch*") { throw $_ }
             if ($i % 5 -eq 0) { Write-Host " - Waiting for backend..." }
         }
     }

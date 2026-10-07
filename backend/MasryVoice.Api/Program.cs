@@ -289,6 +289,7 @@ using (var scope = app.Services.CreateScope())
 app.MapGet("/api/health/live", () => Results.Ok(new
 {
     status = "Alive",
+    environment = builder.Environment.EnvironmentName,
     timestampUtc = DateTime.UtcNow
 }));
 
@@ -308,6 +309,7 @@ app.MapGet("/api/health/ready", async (AppDbContext db) =>
         return Results.Json(new
         {
             status = "Unhealthy",
+            environment = builder.Environment.EnvironmentName,
             databaseConnected = false,
             reason = "Database unreachable"
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
@@ -316,6 +318,7 @@ app.MapGet("/api/health/ready", async (AppDbContext db) =>
     return Results.Ok(new
     {
         status = "Ready",
+        environment = builder.Environment.EnvironmentName,
         databaseConnected = true,
         timestampUtc = DateTime.UtcNow
     });
@@ -350,6 +353,7 @@ app.MapGet("/api/health", async (
     var payload = new
     {
         status = dbOk ? "Healthy" : "Unhealthy",
+        environment = builder.Environment.EnvironmentName,
         timestampUtc = DateTime.UtcNow,
         cairoTime = nowCairo.ToString("yyyy-MM-dd HH:mm:ss"),
         isCairoBusinessHours = isBusinessHours,

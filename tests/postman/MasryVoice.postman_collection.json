@@ -349,6 +349,41 @@
           ]
         },
         {
+          "name": "Create Server Session - Unrelated Control Fixture",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/sessions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sessions"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Server session for Control Fixture created with 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var res = pm.response.json();",
+                  "    pm.expect(res.conversationId).to.be.a('string');",
+                  "    pm.expect(res.customerToken).to.be.a('string');",
+                  "    pm.environment.set('controlConversationId', res.conversationId);",
+                  "    pm.environment.set('controlCustomerToken', res.customerToken);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "name": "Stage Pending Booking Draft - Customer A",
           "request": {
             "method": "POST",
@@ -880,8 +915,31 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('Exactly one booking exists for committed booking ID', function () {",
+                  "pm.test('Safely scoped assertion by fixture booking intent: exactly one confirmed booking exists', function () {",
                   "    pm.response.to.have.status(200);",
+                  "    var bookings = pm.response.json();",
+                  "    var slotId = pm.environment.get('selectedSlotId');",
+                  "    var phone = pm.environment.get('customerPhoneA');",
+                  "    var convId = pm.environment.get('conversationIdA');",
+                  "    var committedId = pm.environment.get('committedBookingIdA');",
+                  "",
+                  "    // Scoped strictly by fixture booking intent: slot, customer phone, and owning conversation",
+                  "    var intentMatches = bookings.filter(function(b) {",
+                  "        return b.slotId === slotId &&",
+                  "               b.customerPhone === phone &&",
+                  "               b.status === 'Confirmed' &&",
+                  "               (!convId || b.conversationId === convId);",
+                  "    });",
+                  "",
+                  "    pm.expect(intentMatches.length).to.eql(1);",
+                  "    pm.expect(intentMatches[0].id).to.eql(committedId);",
+                  "    pm.expect(intentMatches[0].slotId).to.eql(slotId);",
+                  "    pm.expect(intentMatches[0].customerPhone).to.eql(phone);",
+                  "    if (convId) {",
+                  "        pm.expect(intentMatches[0].conversationId).to.eql(convId);",
+                  "    }",
+                  "});",
+                  "pm.test('Original booking ID preserved with exactly one committed record', function () {",
                   "    var bookings = pm.response.json();",
                   "    var matches = bookings.filter(function(b) { return b.id === pm.environment.get('committedBookingIdA'); });",
                   "    pm.expect(matches.length).to.eql(1);",
@@ -1843,6 +1901,157 @@
           ]
         },
         {
+          "name": "Assert Cleanup Restores Fixture Slot Capacity",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/slots",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "slots"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Slot booked capacity restored to initial baseline capacity after cleanup', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var slots = pm.response.json();",
+                  "    var slot = slots.find(function(s) { return s.id === pm.environment.get('selectedSlotId'); });",
+                  "    pm.expect(slot).to.not.be.undefined;",
+                  "    var initialCap = pm.environment.get('slotInitialBookedCapacity');",
+                  "    pm.expect(slot.bookedCapacity).to.eql(initialCap);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Assert Control Fixture Preserved While Test Fixture Resources Removed",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Customer-Token",
+                "value": "{{controlCustomerToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/conversations/{{controlConversationId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "conversations",
+                "{{controlConversationId}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Unrelated control fixture preserved after test fixture cleanup', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var res = pm.response.json();",
+                  "    pm.expect(res.id).to.eql(pm.environment.get('controlConversationId'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Assert Test Fixture Resources Removed - Verify Deleted Conversation 404",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Key",
+                "value": "{{adminKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/conversations/{{conversationIdA}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "conversations",
+                "{{conversationIdA}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Deleted fixture conversation returns 404 Not Found', function () {",
+                  "    pm.response.to.have.status(404);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Clean Up Unrelated Control Fixture (Admin)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "X-Admin-Key",
+                "value": "{{adminKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/fixtures?conversationIds={{controlConversationId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "fixtures"
+              ],
+              "query": [
+                {
+                  "key": "conversationIds",
+                  "value": "{{controlConversationId}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Control fixture cleaned up safely with 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "name": "Sanitize Environment Fixtures and Dynamic Tokens",
           "request": {
             "method": "GET",
@@ -1873,6 +2082,8 @@
                   "    pm.environment.unset('customerTokenB');",
                   "    pm.environment.unset('customerPhoneB');",
                   "    pm.environment.unset('customerNameB');",
+                  "    pm.environment.unset('controlConversationId');",
+                  "    pm.environment.unset('controlCustomerToken');",
                   "    pm.environment.unset('stagedPendingBookingIdA');",
                   "    pm.environment.unset('stagedRequestHashA');",
                   "    pm.environment.unset('issuedCustomerTokenA');",

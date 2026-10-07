@@ -30,16 +30,23 @@ namespace MasryVoice.Api.Migrations
                 principalColumn: "Id",
                 onDelete: ReferentialAction.SetNull);
 
-            // Backfill ownership exclusively from reliable relationships (IdempotencyKey matching PendingBooking).
+            // Backfill ownership exclusively from unambiguous, reliable relationships (IdempotencyKey matching PendingBooking).
             // Explicitly avoid inferring ownership from phone numbers to prevent cross-customer data leakage.
+            // If multiple PendingBookings have conflicting ConversationIds for the same IdempotencyKey, ownership is excluded.
             if (migrationBuilder.ActiveProvider?.Contains("Npgsql", StringComparison.OrdinalIgnoreCase) == true)
             {
                 migrationBuilder.Sql(@"
                     UPDATE ""Bookings"" b
-                    SET ""ConversationId"" = pb.""ConversationId""
-                    FROM ""PendingBookings"" pb
-                    WHERE b.""IdempotencyKey"" = pb.""IdempotencyKey""
-                      AND pb.""ConversationId"" IS NOT NULL;
+                    SET ""ConversationId"" = u.""ConversationId""
+                    FROM (
+                        SELECT pb.""IdempotencyKey"", MIN(pb.""ConversationId""::text)::uuid AS ""ConversationId""
+                        FROM ""PendingBookings"" pb
+                        WHERE pb.""ConversationId"" IS NOT NULL
+                        GROUP BY pb.""IdempotencyKey""
+                        HAVING COUNT(DISTINCT pb.""ConversationId"") = 1
+                    ) u
+                    WHERE b.""IdempotencyKey"" = u.""IdempotencyKey""
+                      AND b.""ConversationId"" IS NULL;
                 ");
             }
             else
@@ -50,13 +57,17 @@ namespace MasryVoice.Api.Migrations
                         SELECT pb.ConversationId
                         FROM PendingBookings pb
                         WHERE pb.IdempotencyKey = Bookings.IdempotencyKey
-                        LIMIT 1
+                          AND pb.ConversationId IS NOT NULL
+                        GROUP BY pb.IdempotencyKey
+                        HAVING COUNT(DISTINCT pb.ConversationId) = 1
                     )
                     WHERE ConversationId IS NULL
-                      AND EXISTS (
-                        SELECT 1
+                      AND IdempotencyKey IN (
+                        SELECT pb.IdempotencyKey
                         FROM PendingBookings pb
-                        WHERE pb.IdempotencyKey = Bookings.IdempotencyKey
+                        WHERE pb.ConversationId IS NOT NULL
+                        GROUP BY pb.IdempotencyKey
+                        HAVING COUNT(DISTINCT pb.ConversationId) = 1
                       );
                 ");
             }

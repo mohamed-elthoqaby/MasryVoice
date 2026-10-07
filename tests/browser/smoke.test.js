@@ -14,7 +14,8 @@ async function runBrowserSmokeSuite() {
   console.log('====================================================');
   console.log(`Target URL: ${FRONTEND_URL}`);
   console.log('Environment: Local Supported Browser (Edge/Chromium)');
-  console.log('[Notice] Voice tests verify protocol orchestration and barge-in suppression using SIMULATED audio; they do not verify real acoustic STT/TTS models.\n');
+  console.log('[Notice] Voice tests verify protocol orchestration and barge-in suppression using SIMULATED providers;');
+  console.log('         They do not establish microphone capture, real transcription, intelligible speech, or Egyptian Arabic acoustic quality.\n');
 
   const launchOptions = {
     headless: true
@@ -31,8 +32,19 @@ async function runBrowserSmokeSuite() {
     viewport: { width: 1280, height: 800 }
   });
   const page = await context.newPage();
+
+  const pageErrors = [];
   page.on('console', msg => console.log('PAGE LOG:', msg.text()));
-  page.on('pageerror', err => console.log('PAGE ERROR:', err.message));
+  page.on('pageerror', err => {
+    console.error('PAGE ERROR:', err.message);
+    pageErrors.push(err.message);
+  });
+
+  function assertNoPageErrors(contextName) {
+    if (pageErrors.length > 0) {
+      assert.fail(`[${contextName}] Unexpected browser page error(s) occurred:\n` + pageErrors.join('\n'));
+    }
+  }
 
   try {
     // Navigate to Dashboard
@@ -42,6 +54,7 @@ async function runBrowserSmokeSuite() {
     console.log(` Page title loaded: "${title}"`);
     await page.waitForSelector('#admin-auth-btn', { timeout: 10000 });
     console.log(' Dashboard navbar and controls loaded successfully.');
+    assertNoPageErrors('Homepage load');
 
     // -----------------------------------------------------------------
     // TEST 1: Two-Turn Chat Flow & Staging
@@ -59,6 +72,7 @@ async function runBrowserSmokeSuite() {
       return msgs.length >= 2;
     }, { timeout: 15000 });
     console.log(' Turn 1 response received from assistant.');
+    assertNoPageErrors('Chat Turn 1');
 
     // Turn 2: Booking intent with customer details
     console.log(' - Sending Turn 2: تقديم بيانات الحجز للمعاينة...');
@@ -68,6 +82,7 @@ async function runBrowserSmokeSuite() {
     // Wait for pending booking preview card to appear
     await page.waitForSelector('#confirm-booking-btn', { timeout: 20000 });
     console.log(' Turn 2 complete: Pending booking card displayed with staging details.');
+    assertNoPageErrors('Chat Turn 2');
 
     // -----------------------------------------------------------------
     // TEST 2: Booking Confirmation Contract & Visual Success
@@ -90,6 +105,7 @@ async function runBrowserSmokeSuite() {
       'Confirmation card must display confirmed booking ID and success status'
     );
     console.log(' Booking confirmed successfully and rendered with confirmed ID in UI.');
+    assertNoPageErrors('Booking Confirmation');
 
     // -----------------------------------------------------------------
     // TEST 3: Admin Authentication & Settings Update
@@ -116,23 +132,20 @@ async function runBrowserSmokeSuite() {
       return document.body.innerText.includes('تم حفظ إعدادات الوكيل بنجاح');
     }, { timeout: 10000 });
     console.log(` Admin settings saved successfully (Agent Name updated to "${newAgentName}").`);
+    assertNoPageErrors('Admin Settings');
 
     // -----------------------------------------------------------------
-    // TEST 4: Initial Voice Turn & Consecutive Turn (Simulated Voice)
+    // TEST 4: Automatic Voice Session Creation & Consecutive Turn
     // -----------------------------------------------------------------
-    console.log('\n[Test 4/5] Verifying Voice Session & Consecutive Voice Turns (Simulated)...');
+    console.log('\n[Test 4/5] Verifying Automatic Session Creation on First Turn & Consecutive Turn (Simulated)...');
     
-    // Switch to Voice tab
+    // Switch to Voice tab WITHOUT clicking start session button
     await page.click('#tab-voice-btn');
-    await page.waitForSelector('#start-voice-session-btn', { timeout: 5000 });
+    await page.waitForSelector('#voice-input-text', { timeout: 5000 });
+    console.log(' Switched to Voice tab. Session NOT explicitly started.');
 
-    // Start voice session
-    await page.click('#start-voice-session-btn');
-    await page.waitForSelector('#voice-barge-in-btn:not([disabled])', { timeout: 10000 });
-    console.log(' Voice session established and active.');
-
-    // Turn 1: Initial voice turn
-    console.log(' - Sending Voice Turn 1: استفسار صوتي أولي...');
+    // Turn 1: First turn WITHOUT manually starting session (exercises automatic session creation in handleSendVoiceTurn)
+    console.log(' - Sending Voice Turn 1 without manual session start (exercises automatic session creation)...');
     await page.fill('#voice-input-text', 'مساء الخير عايز استفسار عن مواعيد العيادة');
     await page.click('#send-voice-turn-btn');
 
@@ -140,10 +153,11 @@ async function runBrowserSmokeSuite() {
     await page.waitForFunction(() => {
       const el = document.getElementById('voice-turn-id-display');
       return el && el.innerText.trim() === '#1';
-    }, { timeout: 20000 });
-    console.log(' Initial voice turn 1 completed successfully (Turn Epoch #1).');
+    }, { timeout: 25000 });
+    console.log(' Voice turn 1 completed successfully with automatic session creation (Turn Epoch #1).');
+    assertNoPageErrors('Automatic Session Turn 1');
 
-    // Turn 2: Consecutive turn with direct token reuse
+    // Turn 2: Consecutive turn verifying session continuity
     console.log(' - Sending Voice Turn 2: استفسار صوتي ثانٍ مع التحقق من استمرارية الجلسة...');
     await page.fill('#voice-input-text', 'تمام شكراً لحضرتك');
     await page.click('#send-voice-turn-btn');
@@ -152,31 +166,109 @@ async function runBrowserSmokeSuite() {
     await page.waitForFunction(() => {
       const el = document.getElementById('voice-turn-id-display');
       return el && el.innerText.trim() === '#2';
-    }, { timeout: 20000 });
+    }, { timeout: 25000 });
     console.log(' Consecutive voice turn 2 completed successfully (Turn Epoch #2).');
+    assertNoPageErrors('Consecutive Turn 2');
 
     // -----------------------------------------------------------------
-    // TEST 5: Barge-In Interruption & Playback Suppression
+    // TEST 5: Active Playback Interruption, Delayed-Response Suppression & Recovery
     // -----------------------------------------------------------------
-    console.log('\n[Test 5/5] Verifying Barge-In Interruption & Suppression of Late Audio...');
+    console.log('\n[Test 5/5] Verifying Active Playback Barge-In, Delayed-Response Suppression & Recovery...');
     
-    // Send voice turn and immediately trigger Barge-In interrupt
-    await page.fill('#voice-input-text', 'استفسار طويل عن الخدمات المتاحة والتكلفة بالتفصيل');
+    // Part A: Interruption of ACTIVE playback (verify playback starts before interrupt)
+    console.log(' - Part A: Verifying active playback starts before barge-in interrupt...');
+    await page.fill('#voice-input-text', 'استفسار مفصل عن مواعيد وأسعار كشوفات الباطنة والأطفال');
     await page.click('#send-voice-turn-btn');
-    
-    // Immediately click barge-in
-    await page.waitForTimeout(50);
-    await page.click('#voice-barge-in-btn');
-    console.log(' Clicked Barge-In interrupt during active turn.');
 
-    // Verify interrupted state indicator appears and audio playback is stopped
-    await page.waitForSelector('#voice-interrupted-indicator', { timeout: 15000 });
+    // Wait for playback to actually start (voice-speaking-indicator appears)
+    await page.waitForSelector('#voice-speaking-indicator', { timeout: 25000 });
+    console.log(' Playback verified actively started (#voice-speaking-indicator is visible).');
+
+    // Interrupt active playback via barge-in
+    await page.click('#voice-barge-in-btn');
+    console.log(' Clicked Barge-In interrupt on active playback.');
+
+    // Verify speaking indicator disappears, interrupted indicator appears, and audio is paused
+    await page.waitForSelector('#voice-interrupted-indicator', { timeout: 10000 });
+    const speakingActive = await page.$('#voice-speaking-indicator');
+    assert.strictEqual(speakingActive, null, 'Speaking indicator must disappear when barge-in is triggered');
+
     const audioPlaying = await page.evaluate(() => {
       const audio = document.querySelector('audio');
       return audio && !audio.paused && audio.currentTime > 0;
     });
     assert.strictEqual(Boolean(audioPlaying), false, 'Audio playback must be stopped/suppressed upon Barge-In interrupt');
-    console.log(' Audio playback verified suppressed upon Barge-In interrupt.');
+    console.log(' Active playback verified stopped upon Barge-In interrupt.');
+    assertNoPageErrors('Active Playback Interruption');
+
+    // Part B: Deterministic delayed-response case
+    // Route holds /api/voice/turn in flight -> user interrupts -> release delayed response -> assert cannot restart playback or overwrite state
+    console.log(' - Part B: Verifying deterministic delayed-response suppression...');
+    let releaseDelayedResponse = null;
+    const delayedResponsePromise = new Promise(resolve => {
+      releaseDelayedResponse = resolve;
+    });
+
+    await page.route('**/api/voice/turn', async route => {
+      console.log('   [Network Intercept] Holding /api/voice/turn in flight...');
+      await delayedResponsePromise;
+      console.log('   [Network Intercept] Releasing delayed /api/voice/turn response...');
+      await route.continue();
+    });
+
+    // Send turn that will be delayed
+    await page.fill('#voice-input-text', 'طلب صوتي متأخر للتحقق من قمع الرد بعد المقاطعة');
+    await page.click('#send-voice-turn-btn');
+
+    // Wait 300ms for request to be in flight
+    await page.waitForTimeout(300);
+
+    // Click barge-in interrupt while request is still pending
+    await page.click('#voice-barge-in-btn');
+    console.log('   Triggered Barge-In while request was pending in flight.');
+
+    // Verify interrupted state is active
+    await page.waitForSelector('#voice-interrupted-indicator', { timeout: 5000 });
+
+    // Release the delayed response
+    const responsePromise = page.waitForResponse(resp => resp.url().includes('/api/voice/turn'), { timeout: 15000 });
+    releaseDelayedResponse();
+    await responsePromise;
+    console.log('   Delayed response completed network transit.');
+
+    // Unroute to restore normal network flow
+    await page.unroute('**/api/voice/turn');
+
+    // Wait a brief moment to ensure no late callback restarts playback
+    await page.waitForTimeout(600);
+
+    // Assert delayed response did NOT restart playback
+    const speakingAfterDelayed = await page.$('#voice-speaking-indicator');
+    assert.strictEqual(speakingAfterDelayed, null, 'Delayed response must not restart playback or show speaking indicator');
+
+    const interruptedStillVisible = await page.$('#voice-interrupted-indicator');
+    assert.notStrictEqual(interruptedStillVisible, null, 'Delayed response must not clear current interrupted state');
+
+    const audioAfterDelayed = await page.evaluate(() => {
+      const audio = document.querySelector('audio');
+      return audio && !audio.paused && audio.currentTime > 0;
+    });
+    assert.strictEqual(Boolean(audioAfterDelayed), false, 'Audio playback must remain stopped after delayed response completes');
+    console.log('   Delayed response safely suppressed: did not restart playback or overwrite state.');
+    assertNoPageErrors('Delayed Response Suppression');
+
+    // Part C: Verify subsequent voice turn still works cleanly
+    console.log(' - Part C: Verifying subsequent voice turn still succeeds after interruption...');
+    await page.fill('#voice-input-text', 'سؤال جديد للتأكد من استئناف الخدمة بعد المقاطعة');
+    await page.click('#send-voice-turn-btn');
+
+    // Wait for turn completion
+    await page.waitForFunction(() => {
+      const el = document.getElementById('voice-turn-id-display');
+      return el && (el.innerText.trim() === '#4' || el.innerText.trim() === '#5');
+    }, { timeout: 25000 });
+    console.log('   Subsequent voice turn completed successfully.');
+    assertNoPageErrors('Post-Interruption Turn');
 
     console.log('\n====================================================');
     console.log('ALL BROWSER SMOKE CHECKS PASSED SUCCESSFULLY (5/5)!');

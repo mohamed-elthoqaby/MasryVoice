@@ -134,9 +134,68 @@ jobs:
           dotnet restore backend/MasryVoice.Api/MasryVoice.Api.csproj
           dotnet build backend/MasryVoice.Api/MasryVoice.Api.csproj -c Release --no-restore
 
-      - name: Start MasryVoice API in Background
+      - name: Verify Production Startup Integrity & Fixtures Disabling
         env:
-          ASPNETCORE_ENVIRONMENT: Production
+          DatabaseProvider: PostgreSql
+          ConnectionStrings__PostgreSql: "Host=localhost;Port=5432;Database=masryvoice_acceptance_db;Username=masryvoice;Password=masryvoice_ci_pass"
+        run: |
+          echo "=== 1. Testing Production Startup Rejection with Invalid Secrets ==="
+          PROD_FAIL=0
+          ASPNETCORE_ENVIRONMENT=Production Security__AdminKey="short" Security__HmacSecret="short" \
+            dotnet backend/MasryVoice.Api/bin/Release/net10.0/MasryVoice.Api.dll || PROD_FAIL=1
+          if [ "$PROD_FAIL" -ne 1 ]; then
+            echo "ERROR: Production startup succeeded with invalid secrets! Secret validation failed."
+            exit 1
+          fi
+          echo "Production startup correctly rejected placeholder/short secrets."
+
+          echo "=== 2. Testing Production Startup with Valid Secrets ==="
+          ASPNETCORE_ENVIRONMENT=Production \
+          Security__AdminKey="masryvoice_prod_admin_key_2026" \
+          Security__HmacSecret="masryvoice_prod_customer_hmac_secret_2026" \
+          LlmProvider="DeterministicFake" \
+          dotnet backend/MasryVoice.Api/bin/Release/net10.0/MasryVoice.Api.dll --urls http://localhost:5001 &
+          PROD_PID=$!
+
+          PROD_READY=0
+          for i in {1..30}; do
+            HTTP_CODE=$(curl -s -o /tmp/prod_ready.json -w "%{http_code}" http://localhost:5001/api/health/ready || true)
+            if [ "$HTTP_CODE" = "200" ] && grep -q '"status":"Ready"' /tmp/prod_ready.json; then
+              PROD_ENV=$(grep -o '"environment":"[^"]*"' /tmp/prod_ready.json | cut -d'"' -f4)
+              if [ "$PROD_ENV" != "Production" ]; then
+                echo "ERROR: Runtime environment mismatch! Expected 'Production', got '$PROD_ENV'!"
+                kill $PROD_PID || true
+                exit 1
+              fi
+              echo "Production instance ready and verified with environment: Production!"
+              PROD_READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$PROD_READY" -ne 1 ]; then
+            echo "ERROR: Production instance failed to reach readiness!"
+            kill $PROD_PID || true
+            exit 1
+          fi
+
+          echo "=== 3. Testing /api/admin/fixtures Disabled (404 Not Found) in Production ==="
+          FIXTURES_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+            -H "X-Admin-Key: masryvoice_prod_admin_key_2026" \
+            "http://localhost:5001/api/admin/fixtures?conversationIds=00000000-0000-0000-0000-000000000000")
+          echo "/api/admin/fixtures in Production returned HTTP $FIXTURES_CODE"
+          if [ "$FIXTURES_CODE" != "404" ]; then
+            echo "ERROR: /api/admin/fixtures did not return 404 in Production! Got HTTP $FIXTURES_CODE."
+            kill $PROD_PID || true
+            exit 1
+          fi
+          echo "Verified /api/admin/fixtures safely returns 404 in Production."
+          kill $PROD_PID || true
+          wait $PROD_PID 2>/dev/null || true
+
+      - name: Start MasryVoice API in Background (Testing Environment)
+        env:
+          ASPNETCORE_ENVIRONMENT: Testing
           DatabaseProvider: PostgreSql
           ConnectionStrings__PostgreSql: "Host=localhost;Port=5432;Database=masryvoice_acceptance_db;Username=masryvoice;Password=masryvoice_ci_pass"
           Security__AdminKey: "masryvoice_ci_admin_key_2026"
@@ -144,13 +203,18 @@ jobs:
           LlmProvider: "DeterministicFake"
           RateLimiting__ApiPermitLimit: "300"
         run: |
-          dotnet run --project backend/MasryVoice.Api/MasryVoice.Api.csproj -c Release --no-build &
+          dotnet backend/MasryVoice.Api/bin/Release/net10.0/MasryVoice.Api.dll --urls http://localhost:5000 &
           echo "Waiting for API readiness at http://localhost:5000/api/health/ready..."
           READY=0
           for i in {1..30}; do
             HTTP_CODE=$(curl -s -o /tmp/ready.json -w "%{http_code}" http://localhost:5000/api/health/ready || true)
             if [ "$HTTP_CODE" = "200" ] && grep -q '"status":"Ready"' /tmp/ready.json; then
-              echo "MasryVoice API is ready (HTTP 200)!"
+              ENV_NAME=$(grep -o '"environment":"[^"]*"' /tmp/ready.json | cut -d'"' -f4)
+              if [ "$ENV_NAME" != "Testing" ]; then
+                echo "ERROR: Runtime environment mismatch! Expected 'Testing', got '$ENV_NAME'!"
+                exit 1
+              fi
+              echo "MasryVoice API is ready in verified Testing environment (HTTP 200)!"
               cat /tmp/ready.json
               READY=1
               break
@@ -365,15 +429,27 @@ jobs:
           Voice__TtsProvider: "Simulated"
           RateLimiting__ApiPermitLimit: "500"
         run: |
-          dotnet run --project backend/MasryVoice.Api/MasryVoice.Api.csproj -c Release --no-build &
+          dotnet backend/MasryVoice.Api/bin/Release/net10.0/MasryVoice.Api.dll --urls http://localhost:5000 &
           echo "Waiting for API readiness at http://localhost:5000/api/health/ready..."
+          READY=0
           for i in {1..30}; do
-            if curl -s -f http://localhost:5000/api/health/ready | grep -q '"status":"Ready"'; then
-              echo "Backend ready!"
+            HTTP_CODE=$(curl -s -o /tmp/browser_ready.json -w "%{http_code}" http://localhost:5000/api/health/ready || true)
+            if [ "$HTTP_CODE" = "200" ] && grep -q '"status":"Ready"' /tmp/browser_ready.json; then
+              ENV_NAME=$(grep -o '"environment":"[^"]*"' /tmp/browser_ready.json | cut -d'"' -f4)
+              if [ "$ENV_NAME" != "Testing" ]; then
+                echo "ERROR: Runtime environment mismatch! Expected 'Testing', got '$ENV_NAME'!"
+                exit 1
+              fi
+              echo "Backend ready in verified Testing environment!"
+              READY=1
               break
             fi
             sleep 1
           done
+          if [ "$READY" -ne 1 ]; then
+            echo "Backend failed to become ready!"
+            exit 1
+          fi
 
       - name: Start Frontend Server
         working-directory: frontend
