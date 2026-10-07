@@ -33,16 +33,60 @@ public class VerticalSliceTests
         using var db = CreateInMemoryDb();
         await db.SeedInitialDataAsync();
 
+        var firstSlot = await db.AvailabilitySlots.OrderBy(s => s.StartTimeUtc).FirstAsync();
+        var targetBusinessDate = CairoTimeHelper.UtcToCairo(firstSlot.StartTimeUtc).ToString("yyyy-MM-dd");
+
         var tool = new CheckAvailabilityTool(db);
-        using var argsDoc = JsonDocument.Parse("{\"date\":\"tomorrow\",\"service\":\"كشف باطنة عامة\"}");
+        using var argsDoc = JsonDocument.Parse($"{{\"date\":\"{targetBusinessDate}\",\"service\":\"كشف باطنة عامة\"}}");
 
         // Act
         var result = await tool.ExecuteAsync(argsDoc.RootElement, Guid.NewGuid(), CancellationToken.None);
 
-        // Assert
+        // Assert: Asserts actual available slots on valid business day
         Assert.True(result.Success);
-        Assert.Contains("موعد", result.Message);
+        Assert.Contains("تم العثور على", result.Message);
         Assert.NotNull(result.Data);
+
+        var dataJson = JsonSerializer.Serialize(result.Data);
+        using var doc = JsonDocument.Parse(dataJson);
+        var slots = doc.RootElement.GetProperty("availableSlots");
+        Assert.True(slots.GetArrayLength() > 0);
+        foreach (var slot in slots.EnumerateArray())
+        {
+            Assert.Equal("كشف باطنة عامة", slot.GetProperty("service").GetString());
+            Assert.False(string.IsNullOrWhiteSpace(slot.GetProperty("cairoTime").GetString()));
+        }
+    }
+
+    [Fact]
+    public async Task CheckAvailabilityTool_OnClosedDay_ReturnsNoSlotsForDay_AndSuggestsNextAvailable()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        await db.SeedInitialDataAsync();
+
+        // Target next Friday (clinic is strictly closed on Friday/Saturday)
+        var todayCairo = CairoTimeHelper.NowCairo.Date;
+        int daysUntilFriday = ((int)DayOfWeek.Friday - (int)todayCairo.DayOfWeek + 7) % 7;
+        if (daysUntilFriday == 0) daysUntilFriday = 7;
+        var fridayDate = todayCairo.AddDays(daysUntilFriday).ToString("yyyy-MM-dd");
+
+        var tool = new CheckAvailabilityTool(db);
+        using var argsDoc = JsonDocument.Parse($"{{\"date\":\"{fridayDate}\",\"service\":\"كشف باطنة عامة\"}}");
+
+        // Act
+        var result = await tool.ExecuteAsync(argsDoc.RootElement, Guid.NewGuid(), CancellationToken.None);
+
+        // Assert: Confirms closed day returns no slots for that specific day and suggests upcoming business slots
+        Assert.True(result.Success);
+        Assert.Contains("لا توجد مواعيد متاحة في تاريخ", result.Message);
+        Assert.Contains("أقرب مواعيد أخرى متاحة", result.Message);
+        Assert.NotNull(result.Data);
+
+        var dataJson = JsonSerializer.Serialize(result.Data);
+        using var doc = JsonDocument.Parse(dataJson);
+        var slots = doc.RootElement.GetProperty("availableSlots");
+        Assert.True(slots.GetArrayLength() > 0);
     }
 
     [Fact]

@@ -43,7 +43,7 @@ public class WhisperSttProvider : ISttProvider
         content.Add(streamContent, "file", $"audio{ext}");
         content.Add(new StringContent("whisper-1"), "model");
         content.Add(new StringContent(language), "language");
-        content.Add(new StringContent("عيادة النور التخصصية، حجز كشف باطنة، أطفال، عظام، دكتور، محمد عاطف، رقم الهاتف 01012345678"), "prompt");
+        content.Add(new StringContent("عيادة النور التخصصية، حجز كشف باطنة، أطفال، عظام، دكتور، مواعيد، تأكيد الحجز، الاسم، رقم التليفون صفر واحد اثنان ثلاثة اربعة خمسة ستة سبعة ثمانية تسعة"), "prompt");
 
         var response = await _httpClient.PostAsync("/v1/audio/transcriptions", content, ct);
 

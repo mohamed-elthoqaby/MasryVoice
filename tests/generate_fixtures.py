@@ -13,7 +13,7 @@ voice = PiperVoice.load("models/piper/ar_JO-kareem-low/ar_JO-kareem-low.onnx", c
 
 prompts = {
     "turn1_inquiry.wav": "عايز أعرف المواعيد المتاحة بكرة لكشف الباطنة",
-    "turn2_booking.wav": "تمام، احجزلي كشف باطنة الساعة 10 الصبح باسم محمد عاطف وتليفوني 01012345678"
+    "turn2_booking.wav": "تمام، احجزلي كشف باطنة الساعة 10 الصبح باسم محمد عاطف وتليفوني 0 1 0 1 2 3 4 5 6 7 8"
 }
 
 for fname, text in prompts.items():

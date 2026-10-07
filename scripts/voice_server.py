@@ -9,6 +9,7 @@ Engine licenses:
 """
 
 import os
+import sys
 import io
 import re
 import av
@@ -60,6 +61,8 @@ QUEUE_TIMEOUT_SEC = float(os.environ.get("VOICE_QUEUE_TIMEOUT", "10.0"))
 
 stt_semaphore = asyncio.Semaphore(STT_CONCURRENCY)
 tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
+_active_stt_tasks: set[asyncio.Task] = set()
+_active_tts_tasks: set[asyncio.Task] = set()
 
 whisper_model: Optional[WhisperModel] = None
 piper_voice: Optional[PiperVoice] = None
@@ -107,11 +110,11 @@ def normalize_spoken_arabic_digits(text: str) -> str:
         return text
     word_to_digit = {
         'صفر': '0', 'سفر': '0', 'صف': '0', 'الصفر': '0', 'السفر': '0',
-        'واحد': '1', 'واح': '1', 'الواحد': '1', 'صفواح': '01', 'واحدث': '1', 'واحدثنام': '12', 'واحدثنا': '12',
-        'اثنان': '2', 'اثنين': '2', 'تنين': '2', 'يثنان': '2', 'دثنان': '2', 'ثنان': '2', 'نان': '2', 'نام': '2', 'الاثنين': '2', 'الاتنين': '2',
+        'واحد': '1', 'واح': '1', 'الواحد': '1', 'صفواح': '01',
+        'اثنان': '2', 'اثنين': '2', 'تنين': '2', 'يثنان': '2', 'دثنان': '2', 'ثنان': '2', 'الاثنين': '2', 'الاتنين': '2',
         'ثلاثة': '3', 'تلاتة': '3', 'ثلاث': '3', 'تلات': '3', 'الثلاثة': '3',
         'أربعة': '4', 'اربعة': '4', 'أربع': '4', 'اربع': '4', 'اربعا': '4', 'أربعا': '4', 'الاربعة': '4', 'الأربعة': '4',
-        'خمسة': '5', 'كمسة': '5', 'خمس': '5', 'كامس': '5', 'كم': '5', 'الخمسة': '5',
+        'خمسة': '5', 'كمسة': '5', 'كمس': '5', 'خمس': '5', 'كامس': '5', 'الخمسة': '5',
         'ستة': '6', 'ست': '6', 'سست': '6', 'الستة': '6',
         'سبعة': '7', 'سبع': '7', 'تسبع': '7', 'السبعة': '7',
         'ثمانية': '8', 'تمانية': '8', 'ثماني': '8', 'تماني': '8', 'الثمانية': '8',
@@ -144,7 +147,7 @@ def normalize_spoken_arabic_digits(text: str) -> str:
         result.append(tokens[i])
         i += 1
     res_str = ''.join(result)
-    res_str = re.sub(r'\bبسم\b(?=\s+[أ-ي])', 'باسم', res_str)
+    res_str = re.sub(r'\b(بسم|بسمي)\b(?=\s+[أ-ي])', 'باسم', res_str)
     return res_str
 
 
@@ -219,8 +222,8 @@ async def health(response: Response):
     if not is_healthy:
         response.status_code = 503
 
-    active_stt = STT_CONCURRENCY - stt_semaphore._value
-    active_tts = TTS_CONCURRENCY - tts_semaphore._value
+    active_stt = len(_active_stt_tasks)
+    active_tts = len(_active_tts_tasks)
 
     return {
         "status": "healthy" if is_healthy else "degraded",
@@ -248,7 +251,7 @@ async def health(response: Response):
     }
 
 
-def validate_audio_container_and_duration_sync(path: str) -> float:
+def validate_audio_container_and_duration_sync(path: str, stop_event: Optional[threading.Event] = None) -> float:
     """Decodes bounded frames and samples via PyAV in worker thread to prevent blocking asyncio loop."""
     try:
         with av.open(path) as container:
@@ -260,6 +263,8 @@ def validate_audio_container_and_duration_sync(path: str) -> float:
             total_samples = 0
 
             for frame in container.decode(audio_stream):
+                if stop_event and stop_event.is_set():
+                    return -1.0
                 total_samples += frame.samples
                 if total_samples > max_allowed_samples:
                     duration_sec = total_samples / rate
@@ -339,39 +344,55 @@ async def transcribe_audio(
             tmp.write(content)
             tmp_path = tmp.name
 
-        # 2. Offload PyAV container decoding to worker thread to prevent event loop blocking
-        await asyncio.to_thread(validate_audio_container_and_duration_sync, tmp_path)
-
         start_time = time.perf_counter()
 
-        # 3. Offload Whisper model forward pass & segment generation to worker thread
-        def run_stt_worker():
-            segments_iter, info = whisper_model.transcribe(
-                tmp_path,
-                language=language if language and language != "auto" else "ar",
-                initial_prompt=prompt,
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500)
-            )
-            text_chunks = []
-            for segment in segments_iter:
-                if stop_event.is_set():
-                    return None, info, True
-                text_chunks.append(segment.text.strip())
-            return " ".join(text_chunks).strip(), info, False
+        # Managed STT worker task owns permit release, temp file deletion, and active worker registration
+        async def _run_stt_worker():
+            cur_task = asyncio.current_task()
+            if cur_task:
+                _active_stt_tasks.add(cur_task)
+            try:
+                def _sync_work():
+                    duration = validate_audio_container_and_duration_sync(tmp_path, stop_event)
+                    if stop_event.is_set() or duration < 0:
+                        return None, None, True
 
-        worker_task = asyncio.create_task(asyncio.to_thread(run_stt_worker))
+                    segments_iter, info = whisper_model.transcribe(
+                        tmp_path,
+                        language=language if language and language != "auto" else "ar",
+                        initial_prompt=prompt,
+                        beam_size=5,
+                        vad_filter=True,
+                        vad_parameters=dict(min_silence_duration_ms=500)
+                    )
+                    text_chunks = []
+                    for segment in segments_iter:
+                        if stop_event.is_set():
+                            return None, info, True
+                        text_chunks.append(segment.text.strip())
+                    return " ".join(text_chunks).strip(), info, False
+
+                return await asyncio.to_thread(_sync_work)
+            finally:
+                if cur_task:
+                    _active_stt_tasks.discard(cur_task)
+                stt_semaphore.release()
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+
+        worker_task = asyncio.create_task(_run_stt_worker())
 
         while not worker_task.done():
             if await request.is_disconnected():
                 stop_event.set()
                 logger.warning("[STT] Client disconnected during inference. Holding capacity until worker completion...")
-                # Supervise worker: hold semaphore and temp file until worker finishes or bounded deadline expires
                 try:
                     await asyncio.wait_for(asyncio.shield(worker_task), timeout=5.0)
                 except asyncio.TimeoutError:
-                    logger.warning("[STT] Worker did not stop within bounded deadline after client disconnect.")
+                    logger.warning("[STT] Worker did not stop within bounded deadline after client disconnect; capacity remains held until thread completes.")
                 except Exception as e:
                     logger.warning(f"[STT] Worker finished with exception: {e}")
                 raise HTTPException(status_code=499, detail="Client Closed Request")
@@ -383,8 +404,8 @@ async def transcribe_audio(
 
         latency = time.perf_counter() - start_time
         normalized_text = normalize_spoken_arabic_digits(transcribed_text)
-        logger.info(f"[STT] Transcribed {len(content)} bytes in {latency:.2f}s (lang={info.language}): '{transcribed_text}' -> normalized: '{normalized_text}'")
-        return {"text": normalized_text, "raw_text": transcribed_text, "language": info.language, "duration": info.duration}
+        logger.info(f"[STT] Transcribed {len(content)} bytes in {latency:.2f}s (lang={info.language if info else 'ar'}): '{transcribed_text}' -> normalized: '{normalized_text}'")
+        return {"text": normalized_text, "raw_text": transcribed_text, "language": info.language if info else "ar", "duration": info.duration if info else 0.0}
 
     except HTTPException:
         raise
@@ -401,12 +422,13 @@ async def transcribe_audio(
         logger.error(f"[STT] Transcription failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail={"code": "stt_failed", "message": str(e)})
     finally:
-        stt_semaphore.release()
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        if worker_task is None:
+            stt_semaphore.release()
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
 
 @app.post("/v1/audio/speech")
@@ -444,30 +466,40 @@ async def synthesize_speech(request: Request, req: SpeechRequest):
         if await request.is_disconnected():
             raise HTTPException(status_code=499, detail="Client Closed Request")
 
-        # Offload Piper ONNX synthesis and chunk iteration to worker thread
-        def run_tts_worker():
-            buffer = io.BytesIO()
-            with wave.open(buffer, "wb") as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(16000)
-                for chunk in piper_voice.synthesize(text):
-                    if stop_event.is_set():
-                        return None, True
-                    wav_file.writeframes(chunk.audio_int16_bytes)
-            return buffer.getvalue(), False
+        # Managed TTS worker task owns permit release and active worker registration
+        async def _run_tts_worker():
+            cur_task = asyncio.current_task()
+            if cur_task:
+                _active_tts_tasks.add(cur_task)
+            try:
+                def _sync_work():
+                    buffer = io.BytesIO()
+                    with wave.open(buffer, "wb") as wav_file:
+                        wav_file.setnchannels(1)
+                        wav_file.setsampwidth(2)
+                        wav_file.setframerate(16000)
+                        for chunk in piper_voice.synthesize(text):
+                            if stop_event.is_set():
+                                return None, True
+                            wav_file.writeframes(chunk.audio_int16_bytes)
+                    return buffer.getvalue(), False
 
-        worker_task = asyncio.create_task(asyncio.to_thread(run_tts_worker))
+                return await asyncio.to_thread(_sync_work)
+            finally:
+                if cur_task:
+                    _active_tts_tasks.discard(cur_task)
+                tts_semaphore.release()
+
+        worker_task = asyncio.create_task(_run_tts_worker())
 
         while not worker_task.done():
             if await request.is_disconnected():
                 stop_event.set()
                 logger.warning("[TTS] Client disconnected during synthesis. Holding capacity until worker completion...")
-                # Supervise worker: hold semaphore until worker finishes or bounded deadline expires
                 try:
                     await asyncio.wait_for(asyncio.shield(worker_task), timeout=5.0)
                 except asyncio.TimeoutError:
-                    logger.warning("[TTS] Worker did not stop within bounded deadline after client disconnect.")
+                    logger.warning("[TTS] Worker did not stop within bounded deadline after client disconnect; capacity remains held until thread completes.")
                 except Exception as e:
                     logger.warning(f"[TTS] Worker finished with exception: {e}")
                 raise HTTPException(status_code=499, detail="Client Closed Request")
@@ -499,10 +531,13 @@ async def synthesize_speech(request: Request, req: SpeechRequest):
         logger.error(f"[TTS] Synthesis failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail={"code": "tts_failed", "message": str(e)})
     finally:
-        tts_semaphore.release()
+        if worker_task is None:
+            tts_semaphore.release()
 
 
 if __name__ == "__main__":
     import uvicorn
+    if BASE_DIR not in sys.path:
+        sys.path.insert(0, BASE_DIR)
     port = int(os.environ.get("VOICE_PORT", "8000"))
-    uvicorn.run("scripts.voice_server:app", host="127.0.0.1", port=port, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")

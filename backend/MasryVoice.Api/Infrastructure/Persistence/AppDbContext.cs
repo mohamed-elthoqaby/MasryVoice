@@ -204,21 +204,6 @@ public class AppDbContext : DbContext
             Agents.Add(defaultAgent);
             await SaveChangesAsync();
         }
-        else
-        {
-            defaultAgent.ModelName = "qwen2.5:3b";
-            defaultAgent.SystemPrompt = """
-            أنتِ سارة، مساعدة عيادة النور التخصصية في القاهرة. تتحدثين بالعامية المصرية الودودة.
-            تعليمات استخدام الأدوات:
-            1. عند سؤال المريض عن المواعيد فقط، استدعي أداة CheckAvailability.
-            2. عندما يطلب المريض الحجز أو يذكر اسمه وتليفونه (مثال: احجزلي باسم فلان وتليفوني كذا)، استدعي فوراً وحصراً أداة StageBooking بالبيانات: customerName و customerPhone، ولا تستدعي CheckAvailability في هذه الحالة.
-            3. بعد استدعاء StageBooking، اطلبي من العميل مراجعة التفاصيل والضغط على زر 'تأكيد الحجز' في الشاشة.
-            4. لا تقومي بتأكيد الحجز بنفسك، فالتأكيد يتم حصرياً عبر ضغط العميل على زر التأكيد.
-            5. عندما يسأل العميل عن الخدمات والأسعار، استدعي أداة SearchKnowledgeBase.
-            """;
-            defaultAgent.AllowedToolsJson = "[\"CheckAvailability\",\"StageBooking\",\"GetBooking\",\"SearchKnowledgeBase\"]";
-            await SaveChangesAsync();
-        }
 
         // Seed initial Clinic Knowledge Document if none exist
         if (!await KnowledgeDocuments.AnyAsync())

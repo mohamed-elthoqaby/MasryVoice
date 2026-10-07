@@ -22,7 +22,16 @@ API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:5000")
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARTIFACTS_DIR = os.path.join(BASE_DIR, "tests", "artifacts")
 FIXTURES_DIR = os.path.join(BASE_DIR, "tests", "fixtures", "audio")
-DB_PATH = os.environ.get("ACCEPTANCE_DB_PATH", os.path.join(BASE_DIR, "masryvoice_real_voice_acceptance.db"))
+def resolve_db_path():
+    explicit = os.environ.get("ACCEPTANCE_DB_PATH")
+    if explicit and os.path.exists(explicit):
+        return explicit
+    backend_path = os.path.join(BASE_DIR, "backend", "MasryVoice.Api", "masryvoice_real_voice_acceptance.db")
+    if os.path.exists(backend_path):
+        return backend_path
+    return os.path.join(BASE_DIR, "masryvoice_real_voice_acceptance.db")
+
+DB_PATH = resolve_db_path()
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -98,12 +107,17 @@ def main():
     print("   MASRYVOICE REAL LOCAL VOICE PIPELINE ACCEPTANCE VERIFICATION ($0 Cost)   ")
     print("=" * 78)
 
+    global DB_PATH
+    DB_PATH = resolve_db_path()
+
     report = {
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "voice_server_url": VOICE_SERVER_URL,
         "api_base_url": API_BASE_URL,
         "mode": "strict" if args.strict else "standard",
         "acceptance_database": DB_PATH,
+        "fixture_provenance": "synthetic spoken fixtures with real inference",
+        "hardware_profile": "100% Local $0 Cost CPU Benchmark",
         "stages": {},
         "timings_ms": {},
         "verifications": {}
@@ -172,35 +186,49 @@ def main():
     # 3a: Health check during active synthesis
     long_text = "أهلاً وسهلاً بحضرتك في عيادة النور التخصصية بالقاهرة، نحن سعداء جداً بتقديم الرعاية الطبية الفائقة لحضرتك في تخصصات الباطنة والأطفال والعيون والجراحة العامة طوال أيام الأسبوع."
     synth_started = threading.Event()
-    health_latency = []
+    bg_result = {}
 
     def background_synthesis():
         synth_started.set()
         try:
             req_data = json.dumps({"input": long_text}).encode("utf-8")
             r = urllib.request.Request(f"{VOICE_SERVER_URL}/v1/audio/speech", data=req_data, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(r, timeout=10) as resp:
-                resp.read()
-        except Exception:
-            pass
+            with urllib.request.urlopen(r, timeout=15) as resp:
+                data = resp.read()
+                bg_result["status"] = resp.getcode()
+                bg_result["bytes"] = len(data)
+        except Exception as e:
+            bg_result["error"] = str(e)
 
     t_bg = threading.Thread(target=background_synthesis)
     t_bg.start()
     synth_started.wait()
-    time.sleep(0.05)  # Ensure worker has acquired permit
 
-    # Measure health check latency while synthesis is actively running on CPU
-    t_h0 = time.perf_counter()
-    _, active_health, _ = http_json(f"{VOICE_SERVER_URL}/health")
-    dt_active_health = (time.perf_counter() - t_h0) * 1000
+    # Poll /health until active worker is genuinely observed (> 0)
+    observed_active = 0
+    dt_active_health = 0.0
+    for _ in range(100):
+        t_h0 = time.perf_counter()
+        code_h, active_health, _ = http_json(f"{VOICE_SERVER_URL}/health")
+        dt_health = (time.perf_counter() - t_h0) * 1000
+        if active_health.get("tts_active_workers", 0) > 0:
+            observed_active = active_health.get("tts_active_workers")
+            dt_active_health = dt_health
+            break
+        time.sleep(0.01)
+
     t_bg.join()
+    assert bg_result.get("status") == 200, f"Background synthesis failed: {bg_result}"
+    assert bg_result.get("bytes", 0) > 44, "Background synthesis returned empty audio"
 
-    print(f" -> /health responsiveness DURING active inference: {dt_active_health:.2f}ms (Active TTS workers observed: {active_health.get('tts_active_workers')})")
+    print(f" -> /health responsiveness DURING active inference: {dt_active_health:.2f}ms (Active TTS workers observed: {observed_active})")
     assert dt_active_health < 1000.0, f"Health check during active inference exceeded threshold: {dt_active_health}ms"
     report["timings_ms"]["health_check_during_active_work_ms"] = round(dt_active_health, 2)
     report["stages"]["active_concurrency_supervision"] = {
         "health_during_inference_ms": round(dt_active_health, 2),
-        "active_tts_observed": active_health.get("tts_active_workers"),
+        "active_tts_observed": observed_active,
+        "bg_synthesis_status": bg_result.get("status"),
+        "bg_synthesis_bytes": bg_result.get("bytes"),
         "non_blocking_event_loop": True
     }
     report["verifications"]["active_supervision"] = "PASSED"
@@ -270,7 +298,21 @@ def main():
     if not args.skip_backend:
         try:
             _, live_res, _ = http_json(f"{API_BASE_URL}/api/health/live")
+            _, h_res, _ = http_json(f"{API_BASE_URL}/api/health")
             backend_available = True
+            cfg_llm = h_res.get("configuredLlmProvider")
+            cfg_stt = h_res.get("configuredSttProvider")
+            cfg_tts = h_res.get("configuredTtsProvider")
+            print(f" -> Backend reachable (LLM: {cfg_llm}, STT: {cfg_stt}, TTS: {cfg_tts})")
+            report["stages"]["backend_providers"] = {
+                "llm": cfg_llm,
+                "stt": cfg_stt,
+                "tts": cfg_tts
+            }
+            if args.strict:
+                assert cfg_llm != "DeterministicFake", f"Strict mode requires real LLM provider (Ollama), got {cfg_llm}"
+                assert cfg_stt not in ["Simulated"], f"Strict mode requires real STT provider, got {cfg_stt}"
+                assert cfg_tts not in ["Simulated"], f"Strict mode requires real TTS provider, got {cfg_tts}"
         except Exception as e:
             print(f"\n[Notice] Backend on {API_BASE_URL} not reachable ({e}).")
             if args.strict:
@@ -400,6 +442,9 @@ def main():
             assert confirmed_before_count == 0, "No confirmed booking should exist before explicit server-side confirmation!"
             if args.strict:
                 assert pending_record is not None, "Pending booking draft must be staged in database during Turn 2 in strict mode"
+                assert pending_record["customerName"] == "محمد عاطف", f"Expected 'محمد عاطف', got '{pending_record['customerName']}'"
+                assert pending_record["customerPhone"] == "01012345678", f"Expected '01012345678', got '{pending_record['customerPhone']}'"
+                assert pending_record["serviceName"] == "كشف باطنة عامة", f"Expected 'كشف باطنة عامة', got '{pending_record['serviceName']}'"
 
         # 5.5 Explicit Server-Authorized Confirmation & Capacity Delta
         confirmed_booking_id = None
@@ -422,15 +467,23 @@ def main():
             p_status_after = c.fetchone()[0]
             c.execute("SELECT BookedCapacity FROM AvailabilitySlots WHERE Id = ? COLLATE NOCASE", (pending_record["slotId"],))
             booked_after = c.fetchone()[0]
+            c.execute("SELECT CustomerName, CustomerPhone, ServiceName, Status FROM Bookings WHERE ConversationId = ? COLLATE NOCASE", (c_id,))
+            booking_row = c.fetchone()
             c.execute("SELECT COUNT(*) FROM Bookings WHERE ConversationId = ? COLLATE NOCASE", (c_id,))
             confirmed_after_count = c.fetchone()[0]
             conn.close()
 
             print(f"    Pending Booking Status After Confirmation: {p_status_after}")
+            print(f"    Confirmed Booking Row in DB: {booking_row}")
             print(f"    Capacity Delta: {slot_before['booked']} -> {booked_after} (Delta: +1 PASS)")
             assert p_status_after == "Confirmed", "PendingBooking status must transition to 'Confirmed'"
             assert booked_after == slot_before["booked"] + 1, "Slot booked capacity must increment by exactly 1"
             assert confirmed_after_count == 1, "Exactly one booking must be created"
+            assert booking_row is not None, "Confirmed booking must exist in Bookings table"
+            assert booking_row[0] == "محمد عاطف", f"Confirmed booking customerName mismatch: expected 'محمد عاطف', got '{booking_row[0]}'"
+            assert booking_row[1] == "01012345678", f"Confirmed booking customerPhone mismatch: expected '01012345678', got '{booking_row[1]}'"
+            assert booking_row[2] == "كشف باطنة عامة", f"Confirmed booking serviceName mismatch: expected 'كشف باطنة عامة', got '{booking_row[2]}'"
+            assert booking_row[3] == "Confirmed", f"Confirmed booking status mismatch: expected 'Confirmed', got '{booking_row[3]}'"
 
             # 5.6 Replay Idempotency Verification
             print(" - Testing Replay Idempotency (calling confirm second time with same hash)...")

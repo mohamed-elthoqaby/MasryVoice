@@ -386,6 +386,8 @@ app.MapGet("/api/health", async (
         businessSchedule = "Sun-Thu 09:00 - 17:00 (Africa/Cairo)",
         databaseConnected = dbOk,
         configuredLlmProvider = cfg["LlmProvider"] ?? "Ollama",
+        configuredSttProvider = cfg["Voice:SttProvider"] ?? "Simulated",
+        configuredTtsProvider = cfg["Voice:TtsProvider"] ?? "Simulated",
         defaultModel = cfg["Ollama:DefaultModel"] ?? "qwen2.5:3b",
         inferenceLoad = new
         {
@@ -1416,9 +1418,50 @@ app.MapPost("/api/voice/turn", async (
         if (string.IsNullOrWhiteSpace(reply))
         {
             var hasPending = await db.PendingBookings.AnyAsync(p => p.ConversationId == req.ConversationId && p.Status == "Pending", token);
-            reply = hasPending
-                ? "تم تجهيز مسودة الحجز بنجاح يا فندم، يرجى الضغط على زر تأكيد الحجز."
-                : "أهلاً بحضرتك يا فندم، المواعيد متاحة وتحت أمرك.";
+            if (hasPending)
+            {
+                reply = "تم تجهيز مسودة الحجز بنجاح يا فندم، يرجى مراجعة التفاصيل وتأكيد الحجز.";
+            }
+            else
+            {
+                var hasAvailability = await db.ToolExecutions.AnyAsync(t => t.ConversationId == req.ConversationId && t.ToolName == "CheckAvailability" && t.Status == "Success", token);
+                if (hasAvailability)
+                {
+                    reply = "المواعيد متاحة في عيادة النور التخصصية، تحب أحجز لحضرتك ميعاد؟";
+                }
+                else
+                {
+                    reply = "أهلاً بحضرتك يا فندم في عيادة النور التخصصية، ممكن توضح طلبك أو تذكر الخدمة والاسم المطلوب للحجز؟";
+                }
+            }
+
+            // Save actual spoken text into conversation messages so history accurately records what was spoken
+            var lastAssistantMsg = await db.Messages
+                .Where(m => m.ConversationId == req.ConversationId && m.Role == "assistant")
+                .OrderByDescending(m => m.SequenceNumber)
+                .FirstOrDefaultAsync(token);
+            if (lastAssistantMsg != null && string.IsNullOrWhiteSpace(lastAssistantMsg.Content))
+            {
+                lastAssistantMsg.Content = reply;
+                await db.SaveChangesAsync(token);
+            }
+            else
+            {
+                var maxSeq = await db.Messages
+                    .Where(m => m.ConversationId == req.ConversationId)
+                    .Select(m => (int?)m.SequenceNumber)
+                    .MaxAsync(token) ?? 0;
+                db.Messages.Add(new Message
+                {
+                    Id = Guid.NewGuid(),
+                    ConversationId = req.ConversationId,
+                    Role = "assistant",
+                    Content = reply,
+                    SequenceNumber = maxSeq + 1,
+                    CreatedAtUtc = DateTime.UtcNow
+                });
+                await db.SaveChangesAsync(token);
+            }
         }
 
         // Synthesize response speech with TTS under separate bounded admission (Zero nested deadlock!)
