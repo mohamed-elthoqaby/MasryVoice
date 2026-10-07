@@ -32,21 +32,32 @@ namespace MasryVoice.Api.Migrations
 
             // Backfill ownership exclusively from unambiguous, reliable relationships (IdempotencyKey matching PendingBooking).
             // Explicitly avoid inferring ownership from phone numbers to prevent cross-customer data leakage.
-            // If multiple PendingBookings have conflicting ConversationIds for the same IdempotencyKey, ownership is excluded.
+            // Requires consistent booking and pending-record details (SlotId, RequestHash), and excludes conflicting records.
             if (migrationBuilder.ActiveProvider?.Contains("Npgsql", StringComparison.OrdinalIgnoreCase) == true)
             {
                 migrationBuilder.Sql(@"
                     UPDATE ""Bookings"" b
                     SET ""ConversationId"" = u.""ConversationId""
                     FROM (
-                        SELECT pb.""IdempotencyKey"", MIN(pb.""ConversationId""::text)::uuid AS ""ConversationId""
+                        SELECT 
+                            pb.""IdempotencyKey"",
+                            pb.""SlotId"",
+                            pb.""RequestHash"",
+                            MIN(pb.""ConversationId""::text)::uuid AS ""ConversationId""
                         FROM ""PendingBookings"" pb
                         WHERE pb.""ConversationId"" IS NOT NULL
-                        GROUP BY pb.""IdempotencyKey""
+                        GROUP BY pb.""IdempotencyKey"", pb.""SlotId"", pb.""RequestHash""
                         HAVING COUNT(DISTINCT pb.""ConversationId"") = 1
                     ) u
                     WHERE b.""IdempotencyKey"" = u.""IdempotencyKey""
-                      AND b.""ConversationId"" IS NULL;
+                      AND b.""SlotId"" = u.""SlotId""
+                      AND b.""RequestHash"" = u.""RequestHash""
+                      AND b.""ConversationId"" IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM ""PendingBookings"" pb_other
+                          WHERE pb_other.""IdempotencyKey"" = b.""IdempotencyKey""
+                            AND (pb_other.""SlotId"" <> b.""SlotId"" OR pb_other.""RequestHash"" <> b.""RequestHash"")
+                      );
                 ");
             }
             else
@@ -57,17 +68,26 @@ namespace MasryVoice.Api.Migrations
                         SELECT pb.ConversationId
                         FROM PendingBookings pb
                         WHERE pb.IdempotencyKey = Bookings.IdempotencyKey
+                          AND pb.SlotId = Bookings.SlotId
+                          AND pb.RequestHash = Bookings.RequestHash
                           AND pb.ConversationId IS NOT NULL
-                        GROUP BY pb.IdempotencyKey
+                        GROUP BY pb.IdempotencyKey, pb.SlotId, pb.RequestHash
                         HAVING COUNT(DISTINCT pb.ConversationId) = 1
                     )
                     WHERE ConversationId IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM PendingBookings pb_other
+                          WHERE pb_other.IdempotencyKey = Bookings.IdempotencyKey
+                            AND (pb_other.SlotId <> Bookings.SlotId OR pb_other.RequestHash <> Bookings.RequestHash)
+                      )
                       AND IdempotencyKey IN (
-                        SELECT pb.IdempotencyKey
-                        FROM PendingBookings pb
-                        WHERE pb.ConversationId IS NOT NULL
-                        GROUP BY pb.IdempotencyKey
-                        HAVING COUNT(DISTINCT pb.ConversationId) = 1
+                          SELECT pb.IdempotencyKey
+                          FROM PendingBookings pb
+                          WHERE pb.SlotId = Bookings.SlotId
+                            AND pb.RequestHash = Bookings.RequestHash
+                            AND pb.ConversationId IS NOT NULL
+                          GROUP BY pb.IdempotencyKey, pb.SlotId, pb.RequestHash
+                          HAVING COUNT(DISTINCT pb.ConversationId) = 1
                       );
                 ");
             }

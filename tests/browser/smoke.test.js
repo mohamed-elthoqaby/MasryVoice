@@ -159,6 +159,7 @@ async function runBrowserSmokeSuite() {
 
     // Turn 2: Consecutive turn verifying session continuity
     console.log(' - Sending Voice Turn 2: استفسار صوتي ثانٍ مع التحقق من استمرارية الجلسة...');
+    await page.waitForSelector('#voice-input-text:not([disabled])', { timeout: 15000 });
     await page.fill('#voice-input-text', 'تمام شكراً لحضرتك');
     await page.click('#send-voice-turn-btn');
 
@@ -177,12 +178,25 @@ async function runBrowserSmokeSuite() {
     
     // Part A: Interruption of ACTIVE playback (verify playback starts before interrupt)
     console.log(' - Part A: Verifying active playback starts before barge-in interrupt...');
+    await page.waitForSelector('#voice-input-text:not([disabled])', { timeout: 15000 });
     await page.fill('#voice-input-text', 'استفسار مفصل عن مواعيد وأسعار كشوفات الباطنة والأطفال');
     await page.click('#send-voice-turn-btn');
 
     // Wait for playback to actually start (voice-speaking-indicator appears)
     await page.waitForSelector('#voice-speaking-indicator', { timeout: 25000 });
     console.log(' Playback verified actively started (#voice-speaking-indicator is visible).');
+
+    // Assert the actual audio element is playing before interruption
+    await page.waitForFunction(() => {
+      const audio = document.querySelector('audio');
+      return audio && !audio.paused && audio.currentTime >= 0;
+    }, { timeout: 10000 });
+    const audioActuallyPlaying = await page.evaluate(() => {
+      const audio = document.querySelector('audio');
+      return audio && !audio.paused;
+    });
+    assert.strictEqual(Boolean(audioActuallyPlaying), true, 'Actual audio element must be actively playing before barge-in interrupt');
+    console.log(' Verified actual audio element is actively playing before barge-in interrupt.');
 
     // Interrupt active playback via barge-in
     await page.click('#voice-barge-in-btn');
@@ -201,9 +215,11 @@ async function runBrowserSmokeSuite() {
     console.log(' Active playback verified stopped upon Barge-In interrupt.');
     assertNoPageErrors('Active Playback Interruption');
 
-    // Part B: Deterministic delayed-response case
+    // Part B: Deterministic delayed-response case (Simulated)
     // Route holds /api/voice/turn in flight -> user interrupts -> release delayed response -> assert cannot restart playback or overwrite state
-    console.log(' - Part B: Verifying deterministic delayed-response suppression...');
+    console.log(' - Part B: Verifying deterministic delayed-response suppression (Simulated)...');
+    const turnIdBeforeDelayed = await page.$eval('#voice-turn-id-display', el => el.innerText.trim());
+
     let releaseDelayedResponse = null;
     const delayedResponsePromise = new Promise(resolve => {
       releaseDelayedResponse = resolve;
@@ -217,6 +233,7 @@ async function runBrowserSmokeSuite() {
     });
 
     // Send turn that will be delayed
+    await page.waitForSelector('#voice-input-text:not([disabled])', { timeout: 15000 });
     await page.fill('#voice-input-text', 'طلب صوتي متأخر للتحقق من قمع الرد بعد المقاطعة');
     await page.click('#send-voice-turn-btn');
 
@@ -254,21 +271,74 @@ async function runBrowserSmokeSuite() {
       return audio && !audio.paused && audio.currentTime > 0;
     });
     assert.strictEqual(Boolean(audioAfterDelayed), false, 'Audio playback must remain stopped after delayed response completes');
+
+    const turnIdAfterDelayed = await page.$eval('#voice-turn-id-display', el => el.innerText.trim());
+    assert.strictEqual(turnIdAfterDelayed, turnIdBeforeDelayed, 'Delayed response must not overwrite current turn ID state');
+
     console.log('   Delayed response safely suppressed: did not restart playback or overwrite state.');
     assertNoPageErrors('Delayed Response Suppression');
 
-    // Part C: Verify subsequent voice turn still works cleanly
-    console.log(' - Part C: Verifying subsequent voice turn still succeeds after interruption...');
-    await page.fill('#voice-input-text', 'سؤال جديد للتأكد من استئناف الخدمة بعد المقاطعة');
+    // Part C: Verify subsequent voice turn still works cleanly (Simulated)
+    console.log(' - Part C: Verifying subsequent voice turn still succeeds after interruption (Simulated)...');
+    const turnDisplayBefore = await page.$eval('#voice-turn-id-display', el => el.innerText.trim());
+    console.log(`   Captured turn state before new turn: ${turnDisplayBefore}`);
+
+    // Listen for the specific new POST /api/voice/turn response
+    const nextTurnResponsePromise = page.waitForResponse(
+      resp => resp.url().includes('/api/voice/turn') && resp.request().method() === 'POST',
+      { timeout: 25000 }
+    );
+
+    const promptMsg = 'سؤال جديد للتأكد من استئناف الخدمة بعد المقاطعة';
+    await page.waitForSelector('#voice-input-text:not([disabled])', { timeout: 15000 });
+    await page.fill('#voice-input-text', promptMsg);
     await page.click('#send-voice-turn-btn');
 
-    // Wait for turn completion
-    await page.waitForFunction(() => {
-      const el = document.getElementById('voice-turn-id-display');
-      return el && (el.innerText.trim() === '#4' || el.innerText.trim() === '#5');
-    }, { timeout: 25000 });
-    console.log('   Subsequent voice turn completed successfully.');
+    // Await the specific new response and require success
+    const nextTurnResp = await nextTurnResponsePromise;
+    assert.strictEqual(nextTurnResp.ok(), true, 'Subsequent voice turn HTTP request must return HTTP 200 OK');
+    const nextTurnData = await nextTurnResp.json();
+    assert.strictEqual(Boolean(nextTurnData.turnId), true, 'Voice turn response must contain turnId');
+    assert.strictEqual(Boolean(nextTurnData.text), true, 'Voice turn response must contain text content');
+
+    const expectedTurnEpoch = `#${nextTurnData.turnId}`;
+    console.log(`   Specific response received: turnId=${nextTurnData.turnId}, expecting UI to display ${expectedTurnEpoch}`);
+
+    // Assert UI displays that specific response's turn ID
+    await page.waitForFunction(
+      (expectedEpoch) => {
+        const el = document.getElementById('voice-turn-id-display');
+        return el && el.innerText.trim() === expectedEpoch;
+      },
+      expectedTurnEpoch,
+      { timeout: 25000 }
+    );
+
+    const finalTurnId = await page.$eval('#voice-turn-id-display', el => el.innerText.trim());
+    assert.strictEqual(finalTurnId, expectedTurnEpoch, 'UI must display the exact turn ID from the new response');
+
+    // Assert UI displays that specific response's content
+    await page.waitForFunction(
+      (expectedSnippet) => {
+        const el = document.getElementById('voice-response-content-display');
+        return el && el.innerText.trim().length > 0 && el.innerText.includes(expectedSnippet);
+      },
+      nextTurnData.text.slice(0, 15),
+      { timeout: 25000 }
+    );
+
+    const finalResponseContent = await page.$eval('#voice-response-content-display', el => el.innerText.trim());
+    assert.strictEqual(
+      finalResponseContent.includes(nextTurnData.text.slice(0, 15)),
+      true,
+      'UI must display the exact response text content from the new response'
+    );
+
+    console.log('   Subsequent voice turn completed successfully and verified in UI with exact turn ID and content.');
     assertNoPageErrors('Post-Interruption Turn');
+
+    // Verify completion before closing browser
+    await page.waitForLoadState('networkidle');
 
     console.log('\n====================================================');
     console.log('ALL BROWSER SMOKE CHECKS PASSED SUCCESSFULLY (5/5)!');

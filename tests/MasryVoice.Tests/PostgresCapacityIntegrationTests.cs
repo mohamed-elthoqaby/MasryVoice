@@ -34,7 +34,14 @@ public class PostgresCapacityIntegrationTests
     private async Task EnsurePostgresInitializedAsync()
     {
         using var db = CreatePostgresDbContext();
-        await DatabaseMigrationHelper.ApplyMigrationsAsync(db);
+        try
+        {
+            await DatabaseMigrationHelper.ApplyMigrationsAsync(db);
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("RepairPartiallyUpgradedSchemaAsync"))
+        {
+            await DatabaseMigrationHelper.RepairPartiallyUpgradedSchemaAsync(db);
+        }
         await db.SeedInitialDataAsync();
     }
 

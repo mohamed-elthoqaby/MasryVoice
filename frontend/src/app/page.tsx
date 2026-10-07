@@ -151,12 +151,14 @@ export default function Dashboard() {
   // Voice tab state
   const [voiceSessionId, setVoiceSessionId] = useState<string>('');
   const [voiceText, setVoiceText] = useState('');
+  const [voiceResponseText, setVoiceResponseText] = useState<string>('');
   const [isVoiceProcessing, setIsVoiceProcessing] = useState(false);
   const [isVoiceSpeaking, setIsVoiceSpeaking] = useState(false);
   const [voiceInterrupted, setVoiceInterrupted] = useState(false);
   const [voiceTurnId, setVoiceTurnId] = useState<number>(0);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const isInterruptedRef = useRef<boolean>(false);
+  const activeVoiceRequestIdRef = useRef<number>(0);
 
   // Settings form state
   const [agentForm, setAgentForm] = useState<Partial<Agent>>({});
@@ -514,6 +516,8 @@ export default function Dashboard() {
   const handleBargeInInterrupt = async () => {
     if (!voiceSessionId) return;
     isInterruptedRef.current = true;
+    activeVoiceRequestIdRef.current++; // Invalidate any pending in-flight request
+    setIsVoiceProcessing(false);
     try {
       if (audioPlayerRef.current) {
         audioPlayerRef.current.pause();
@@ -539,6 +543,7 @@ export default function Dashboard() {
     const textToSend = messageText || voiceText;
     if (!textToSend.trim() || !selectedAgent) return;
     isInterruptedRef.current = false;
+    const currentRequestId = ++activeVoiceRequestIdRef.current;
     let sId = voiceSessionId;
     let currentConv = conversationId || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_conversation_id') : null);
     let currentToken = customerToken || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_customer_token') : null);
@@ -576,19 +581,21 @@ export default function Dashboard() {
 
       if (res.ok) {
         const data = await res.json();
-        setVoiceTurnId(data.turnId);
-        setVoiceText('');
 
-        // Suppress late playback if user interrupted while waiting
-        if (data.interrupted || isInterruptedRef.current) {
+        // Reject stale/interrupted responses before applying turn ID, input, or response-state updates!
+        if (data.interrupted || isInterruptedRef.current || currentRequestId !== activeVoiceRequestIdRef.current) {
           setIsVoiceSpeaking(false);
           setVoiceInterrupted(true);
           return;
         }
 
+        setVoiceTurnId(data.turnId);
+        setVoiceResponseText(data.text || '');
+        setVoiceText('');
+
         if (data.audioBase64) {
           const audioSrc = `data:audio/wav;base64,${data.audioBase64}`;
-          if (audioPlayerRef.current && !isInterruptedRef.current) {
+          if (audioPlayerRef.current && !isInterruptedRef.current && currentRequestId === activeVoiceRequestIdRef.current) {
             audioPlayerRef.current.src = audioSrc;
             setIsVoiceSpeaking(true);
             audioPlayerRef.current.play().catch(() => {});
@@ -1746,6 +1753,27 @@ export default function Dashboard() {
                   <span>توليد وتحدث</span>
                 </button>
               </div>
+
+              {/* Active Voice Response Content Display */}
+              {voiceResponseText && (
+                <div
+                  id="voice-response-content-display"
+                  style={{
+                    background: 'rgba(16, 185, 129, 0.08)',
+                    border: '1px solid rgba(16, 185, 129, 0.3)',
+                    borderRadius: '12px',
+                    padding: '16px',
+                    color: '#f3f4f6',
+                    fontSize: '0.9rem',
+                    lineHeight: '1.6'
+                  }}
+                >
+                  <div style={{ color: '#10b981', fontWeight: 600, fontSize: '0.8rem', marginBottom: '6px' }}>
+                    رد الوكيل الصوتي:
+                  </div>
+                  {voiceResponseText}
+                </div>
+              )}
 
               {/* Technical Specifications */}
               <div style={{

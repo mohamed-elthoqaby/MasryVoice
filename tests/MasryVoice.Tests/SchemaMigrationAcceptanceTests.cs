@@ -242,10 +242,13 @@ public class SchemaMigrationAcceptanceTests
             var convId1 = Guid.NewGuid();
             var convId2 = Guid.NewGuid();
             var slotId = Guid.NewGuid();
+            var slotId2 = Guid.NewGuid();
             var bId1 = Guid.NewGuid();
             var bId2 = Guid.NewGuid();
             var bId3 = Guid.NewGuid();
             var bId4 = Guid.NewGuid();
+            var bIdConflictSlot = Guid.NewGuid();
+            var bIdConflictHash = Guid.NewGuid();
 
             // 1. Setup independently preserved legacy schema corresponding to commit 428f490 via raw DDL
             using (var db = new AppDbContext(options))
@@ -266,6 +269,9 @@ public class SchemaMigrationAcceptanceTests
                     INSERT INTO ""AvailabilitySlots"" (""Id"", ""ServiceName"", ""StartTimeUtc"", ""EndTimeUtc"", ""TotalCapacity"", ""BookedCapacity"")
                     VALUES ('{slotId}', 'كشف باطنة', NOW() + INTERVAL '1 day', NOW() + INTERVAL '1 day 30 minutes', 5, 4);
 
+                    INSERT INTO ""AvailabilitySlots"" (""Id"", ""ServiceName"", ""StartTimeUtc"", ""EndTimeUtc"", ""TotalCapacity"", ""BookedCapacity"")
+                    VALUES ('{slotId2}', 'كشف أطفال', NOW() + INTERVAL '2 days', NOW() + INTERVAL '2 days 30 minutes', 3, 1);
+
                     -- Pending booking 1: Unambiguous match for Conversation 1
                     INSERT INTO ""PendingBookings"" (""Id"", ""ConversationId"", ""SlotId"", ""CustomerName"", ""CustomerPhone"", ""ServiceName"", ""BookingDateUtc"", ""IdempotencyKey"", ""RequestHash"", ""Status"", ""CreatedAtUtc"")
                     VALUES ('{Guid.NewGuid()}', '{convId1}', '{slotId}', 'عميل أ', '01011111111', 'كشف باطنة', NOW() + INTERVAL '1 day', 'idemp_unambiguous_1', 'hash1', 'Confirmed', NOW());
@@ -275,6 +281,14 @@ public class SchemaMigrationAcceptanceTests
                     VALUES ('{Guid.NewGuid()}', '{convId1}', '{slotId}', 'عميل أ', '01011111111', 'كشف باطنة', NOW() + INTERVAL '1 day', 'idemp_conflicting_2', 'hash2a', 'Confirmed', NOW());
                     INSERT INTO ""PendingBookings"" (""Id"", ""ConversationId"", ""SlotId"", ""CustomerName"", ""CustomerPhone"", ""ServiceName"", ""BookingDateUtc"", ""IdempotencyKey"", ""RequestHash"", ""Status"", ""CreatedAtUtc"")
                     VALUES ('{Guid.NewGuid()}', '{convId2}', '{slotId}', 'عميل ب', '01022222222', 'كشف باطنة', NOW() + INTERVAL '1 day', 'idemp_conflicting_2', 'hash2b', 'Confirmed', NOW());
+
+                    -- Conflicting slot case: Pending booking has slotId2 while booking has slotId (same conversation)
+                    INSERT INTO ""PendingBookings"" (""Id"", ""ConversationId"", ""SlotId"", ""CustomerName"", ""CustomerPhone"", ""ServiceName"", ""BookingDateUtc"", ""IdempotencyKey"", ""RequestHash"", ""Status"", ""CreatedAtUtc"")
+                    VALUES ('{Guid.NewGuid()}', '{convId1}', '{slotId2}', 'عميل أ', '01011111111', 'كشف باطنة', NOW() + INTERVAL '1 day', 'idemp_conflicting_slot', 'hash_slot', 'Confirmed', NOW());
+
+                    -- Conflicting request hash case: Pending booking has hash_conflict_b while booking has hash_conflict_a (same conversation)
+                    INSERT INTO ""PendingBookings"" (""Id"", ""ConversationId"", ""SlotId"", ""CustomerName"", ""CustomerPhone"", ""ServiceName"", ""BookingDateUtc"", ""IdempotencyKey"", ""RequestHash"", ""Status"", ""CreatedAtUtc"")
+                    VALUES ('{Guid.NewGuid()}', '{convId1}', '{slotId}', 'عميل أ', '01011111111', 'كشف باطنة', NOW() + INTERVAL '1 day', 'idemp_conflicting_hash', 'hash_conflict_b', 'Confirmed', NOW());
 
                     -- Booking 1: Unambiguous match with PendingBooking 1 -> Must be backfilled to convId1
                     INSERT INTO ""Bookings"" (""Id"", ""SlotId"", ""CustomerName"", ""CustomerPhone"", ""ServiceName"", ""BookingDateUtc"", ""Status"", ""IdempotencyKey"", ""RequestHash"", ""CreatedAtUtc"")
@@ -291,6 +305,14 @@ public class SchemaMigrationAcceptanceTests
                     -- Booking 4: Unresolved legacy booking with no pending matches -> Remains NULL
                     INSERT INTO ""Bookings"" (""Id"", ""SlotId"", ""CustomerName"", ""CustomerPhone"", ""ServiceName"", ""BookingDateUtc"", ""Status"", ""IdempotencyKey"", ""RequestHash"", ""CreatedAtUtc"")
                     VALUES ('{bId4}', '{slotId}', 'عميل قديم', '01033333333', 'كشف باطنة', NOW() + INTERVAL '1 day', 'Confirmed', 'idemp_legacy_unresolved', 'hash4', NOW());
+
+                    -- Booking 5: Match has conflicting slot -> Must NOT be backfilled (remains NULL)
+                    INSERT INTO ""Bookings"" (""Id"", ""SlotId"", ""CustomerName"", ""CustomerPhone"", ""ServiceName"", ""BookingDateUtc"", ""Status"", ""IdempotencyKey"", ""RequestHash"", ""CreatedAtUtc"")
+                    VALUES ('{bIdConflictSlot}', '{slotId}', 'عميل أ بتعارض موعد', '01011111111', 'كشف باطنة', NOW() + INTERVAL '1 day', 'Confirmed', 'idemp_conflicting_slot', 'hash_slot', NOW());
+
+                    -- Booking 6: Match has conflicting request hash -> Must NOT be backfilled (remains NULL)
+                    INSERT INTO ""Bookings"" (""Id"", ""SlotId"", ""CustomerName"", ""CustomerPhone"", ""ServiceName"", ""BookingDateUtc"", ""Status"", ""IdempotencyKey"", ""RequestHash"", ""CreatedAtUtc"")
+                    VALUES ('{bIdConflictHash}', '{slotId}', 'عميل أ بتعارض هاش', '01011111111', 'كشف باطنة', NOW() + INTERVAL '1 day', 'Confirmed', 'idemp_conflicting_hash', 'hash_conflict_a', NOW());
                 ");
             }
 
@@ -304,17 +326,21 @@ public class SchemaMigrationAcceptanceTests
             using (var db = new AppDbContext(options))
             {
                 var bookings = await db.Bookings.AsNoTracking().ToListAsync();
-                Assert.Equal(4, bookings.Count);
+                Assert.Equal(6, bookings.Count);
 
                 var booking1 = bookings.FirstOrDefault(b => b.IdempotencyKey == "idemp_unambiguous_1");
                 var booking2 = bookings.FirstOrDefault(b => b.IdempotencyKey == "idemp_conflicting_2");
                 var booking3 = bookings.FirstOrDefault(b => b.IdempotencyKey == "idemp_phone_only_match");
                 var booking4 = bookings.FirstOrDefault(b => b.IdempotencyKey == "idemp_legacy_unresolved");
+                var bookingSlotConflict = bookings.FirstOrDefault(b => b.IdempotencyKey == "idemp_conflicting_slot");
+                var bookingHashConflict = bookings.FirstOrDefault(b => b.IdempotencyKey == "idemp_conflicting_hash");
 
                 Assert.NotNull(booking1);
                 Assert.NotNull(booking2);
                 Assert.NotNull(booking3);
                 Assert.NotNull(booking4);
+                Assert.NotNull(bookingSlotConflict);
+                Assert.NotNull(bookingHashConflict);
 
                 // Booking 1: Reliably backfilled from unambiguous match
                 Assert.Equal(convId1, booking1.ConversationId);
@@ -328,11 +354,15 @@ public class SchemaMigrationAcceptanceTests
                 // Booking 4: Legacy booking with unresolved ownership remains NULL
                 Assert.Null(booking4.ConversationId);
 
+                // Booking 5 & 6: Conflicting slot or request hash records MUST NOT be backfilled
+                Assert.Null(bookingSlotConflict.ConversationId);
+                Assert.Null(bookingHashConflict.ConversationId);
+
                 // Unresolved bookings retrievable by administrator (null ConversationId)
                 var unresolvedAdminList = await db.Bookings.Where(b => b.ConversationId == null).ToListAsync();
-                Assert.Equal(3, unresolvedAdminList.Count);
+                Assert.Equal(5, unresolvedAdminList.Count);
 
-                // Customer 1 query returns strictly owned booking 1
+                // Customer 1 query returns strictly owned booking 1; unresolved ownership inaccessible to customer
                 var customer1Query = await db.Bookings.Where(b => b.ConversationId == convId1).ToListAsync();
                 Assert.Single(customer1Query);
                 Assert.Equal(bId1, customer1Query[0].Id);
@@ -472,6 +502,200 @@ public class SchemaMigrationAcceptanceTests
                 var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => DatabaseMigrationHelper.ApplyMigrationsAsync(db));
                 Assert.Contains("Unsupported or corrupted legacy database schema", ex.Message);
                 Assert.Contains("CK_AvailabilitySlots_Capacity", ex.Message);
+            }
+        }
+        finally
+        {
+            await DropDisposablePostgresDatabaseAsync(cs);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "PostgresIntegration")]
+    public async Task Postgres_LegacySchema_NonUniqueIdempotencyIndex_IsRejected()
+    {
+        var cs = await CreateDisposablePostgresDatabaseAsync();
+        try
+        {
+            var options = new DbContextOptionsBuilder<AppDbContext>()
+                .UseNpgsql(cs, o => o.UseVector())
+                .Options;
+
+            using (var db = new AppDbContext(options))
+            {
+                await CreateLegacyPostgresSchema428F490Async(db);
+                // Replace unique index with a non-unique index using the expected index name
+                await db.Database.ExecuteSqlRawAsync(@"
+                    DROP INDEX ""IX_Bookings_IdempotencyKey"";
+                    CREATE INDEX ""IX_Bookings_IdempotencyKey"" ON ""Bookings"" (""IdempotencyKey"");
+                ");
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => DatabaseMigrationHelper.ApplyMigrationsAsync(db));
+                Assert.Contains("IX_Bookings_IdempotencyKey", ex.Message);
+                Assert.Contains("UNIQUE", ex.Message);
+
+                // Verify migration history was not falsely updated
+                await using var cmd = db.Database.GetDbConnection().CreateCommand();
+                cmd.CommandText = "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = '__EFMigrationsHistory');";
+                var histExists = (bool)(await cmd.ExecuteScalarAsync() ?? false);
+                Assert.False(histExists);
+            }
+        }
+        finally
+        {
+            await DropDisposablePostgresDatabaseAsync(cs);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "PostgresIntegration")]
+    public async Task Postgres_LegacySchema_IneffectiveCapacityConstraint_IsRejected()
+    {
+        var cs = await CreateDisposablePostgresDatabaseAsync();
+        try
+        {
+            var options = new DbContextOptionsBuilder<AppDbContext>()
+                .UseNpgsql(cs, o => o.UseVector())
+                .Options;
+
+            using (var db = new AppDbContext(options))
+            {
+                await CreateLegacyPostgresSchema428F490Async(db);
+                // Replace capacity constraint with an ineffective check constraint using the expected constraint name
+                await db.Database.ExecuteSqlRawAsync(@"
+                    ALTER TABLE ""AvailabilitySlots"" DROP CONSTRAINT ""CK_AvailabilitySlots_Capacity"";
+                    ALTER TABLE ""AvailabilitySlots"" ADD CONSTRAINT ""CK_AvailabilitySlots_Capacity"" CHECK (true);
+                ");
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => DatabaseMigrationHelper.ApplyMigrationsAsync(db));
+                Assert.Contains("CK_AvailabilitySlots_Capacity", ex.Message);
+                Assert.Contains("does not enforce BookedCapacity <= TotalCapacity", ex.Message);
+
+                // Verify migration history was not falsely updated
+                await using var cmd = db.Database.GetDbConnection().CreateCommand();
+                cmd.CommandText = "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = '__EFMigrationsHistory');";
+                var histExists = (bool)(await cmd.ExecuteScalarAsync() ?? false);
+                Assert.False(histExists);
+            }
+        }
+        finally
+        {
+            await DropDisposablePostgresDatabaseAsync(cs);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "PostgresIntegration")]
+    public async Task Postgres_MissingBookingOwnershipFkOrIndex_WhileMigrationHistoryPresent_IsRejected()
+    {
+        var cs = await CreateDisposablePostgresDatabaseAsync();
+        try
+        {
+            var options = new DbContextOptionsBuilder<AppDbContext>()
+                .UseNpgsql(cs, o => o.UseVector())
+                .Options;
+
+            using (var db = new AppDbContext(options))
+            {
+                // Initialize clean database with migrations applied
+                await DatabaseMigrationHelper.ApplyMigrationsAsync(db);
+
+                // Simulate corrupted state: migration history is present, ConversationId column exists,
+                // but the foreign key constraint is dropped
+                await db.Database.ExecuteSqlRawAsync(@"
+                    ALTER TABLE ""Bookings"" DROP CONSTRAINT ""FK_Bookings_Conversations_ConversationId"";
+                ");
+
+                // Calling ApplyMigrationsAsync must detect missing FK even though AddBookingConversationId is in history
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => DatabaseMigrationHelper.ApplyMigrationsAsync(db));
+                Assert.Contains("Partially upgraded", ex.Message);
+                Assert.Contains("FK: False", ex.Message);
+                Assert.Contains("RepairPartiallyUpgradedSchemaAsync", ex.Message);
+            }
+        }
+        finally
+        {
+            await DropDisposablePostgresDatabaseAsync(cs);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "PostgresIntegration")]
+    public async Task Postgres_LegacySchema_MissingRequiredColumn_IsRejected()
+    {
+        var cs = await CreateDisposablePostgresDatabaseAsync();
+        try
+        {
+            var options = new DbContextOptionsBuilder<AppDbContext>()
+                .UseNpgsql(cs, o => o.UseVector())
+                .Options;
+
+            using (var db = new AppDbContext(options))
+            {
+                await CreateLegacyPostgresSchema428F490Async(db);
+                // Drop a required application column from Bookings
+                await db.Database.ExecuteSqlRawAsync(@"
+                    ALTER TABLE ""Bookings"" DROP COLUMN ""RequestHash"";
+                ");
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => DatabaseMigrationHelper.ApplyMigrationsAsync(db));
+                Assert.Contains("Missing required application column 'RequestHash'", ex.Message);
+
+                // Verify migration history was not falsely updated
+                await using var cmd = db.Database.GetDbConnection().CreateCommand();
+                cmd.CommandText = "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = '__EFMigrationsHistory');";
+                var histExists = (bool)(await cmd.ExecuteScalarAsync() ?? false);
+                Assert.False(histExists);
+            }
+        }
+        finally
+        {
+            await DropDisposablePostgresDatabaseAsync(cs);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "PostgresIntegration")]
+    public async Task Postgres_RepairOperation_FailsAndRollsBack_OnValidationFailure()
+    {
+        var cs = await CreateDisposablePostgresDatabaseAsync();
+        try
+        {
+            var options = new DbContextOptionsBuilder<AppDbContext>()
+                .UseNpgsql(cs, o => o.UseVector())
+                .Options;
+
+            var slotId = Guid.NewGuid();
+
+            using (var db = new AppDbContext(options))
+            {
+                await CreateLegacyPostgresSchema428F490Async(db);
+                await db.Database.ExecuteSqlRawAsync(@"
+                    ALTER TABLE ""Bookings"" ADD COLUMN ""ConversationId"" uuid NULL;
+                ");
+
+                // Insert a slot that violates business capacity constraint
+                await db.Database.ExecuteSqlRawAsync(@"
+                    ALTER TABLE ""AvailabilitySlots"" DROP CONSTRAINT ""CK_AvailabilitySlots_Capacity"";
+                ");
+                await db.Database.ExecuteSqlRawAsync($@"
+                    INSERT INTO ""AvailabilitySlots"" (""Id"", ""ServiceName"", ""StartTimeUtc"", ""EndTimeUtc"", ""TotalCapacity"", ""BookedCapacity"")
+                    VALUES ('{slotId}', 'كشف باطنة', NOW(), NOW() + INTERVAL '30 minutes', 2, 5);
+                ");
+                // Re-add dummy check constraint to pass initial legacy check but fail capacity check step in repair
+                await db.Database.ExecuteSqlRawAsync(@"
+                    ALTER TABLE ""AvailabilitySlots"" ADD CONSTRAINT ""CK_AvailabilitySlots_Capacity"" CHECK (""BookedCapacity"" <= ""TotalCapacity"") NOT VALID;
+                ");
+
+                // Execute Repair: must throw capacity violation and roll back transaction
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => DatabaseMigrationHelper.RepairPartiallyUpgradedSchemaAsync(db));
+                Assert.Contains("Capacity constraint violation", ex.Message);
+
+                // Verify rollback: __EFMigrationsHistory must not exist and AddBookingConversationId must not be recorded
+                await using var cmd = db.Database.GetDbConnection().CreateCommand();
+                cmd.CommandText = "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = '__EFMigrationsHistory');";
+                var histExists = (bool)(await cmd.ExecuteScalarAsync() ?? false);
+                Assert.False(histExists);
             }
         }
         finally
