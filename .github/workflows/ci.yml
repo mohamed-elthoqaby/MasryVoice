@@ -54,10 +54,10 @@ jobs:
       - name: Install Python Voice Unit Dependencies (Headless / No Weights)
         run: |
           python -m pip install --upgrade pip
-          pip install fastapi pydantic uvicorn starlette av
+          pip install fastapi pydantic uvicorn starlette av python-multipart
 
       - name: Run Voice Server Lifecycle Unit Tests
-        run: python -m unittest tests/test_voice_server_lifecycle.py
+        run: python -m unittest tests/test_voice_server_lifecycle.py tests/test_verification_script_logic.py
 
   postgres-integration-test:
     name: PostgreSQL & pgvector Integration Tests
@@ -421,7 +421,9 @@ jobs:
 
       - name: Install Playwright Chromium & System Dependencies
         working-directory: frontend
-        run: npx playwright install --with-deps chromium
+        run: |
+          node ./node_modules/playwright-core/cli.js --version
+          node ./node_modules/playwright-core/cli.js install --with-deps chromium
 
       - name: Build Backend (Release)
         run: dotnet build backend/MasryVoice.Api/MasryVoice.Api.csproj -c Release

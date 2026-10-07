@@ -26,8 +26,16 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response, Request
 from pydantic import BaseModel
-from faster_whisper import WhisperModel
-from piper.voice import PiperVoice
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
+
+try:
+    from piper.voice import PiperVoice
+except ImportError:
+    PiperVoice = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("VoiceServer")
@@ -158,31 +166,38 @@ async def lifespan(app: FastAPI):
     global piper_onnx_sha256, piper_json_sha256
 
     # 1. Load Whisper STT (strictly local, local_files_only=True)
-    resolved_whisper_path = find_local_whisper_snapshot()
-    if resolved_whisper_path and os.path.exists(resolved_whisper_path):
-        whisper_snapshot_id = os.path.basename(resolved_whisper_path)
-        model_bin_file = os.path.join(resolved_whisper_path, "model.bin")
-        whisper_bin_sha256 = get_file_sha256(model_bin_file)
-
-        logger.info(f"Loading faster-whisper from explicit snapshot '{resolved_whisper_path}' (model={WHISPER_MODEL_NAME}, snapshot={whisper_snapshot_id}) on {WHISPER_DEVICE} ({WHISPER_COMPUTE})...")
-        stt_start = time.perf_counter()
-        try:
-            whisper_model = WhisperModel(
-                resolved_whisper_path,
-                device=WHISPER_DEVICE,
-                compute_type=WHISPER_COMPUTE,
-                local_files_only=True
-            )
-            logger.info(f"faster-whisper loaded in {time.perf_counter() - stt_start:.2f}s")
-        except Exception as e:
-            logger.error(f"Failed to load local Whisper model: {e}", exc_info=True)
-            whisper_model = None
-    else:
-        logger.warning(f"No local faster-whisper model found for '{WHISPER_MODEL_NAME}'. STT disabled (offline local_files_only=True enforced).")
+    if WhisperModel is None:
+        logger.warning("faster-whisper is not installed. STT disabled.")
         whisper_model = None
+    else:
+        resolved_whisper_path = find_local_whisper_snapshot()
+        if resolved_whisper_path and os.path.exists(resolved_whisper_path):
+            whisper_snapshot_id = os.path.basename(resolved_whisper_path)
+            model_bin_file = os.path.join(resolved_whisper_path, "model.bin")
+            whisper_bin_sha256 = get_file_sha256(model_bin_file)
+
+            logger.info(f"Loading faster-whisper from explicit snapshot '{resolved_whisper_path}' (model={WHISPER_MODEL_NAME}, snapshot={whisper_snapshot_id}) on {WHISPER_DEVICE} ({WHISPER_COMPUTE})...")
+            stt_start = time.perf_counter()
+            try:
+                whisper_model = WhisperModel(
+                    resolved_whisper_path,
+                    device=WHISPER_DEVICE,
+                    compute_type=WHISPER_COMPUTE,
+                    local_files_only=True
+                )
+                logger.info(f"faster-whisper loaded in {time.perf_counter() - stt_start:.2f}s")
+            except Exception as e:
+                logger.error(f"Failed to load local Whisper model: {e}", exc_info=True)
+                whisper_model = None
+        else:
+            logger.warning(f"No local faster-whisper model found for '{WHISPER_MODEL_NAME}'. STT disabled (offline local_files_only=True enforced).")
+            whisper_model = None
 
     # 2. Load Piper TTS (strictly local ONNX, GPL-3.0-or-later)
-    if os.path.exists(TTS_MODEL_PATH) and os.path.exists(TTS_CONFIG_PATH):
+    if PiperVoice is None:
+        logger.warning("piper-voice is not installed. TTS disabled.")
+        piper_voice = None
+    elif os.path.exists(TTS_MODEL_PATH) and os.path.exists(TTS_CONFIG_PATH):
         piper_onnx_sha256 = get_file_sha256(TTS_MODEL_PATH)
         piper_json_sha256 = get_file_sha256(TTS_CONFIG_PATH)
 
@@ -372,7 +387,11 @@ async def transcribe_audio(
                         text_chunks.append(segment.text.strip())
                     return " ".join(text_chunks).strip(), info, False
 
-                return await asyncio.to_thread(_sync_work)
+                try:
+                    return await asyncio.to_thread(_sync_work)
+                except Exception as ex:
+                    logger.warning(f"[STT Worker] Thread error observed: {ex}")
+                    return None, None, True
             finally:
                 if cur_task:
                     _active_stt_tasks.discard(cur_task)
@@ -383,7 +402,14 @@ async def transcribe_audio(
                     except OSError:
                         pass
 
+        def _observe_stt_task_exception(t: asyncio.Task):
+            if not t.cancelled():
+                exc = t.exception()
+                if exc:
+                    logger.warning(f"[STT] Background worker completed with exception: {exc}")
+
         worker_task = asyncio.create_task(_run_stt_worker())
+        worker_task.add_done_callback(_observe_stt_task_exception)
 
         while not worker_task.done():
             if await request.is_disconnected():
@@ -484,13 +510,24 @@ async def synthesize_speech(request: Request, req: SpeechRequest):
                             wav_file.writeframes(chunk.audio_int16_bytes)
                     return buffer.getvalue(), False
 
-                return await asyncio.to_thread(_sync_work)
+                try:
+                    return await asyncio.to_thread(_sync_work)
+                except Exception as ex:
+                    logger.warning(f"[TTS Worker] Thread error observed: {ex}")
+                    return None, True
             finally:
                 if cur_task:
                     _active_tts_tasks.discard(cur_task)
                 tts_semaphore.release()
 
+        def _observe_tts_task_exception(t: asyncio.Task):
+            if not t.cancelled():
+                exc = t.exception()
+                if exc:
+                    logger.warning(f"[TTS] Background worker completed with exception: {exc}")
+
         worker_task = asyncio.create_task(_run_tts_worker())
+        worker_task.add_done_callback(_observe_tts_task_exception)
 
         while not worker_task.done():
             if await request.is_disconnected():

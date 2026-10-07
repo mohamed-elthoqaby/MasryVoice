@@ -97,11 +97,24 @@ def build_overlong_wav_bytes(duration_sec=35):
     return bytes(buf)
 
 
+def persist_report(report):
+    report_file = os.path.join(ARTIFACTS_DIR, "real_voice_verification_report.json")
+    try:
+        with open(report_file, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f" [WARNING] Failed to write report file: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="MasryVoice Real Local Voice Verification")
     parser.add_argument("--strict", action="store_true", help="Fail nonzero if any required stage is unavailable")
     parser.add_argument("--skip-backend", action="store_true", help="Skip backend E2E turns and test speech server only")
     args = parser.parse_args()
+
+    if args.strict and args.skip_backend:
+        print(" [ERROR] --strict cannot be used with --skip-backend. Full end-to-end verification is required.")
+        sys.exit(1)
 
     print("=" * 78)
     print("   MASRYVOICE REAL LOCAL VOICE PIPELINE ACCEPTANCE VERIFICATION ($0 Cost)   ")
@@ -122,6 +135,12 @@ def main():
         "timings_ms": {},
         "verifications": {}
     }
+
+    if args.strict and not os.path.exists(DB_PATH):
+        print(f" [ERROR] Acceptance database not found at {DB_PATH} in strict mode.")
+        report["verifications"]["acceptance_database"] = f"FAILED: Missing DB {DB_PATH}"
+        persist_report(report)
+        sys.exit(1)
 
     # -----------------------------------------------------------------
     # Stage 1: Local Voice Server Health, Engine Provenance & Hashes
@@ -150,6 +169,7 @@ def main():
         print(f" [FAILED] Health check failed: {e}")
         report["verifications"]["health_status"] = f"FAILED: {e}"
         if args.strict:
+            persist_report(report)
             sys.exit(1)
 
     # -----------------------------------------------------------------
@@ -222,6 +242,7 @@ def main():
     assert bg_result.get("bytes", 0) > 44, "Background synthesis returned empty audio"
 
     print(f" -> /health responsiveness DURING active inference: {dt_active_health:.2f}ms (Active TTS workers observed: {observed_active})")
+    assert observed_active > 0, f"Active TTS worker must be observed during background synthesis, got {observed_active}"
     assert dt_active_health < 1000.0, f"Health check during active inference exceeded threshold: {dt_active_health}ms"
     report["timings_ms"]["health_check_during_active_work_ms"] = round(dt_active_health, 2)
     report["stages"]["active_concurrency_supervision"] = {
@@ -247,19 +268,21 @@ def main():
     t_stt1 = (time.perf_counter() - t0) * 1000
     assert code1 == 200, f"STT failed for turn 1 with {code1}"
     transcript1 = res1.get("text", "")
-    print(f" -> Fixture 1 ({os.path.getsize(turn1_wav)} bytes) in {t_stt1:.1f}ms: '{transcript1}'")
+    raw_transcript1 = res1.get("raw_text", transcript1)
+    print(f" -> Fixture 1 ({os.path.getsize(turn1_wav)} bytes) in {t_stt1:.1f}ms: '{transcript1}' (raw: '{raw_transcript1}')")
 
     t0 = time.perf_counter()
     code2, res2 = http_post_multipart(f"{VOICE_SERVER_URL}/v1/audio/transcriptions", turn2_wav)
     t_stt2 = (time.perf_counter() - t0) * 1000
     assert code2 == 200, f"STT failed for turn 2 with {code2}"
     transcript2 = res2.get("text", "")
-    print(f" -> Fixture 2 ({os.path.getsize(turn2_wav)} bytes) in {t_stt2:.1f}ms: '{transcript2}'")
+    raw_transcript2 = res2.get("raw_text", transcript2)
+    print(f" -> Fixture 2 ({os.path.getsize(turn2_wav)} bytes) in {t_stt2:.1f}ms: '{transcript2}' (raw: '{raw_transcript2}')")
 
     report["stages"]["stt_benchmarks"] = {
         "configured_model": health_data.get("stt_model_configured"),
-        "turn1": {"duration_ms": round(t_stt1, 2), "transcript": transcript1},
-        "turn2": {"duration_ms": round(t_stt2, 2), "transcript": transcript2}
+        "turn1": {"duration_ms": round(t_stt1, 2), "transcript": transcript1, "raw_transcript": raw_transcript1},
+        "turn2": {"duration_ms": round(t_stt2, 2), "transcript": transcript2, "raw_transcript": raw_transcript2}
     }
     report["timings_ms"]["stt_turn1_ms"] = round(t_stt1, 2)
     report["timings_ms"]["stt_turn2_ms"] = round(t_stt2, 2)
@@ -300,9 +323,9 @@ def main():
             _, live_res, _ = http_json(f"{API_BASE_URL}/api/health/live")
             _, h_res, _ = http_json(f"{API_BASE_URL}/api/health")
             backend_available = True
-            cfg_llm = h_res.get("configuredLlmProvider")
-            cfg_stt = h_res.get("configuredSttProvider")
-            cfg_tts = h_res.get("configuredTtsProvider")
+            cfg_llm = (h_res.get("configuredLlmProvider") or "").strip()
+            cfg_stt = (h_res.get("configuredSttProvider") or "").strip()
+            cfg_tts = (h_res.get("configuredTtsProvider") or "").strip()
             print(f" -> Backend reachable (LLM: {cfg_llm}, STT: {cfg_stt}, TTS: {cfg_tts})")
             report["stages"]["backend_providers"] = {
                 "llm": cfg_llm,
@@ -310,9 +333,10 @@ def main():
                 "tts": cfg_tts
             }
             if args.strict:
-                assert cfg_llm != "DeterministicFake", f"Strict mode requires real LLM provider (Ollama), got {cfg_llm}"
-                assert cfg_stt not in ["Simulated"], f"Strict mode requires real STT provider, got {cfg_stt}"
-                assert cfg_tts not in ["Simulated"], f"Strict mode requires real TTS provider, got {cfg_tts}"
+                disallowed = ["deterministicfake", "simulated", "fake", "none", ""]
+                assert cfg_llm.lower() not in disallowed, f"Strict mode requires real LLM provider (Ollama), got '{cfg_llm}'"
+                assert cfg_stt.lower() not in disallowed, f"Strict mode requires real STT provider, got '{cfg_stt}'"
+                assert cfg_tts.lower() not in disallowed, f"Strict mode requires real TTS provider, got '{cfg_tts}'"
         except Exception as e:
             print(f"\n[Notice] Backend on {API_BASE_URL} not reachable ({e}).")
             if args.strict:
@@ -414,7 +438,13 @@ def main():
         print("\n - Inspecting Staged Booking Draft in Acceptance Database...")
         pending_record = None
         slot_before = None
-        if os.path.exists(DB_PATH):
+        if not os.path.exists(DB_PATH):
+            if args.strict:
+                print(f" [ERROR] Acceptance database not found at {DB_PATH} in strict mode.")
+                report["verifications"]["booking_lifecycle"] = f"FAILED: Missing DB {DB_PATH}"
+                persist_report(report)
+                sys.exit(1)
+        else:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             c.execute("SELECT Id, SlotId, CustomerName, CustomerPhone, ServiceName, RequestHash, Status FROM PendingBookings WHERE ConversationId = ? COLLATE NOCASE AND Status = 'Pending' ORDER BY CreatedAtUtc DESC LIMIT 1", (c_id,))
@@ -435,9 +465,15 @@ def main():
                     slot_before = {"total": srow[0], "booked": srow[1]}
             c.execute("SELECT COUNT(*) FROM Bookings WHERE ConversationId = ? COLLATE NOCASE", (c_id,))
             confirmed_before_count = c.fetchone()[0]
+
+            # Verify tool execution records in database
+            c.execute("SELECT ToolName, Status FROM ToolExecutions WHERE ConversationId = ? COLLATE NOCASE ORDER BY ExecutedAtUtc ASC", (c_id,))
+            tool_rows = c.fetchall()
+            tool_names = [tr[0] for tr in tool_rows]
             conn.close()
 
             print(f"    Pending Booking Found: {pending_record}")
+            print(f"    Recorded Tool Executions: {tool_rows}")
             print(f"    Confirmed Bookings in DB prior to confirmation: {confirmed_before_count} (Trust Boundary: PASS)")
             assert confirmed_before_count == 0, "No confirmed booking should exist before explicit server-side confirmation!"
             if args.strict:
@@ -445,6 +481,7 @@ def main():
                 assert pending_record["customerName"] == "محمد عاطف", f"Expected 'محمد عاطف', got '{pending_record['customerName']}'"
                 assert pending_record["customerPhone"] == "01012345678", f"Expected '01012345678', got '{pending_record['customerPhone']}'"
                 assert pending_record["serviceName"] == "كشف باطنة عامة", f"Expected 'كشف باطنة عامة', got '{pending_record['serviceName']}'"
+                assert "StageBooking" in tool_names, f"Expected StageBooking in tool executions, got {tool_names}"
 
         # 5.5 Explicit Server-Authorized Confirmation & Capacity Delta
         confirmed_booking_id = None
@@ -542,7 +579,18 @@ def main():
         t_inflight = threading.Thread(target=in_flight_turn_worker)
         t_inflight.start()
         turn_started_event.wait()
-        time.sleep(0.15)  # Wait 150ms to ensure request has entered active STT/orchestration on server
+
+        # Poll until work is demonstrably underway on server
+        observable_work_started = False
+        for _ in range(50):
+            try:
+                _, h_check, _ = http_json(f"{VOICE_SERVER_URL}/health", timeout=2)
+                if h_check.get("stt_active_workers", 0) > 0 or h_check.get("tts_active_workers", 0) > 0:
+                    observable_work_started = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.01)
 
         t0 = time.perf_counter()
         code_int, int_res, _ = http_json(f"{API_BASE_URL}/api/voice/interrupt", method="POST", payload={"sessionId": s_id}, headers=hdrs)
@@ -552,7 +600,7 @@ def main():
 
         t_inflight.join(timeout=10)
         assert in_flight_result["status_code"] == 499, f"Expected HTTP 499 (Client Closed Request / Interrupted), got {in_flight_result['status_code']}"
-        print(f" -> Active in-flight turn interrupted successfully: status={in_flight_result['status_code']} in {in_flight_result['duration_ms']:.1f}ms")
+        print(f" -> Active in-flight turn interrupted successfully: status={in_flight_result['status_code']} in {in_flight_result['duration_ms']:.1f}ms (Observable worker active: {observable_work_started})")
         print(f" -> Interrupt endpoint latency: {t_int:.1f}ms (interrupted={int_res.get('interrupted')})")
 
         settled = False
@@ -570,6 +618,7 @@ def main():
             "interrupt_latency_ms": round(t_int, 2),
             "interrupted_turn_status": in_flight_result["status_code"],
             "interrupted_turn_duration_ms": round(in_flight_result["duration_ms"], 2),
+            "observable_work_started": observable_work_started,
             "stt_active_workers_after": health_after_int.get("stt_active_workers", 0),
             "tts_active_workers_after": health_after_int.get("tts_active_workers", 0)
         }
@@ -578,16 +627,14 @@ def main():
         report["verifications"]["e2e_flow"] = "PASSED"
 
     # -----------------------------------------------------------------
-    # Stage 7: Persist & Report Artifacts
+    # Stage 7: Persist & Report Artifacts (guaranteed persistence)
     # -----------------------------------------------------------------
-    report_file = os.path.join(ARTIFACTS_DIR, "real_voice_verification_report.json")
-    with open(report_file, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+    persist_report(report)
 
     print("\n" + "=" * 78)
     print("                      VERIFICATION SUMMARY REPORT                      ")
     print("=" * 78)
-    print(f"Artifact File:           {report_file}")
+    print(f"Artifact File:           {os.path.join(ARTIFACTS_DIR, 'real_voice_verification_report.json')}")
     print(f"Server Health:           {report['verifications'].get('health_status', 'N/A')}")
     print(f"Active Supervision:      {report['verifications'].get('active_supervision', 'N/A')}")
     print(f"Container Rejection:     {report['verifications'].get('overlong_rejection', 'N/A')}")
@@ -595,15 +642,24 @@ def main():
     print(f"STT Turn 2:              {report['timings_ms'].get('stt_turn2_ms', 'N/A')} ms")
     print(f"Isolated TTS (Piper):    {report['timings_ms'].get('tts_isolated_ms', 'N/A')} ms")
     print(f"Active Health Check:     {report['timings_ms'].get('health_check_during_active_work_ms', 'N/A')} ms")
-    if "e2e_turn1" in report["stages"]:
+    if "e2e_turn1" in report.get("stages", {}):
         t1_b = report["stages"]["e2e_turn1"].get("backend_timings", {})
         print(f"Turn 1 Breakdown:        STT={t1_b.get('sttMs')}ms | LLM={t1_b.get('llmMs')}ms | TTS={t1_b.get('ttsMs')}ms | Total={report['stages']['e2e_turn1'].get('http_total_ms')}ms")
-    if "e2e_turn2" in report["stages"]:
+    if "e2e_turn2" in report.get("stages", {}):
         t2_b = report["stages"]["e2e_turn2"].get("backend_timings", {})
         print(f"Turn 2 Breakdown:        STT={t2_b.get('sttMs')}ms | LLM={t2_b.get('llmMs')}ms | TTS={t2_b.get('ttsMs')}ms | Total={report['stages']['e2e_turn2'].get('http_total_ms')}ms")
     print(f"Booking Lifecycle:       {report['verifications'].get('booking_lifecycle', 'N/A')}")
     print("=" * 78)
-    print("[SUCCESS] All real local voice pipeline verifications passed.\n")
+
+    if args.skip_backend:
+        print("[PARTIAL] Component-only mode completed successfully (backend E2E turns skipped).\n")
+    elif all(v == "PASSED" for v in report.get("verifications", {}).values()):
+        print("[SUCCESS] All real local voice pipeline verifications passed.\n")
+    else:
+        failed_items = [k for k, v in report.get("verifications", {}).items() if v != "PASSED"]
+        print(f"[FAILURE] The following verifications did not pass: {failed_items}\n")
+        if args.strict:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1304,6 +1304,7 @@ app.MapPost("/api/voice/turn", async (
     using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(turnContext.Token, ctx.RequestAborted);
     var token = linkedCts.Token;
 
+    var turnStartTimeUtc = DateTime.UtcNow;
     var turnSw = System.Diagnostics.Stopwatch.StartNew();
     double sttDurationMs = 0;
     double llmDurationMs = 0;
@@ -1424,10 +1425,35 @@ app.MapPost("/api/voice/turn", async (
             }
             else
             {
-                var hasAvailability = await db.ToolExecutions.AnyAsync(t => t.ConversationId == req.ConversationId && t.ToolName == "CheckAvailability" && t.Status == "Success", token);
-                if (hasAvailability)
+                // Only inspect CheckAvailability executed during the current turn (not stale previous turns)
+                var currentTurnAvailability = await db.ToolExecutions
+                    .Where(t => t.ConversationId == req.ConversationId && t.ToolName == "CheckAvailability" && t.ExecutedAtUtc >= turnStartTimeUtc)
+                    .OrderByDescending(t => t.ExecutedAtUtc)
+                    .FirstOrDefaultAsync(token);
+
+                if (currentTurnAvailability != null && currentTurnAvailability.Status == "Success" && !string.IsNullOrWhiteSpace(currentTurnAvailability.ResultJson))
                 {
-                    reply = "المواعيد متاحة في عيادة النور التخصصية، تحب أحجز لحضرتك ميعاد؟";
+                    bool hasSlots = false;
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(currentTurnAvailability.ResultJson);
+                        if (doc.RootElement.TryGetProperty("availableSlots", out var slotsElem) &&
+                            slotsElem.ValueKind == JsonValueKind.Array &&
+                            slotsElem.GetArrayLength() > 0)
+                        {
+                            hasSlots = true;
+                        }
+                    }
+                    catch { }
+
+                    if (hasSlots)
+                    {
+                        reply = "تم التحقق من المواعيد المتاحة في عيادة النور التخصصية، تحب أحجز لحضرتك ميعاد في المواعيد المتاحة؟";
+                    }
+                    else
+                    {
+                        reply = "لا توجد مواعيد متاحة حالياً في التاريخ المطلوب بعيادة النور التخصصية، تحب نقترح على حضرتك أقرب موعد بديل؟";
+                    }
                 }
                 else
                 {

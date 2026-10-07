@@ -90,6 +90,29 @@ public class VerticalSliceTests
     }
 
     [Fact]
+    public async Task CheckAvailabilityTool_WhenEntireSystemHasNoSlots_ReturnsEmptyAvailableSlots()
+    {
+        // Arrange
+        using var db = CreateInMemoryDb();
+        // Do NOT seed slots; empty database
+        var tool = new CheckAvailabilityTool(db);
+        using var argsDoc = JsonDocument.Parse("{\"date\":\"2026-10-15\",\"service\":\"كشف باطنة عامة\"}");
+
+        // Act
+        var result = await tool.ExecuteAsync(argsDoc.RootElement, Guid.NewGuid(), CancellationToken.None);
+
+        // Assert
+        Assert.True(result.Success);
+        Assert.Contains("لا توجد أي مواعيد متاحة حالياً", result.Message);
+        Assert.NotNull(result.Data);
+
+        var dataJson = JsonSerializer.Serialize(result.Data);
+        using var doc = JsonDocument.Parse(dataJson);
+        var slots = doc.RootElement.GetProperty("availableSlots");
+        Assert.Equal(0, slots.GetArrayLength());
+    }
+
+    [Fact]
     public async Task StageBooking_Creates_PendingBooking_AwaitingConfirmation()
     {
         // Arrange

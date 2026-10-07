@@ -119,12 +119,13 @@ class TestVoiceServerLifecycle(unittest.TestCase):
     def test_stt_cancellation_during_pyav_decode(self):
         """
         Verifies that when client disconnects during PyAV container decoding,
-        the stop_event halts decoding early, the temporary file is deleted,
-        and capacity is safely released.
+        the stop_event halts decoding early, the temporary file is retained during execution
+        and deleted upon completion, and capacity is safely released.
         """
         async def run_test():
             decode_started = threading.Event()
             stop_event = threading.Event()
+            captured_tmp_path = None
 
             # Create minimal valid audio file
             buf = io.BytesIO()
@@ -139,9 +140,13 @@ class TestVoiceServerLifecycle(unittest.TestCase):
             mock_model = MagicMock()
             voice_server.whisper_model = mock_model
 
-            # Mock validate_audio_container_and_duration_sync to verify stop_event
+            # Mock validate_audio_container_and_duration_sync to verify stop_event and temp file
             def mock_validate(path, ev):
+                nonlocal captured_tmp_path
+                captured_tmp_path = path
                 decode_started.set()
+                # Assert temp file exists while decoding is active
+                self.assertTrue(os.path.exists(path), "Temporary file must exist during active decoding!")
                 # Wait until client disconnect sets the event
                 for _ in range(50):
                     if ev and ev.is_set():
@@ -165,17 +170,24 @@ class TestVoiceServerLifecycle(unittest.TestCase):
 
                 self.assertEqual(ctx.exception.status_code, 499)
 
-            # Wait for cleanup
-            await asyncio.sleep(0.1)
+            # Wait for background worker cleanup
+            for _ in range(50):
+                if len(voice_server._active_stt_tasks) == 0:
+                    break
+                await asyncio.sleep(0.01)
+
             self.assertEqual(len(voice_server._active_stt_tasks), 0)
             self.assertEqual(voice_server.stt_semaphore._value, voice_server.STT_CONCURRENCY)
+            self.assertIsNotNone(captured_tmp_path)
+            self.assertFalse(os.path.exists(captured_tmp_path), "Temporary file must be deleted after worker cleanup!")
 
         asyncio.run(run_test())
 
     def test_asgi_task_cancellation_preserves_capacity_until_thread_completion(self):
         """
         Tests ASGI cancellation (asyncio.CancelledError injected into request handler)
-        and verifies capacity and active worker tracking are held until worker completes.
+        and verifies capacity and active worker tracking are held while worker is blocked,
+        and released cleanly only after worker completion.
         """
         async def run_test():
             worker_started = threading.Event()
@@ -216,14 +228,22 @@ class TestVoiceServerLifecycle(unittest.TestCase):
 
             self.assertTrue(worker_started.is_set())
 
-            # Cancel the ASGI task
-            task.cancel()
+            # Verification while worker is blocked during cancellation
+            async def verify_and_release():
+                await asyncio.sleep(0.05)
+                # Worker thread is STILL BLOCKED because worker_can_finish is not yet set!
+                self.assertFalse(worker_finished.is_set(), "Worker should still be running while blocked!")
+                self.assertEqual(len(voice_server._active_tts_tasks), 1, "Active worker must remain tracked!")
+                self.assertLess(voice_server.tts_semaphore._value, voice_server.TTS_CONCURRENCY, "Capacity permit must be held!")
+                worker_can_finish.set()
 
-            # Now allow worker to finish
-            worker_can_finish.set()
+            verifier = asyncio.create_task(verify_and_release())
+            task.cancel()
 
             with self.assertRaises(asyncio.CancelledError):
                 await task
+
+            await verifier
 
             # Wait for worker cleanup
             for _ in range(50):
@@ -239,44 +259,66 @@ class TestVoiceServerLifecycle(unittest.TestCase):
 
     def test_repeated_in_flight_cancellations_with_clean_recovery(self):
         """
-        Simulates 5 back-to-back in-flight cancellations, asserting active worker
-        tracking and semaphore permits at each step, followed by a valid 200 OK request.
+        Simulates 5 back-to-back in-flight cancellations where the worker has genuinely started
+        before disconnect is observed, asserting active worker tracking and permits at each step,
+        followed by a valid 200 OK request.
         """
         async def run_test():
-            mock_voice = MagicMock()
-
-            def cancellable_synthesize(text):
-                for _ in range(3):
-                    chunk = MagicMock()
-                    chunk.audio_int16_bytes = b"\x00" * 800
-                    time.sleep(0.01)
-                    yield chunk
-
-            mock_voice.synthesize = cancellable_synthesize
-            voice_server.piper_voice = mock_voice
-
             for i in range(5):
+                worker_started = threading.Event()
+                worker_finished = threading.Event()
+
+                mock_voice = MagicMock()
+
+                def in_flight_synthesize(text):
+                    worker_started.set()
+                    try:
+                        for _ in range(5):
+                            chunk = MagicMock()
+                            chunk.audio_int16_bytes = b"\x00" * 800
+                            time.sleep(0.02)
+                            yield chunk
+                    finally:
+                        worker_finished.set()
+
+                mock_voice.synthesize = in_flight_synthesize
+                voice_server.piper_voice = mock_voice
+
                 async def mock_disc():
-                    return True
+                    # Return True only after worker has demonstrably started
+                    return worker_started.is_set()
 
                 req = MagicMock(spec=Request)
                 req.is_disconnected = mock_disc
-                payload = voice_server.SpeechRequest(input=f"طلب ملغى متكرر {i}")
+                payload = voice_server.SpeechRequest(input=f"طلب ملغى متكرر أثناء العمل {i}")
 
                 with self.assertRaises(HTTPException) as exc:
                     await voice_server.synthesize_speech(req, payload)
                 self.assertEqual(exc.exception.status_code, 499)
 
-                # Wait for worker to exit
+                # Worker was started and running in flight
+                self.assertTrue(worker_started.is_set(), f"Worker must have started for cancellation {i}")
+
+                # Wait for worker to exit cleanly
                 for _ in range(50):
-                    if len(voice_server._active_tts_tasks) == 0:
+                    if worker_finished.is_set() and len(voice_server._active_tts_tasks) == 0:
                         break
                     await asyncio.sleep(0.01)
 
+                self.assertTrue(worker_finished.is_set())
                 self.assertEqual(len(voice_server._active_tts_tasks), 0)
                 self.assertEqual(voice_server.tts_semaphore._value, voice_server.TTS_CONCURRENCY)
 
             # Subsequent normal request succeeds completely
+            normal_mock_voice = MagicMock()
+            def fast_synthesize(text):
+                chunk = MagicMock()
+                chunk.audio_int16_bytes = b"\x00" * 1600
+                yield chunk
+
+            normal_mock_voice.synthesize = fast_synthesize
+            voice_server.piper_voice = normal_mock_voice
+
             async def normal_disc():
                 return False
 
@@ -288,6 +330,77 @@ class TestVoiceServerLifecycle(unittest.TestCase):
             self.assertEqual(resp.status_code, 200)
             self.assertGreater(len(resp.body), 44)
             self.assertTrue(resp.body.startswith(b"RIFF"))
+            self.assertEqual(len(voice_server._active_tts_tasks), 0)
+            self.assertEqual(voice_server.tts_semaphore._value, voice_server.TTS_CONCURRENCY)
+
+        asyncio.run(run_test())
+
+    def test_worker_exception_after_http_deadline_is_observed_and_cleans_up(self):
+        """
+        Verifies that when a worker task raises an exception after the HTTP 5.0s wait deadline
+        has already expired (and 499 was returned), the exception is observed by the task's
+        done callback without unhandled errors, active worker count clears, and capacity restores.
+        """
+        async def run_test():
+            worker_started = threading.Event()
+            worker_can_fail = threading.Event()
+            worker_finished = threading.Event()
+
+            mock_voice = MagicMock()
+
+            def failing_synthesize(text):
+                worker_started.set()
+                try:
+                    chunk = MagicMock()
+                    chunk.audio_int16_bytes = b"\x00" * 1600
+                    yield chunk
+                    # Block until deadline in HTTP handler expires
+                    worker_can_fail.wait(timeout=10.0)
+                    raise RuntimeError("Simulated worker error after HTTP deadline expiration")
+                finally:
+                    worker_finished.set()
+
+            mock_voice.synthesize = failing_synthesize
+            voice_server.piper_voice = mock_voice
+
+            async def mock_disc():
+                return worker_started.is_set()
+
+            req = MagicMock(spec=Request)
+            req.is_disconnected = mock_disc
+            payload = voice_server.SpeechRequest(input="اختبار فشل العامل بعد مهلة HTTP")
+
+            real_wait_for = asyncio.wait_for
+            with patch("scripts.voice_server.asyncio.wait_for") as mock_wait_for:
+                async def patched_wait_for(fut, timeout):
+                    if timeout == 5.0:
+                        await asyncio.sleep(0.05)
+                        raise asyncio.TimeoutError()
+                    return await real_wait_for(fut, timeout=timeout)
+                mock_wait_for.side_effect = patched_wait_for
+
+                task = asyncio.create_task(
+                    voice_server.synthesize_speech(req, payload)
+                )
+
+                with self.assertRaises(HTTPException) as ctx:
+                    await task
+
+                self.assertEqual(ctx.exception.status_code, 499)
+
+            # Handler exited, worker is still running
+            self.assertFalse(worker_finished.is_set())
+            self.assertEqual(len(voice_server._active_tts_tasks), 1)
+
+            # Now let worker fail with exception
+            worker_can_fail.set()
+
+            for _ in range(50):
+                if worker_finished.is_set() and len(voice_server._active_tts_tasks) == 0:
+                    break
+                await asyncio.sleep(0.02)
+
+            self.assertTrue(worker_finished.is_set())
             self.assertEqual(len(voice_server._active_tts_tasks), 0)
             self.assertEqual(voice_server.tts_semaphore._value, voice_server.TTS_CONCURRENCY)
 
