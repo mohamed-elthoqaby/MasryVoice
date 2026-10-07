@@ -9,7 +9,9 @@ using Microsoft.Extensions.DependencyInjection;
 using MasryVoice.Api.Domain;
 using MasryVoice.Api.Features.Security;
 using MasryVoice.Api.Features.Tools;
+using MasryVoice.Api.Features.Voice;
 using MasryVoice.Api.Infrastructure.Persistence;
+using MasryVoice.Api.Infrastructure.Providers;
 using Xunit;
 
 namespace MasryVoice.Tests;
@@ -57,6 +59,18 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
                 {
                     options.UseSqlite($"Data Source={dbName}");
                 });
+
+                var llmDesc = services.FirstOrDefault(d => d.ServiceType == typeof(ILlmProvider));
+                if (llmDesc != null) services.Remove(llmDesc);
+                services.AddSingleton<ILlmProvider, DeterministicFakeLlmProvider>();
+
+                var sttDesc = services.FirstOrDefault(d => d.ServiceType == typeof(ISttProvider));
+                if (sttDesc != null) services.Remove(sttDesc);
+                services.AddSingleton<ISttProvider, SimulatedSttProvider>();
+
+                var ttsDesc = services.FirstOrDefault(d => d.ServiceType == typeof(ITtsProvider));
+                if (ttsDesc != null) services.Remove(ttsDesc);
+                services.AddSingleton<ITtsProvider, SimulatedTtsProvider>();
             });
         });
     }

@@ -158,17 +158,18 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 
 // 5. Register HTTP Client & LLM Provider
 builder.Services.AddHttpClient();
-
-var llmChoice = builder.Configuration["LlmProvider"] ?? "Ollama";
-if (llmChoice.Equals("DeterministicFake", StringComparison.OrdinalIgnoreCase))
+builder.Services.AddSingleton<DeterministicFakeLlmProvider>();
+builder.Services.AddHttpClient<OllamaLlmProvider>();
+builder.Services.AddTransient<ILlmProvider>(sp =>
 {
-    builder.Services.AddSingleton<ILlmProvider, DeterministicFakeLlmProvider>();
-}
-else
-{
-    builder.Services.AddHttpClient<OllamaLlmProvider>();
-    builder.Services.AddTransient<ILlmProvider, OllamaLlmProvider>();
-}
+    var config = sp.GetRequiredService<IConfiguration>();
+    var choice = config["LlmProvider"] ?? (builder.Environment.IsEnvironment("Testing") ? "DeterministicFake" : "Ollama");
+    if (choice.Equals("DeterministicFake", StringComparison.OrdinalIgnoreCase))
+    {
+        return sp.GetRequiredService<DeterministicFakeLlmProvider>();
+    }
+    return sp.GetRequiredService<OllamaLlmProvider>();
+});
 
 // 6. Register Security & Auth Service
 builder.Services.AddSingleton<ISecurityService, SecurityService>();
@@ -209,37 +210,46 @@ builder.Services.AddScoped<ToolRegistry>();
 builder.Services.AddScoped<AgentOrchestrator>();
 
 // 11. Register Speech Pipeline & Voice Session
-var sttProviderType = builder.Configuration["Voice:SttProvider"] ?? "Simulated";
-if (sttProviderType.Equals("Whisper", StringComparison.OrdinalIgnoreCase) ||
-    sttProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
-{
-    var sttBaseUrl = builder.Configuration["Voice:SttBaseUrl"] ?? "http://127.0.0.1:8000";
-    builder.Services.AddHttpClient<ISttProvider, WhisperSttProvider>(c =>
-    {
-        c.BaseAddress = new Uri(sttBaseUrl);
-        c.Timeout = TimeSpan.FromSeconds(30);
-    });
-}
-else
-{
-    builder.Services.AddSingleton<ISttProvider, SimulatedSttProvider>();
-}
+builder.Services.AddSingleton<SimulatedSttProvider>();
+builder.Services.AddSingleton<SimulatedTtsProvider>();
 
-var ttsProviderType = builder.Configuration["Voice:TtsProvider"] ?? "Simulated";
-if (ttsProviderType.Equals("LocalEgyptian", StringComparison.OrdinalIgnoreCase) ||
-    ttsProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
+var sttBaseUrl = builder.Configuration["Voice:SttBaseUrl"] ?? "http://127.0.0.1:8000";
+builder.Services.AddHttpClient<WhisperSttProvider>(c =>
 {
-    var ttsBaseUrl = builder.Configuration["Voice:TtsBaseUrl"] ?? "http://127.0.0.1:8000";
-    builder.Services.AddHttpClient<ITtsProvider, LocalEgyptianTtsProvider>(c =>
+    c.BaseAddress = new Uri(sttBaseUrl);
+    c.Timeout = TimeSpan.FromSeconds(30);
+});
+
+var ttsBaseUrl = builder.Configuration["Voice:TtsBaseUrl"] ?? "http://127.0.0.1:8000";
+builder.Services.AddHttpClient<LocalEgyptianTtsProvider>(c =>
+{
+    c.BaseAddress = new Uri(ttsBaseUrl);
+    c.Timeout = TimeSpan.FromSeconds(30);
+});
+
+builder.Services.AddTransient<ISttProvider>(sp =>
+{
+    var config = sp.GetRequiredService<IConfiguration>();
+    var sttProviderType = config["Voice:SttProvider"] ?? "Simulated";
+    if (sttProviderType.Equals("Whisper", StringComparison.OrdinalIgnoreCase) ||
+        sttProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
     {
-        c.BaseAddress = new Uri(ttsBaseUrl);
-        c.Timeout = TimeSpan.FromSeconds(30);
-    });
-}
-else
+        return sp.GetRequiredService<WhisperSttProvider>();
+    }
+    return sp.GetRequiredService<SimulatedSttProvider>();
+});
+
+builder.Services.AddTransient<ITtsProvider>(sp =>
 {
-    builder.Services.AddSingleton<ITtsProvider, SimulatedTtsProvider>();
-}
+    var config = sp.GetRequiredService<IConfiguration>();
+    var ttsProviderType = config["Voice:TtsProvider"] ?? "Simulated";
+    if (ttsProviderType.Equals("LocalEgyptian", StringComparison.OrdinalIgnoreCase) ||
+        ttsProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
+    {
+        return sp.GetRequiredService<LocalEgyptianTtsProvider>();
+    }
+    return sp.GetRequiredService<SimulatedTtsProvider>();
+});
 builder.Services.AddSingleton<VoiceSessionManager>();
 builder.Services.AddSingleton<VoiceAdmissionManager>();
 

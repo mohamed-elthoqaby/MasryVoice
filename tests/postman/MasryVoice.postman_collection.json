@@ -1657,11 +1657,15 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{voiceCustomerToken}}"
               }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"text\": \"أهلاً بحضرتك يا فندم في عيادة النور التخصصية\",\n  \"languageCode\": \"ar-EG\"\n}"
+              "raw": "{\n  \"text\": \"أهلاً بحضرتك يا فندم في عيادة النور التخصصية\",\n  \"languageCode\": \"ar-EG\",\n  \"conversationId\": \"{{voiceConversationId}}\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/voice/tts",
