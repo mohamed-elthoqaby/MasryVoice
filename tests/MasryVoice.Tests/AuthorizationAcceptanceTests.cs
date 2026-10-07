@@ -1038,12 +1038,17 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
         var (sessionId, convId, token) = await CreateSessionAsync(client);
         client.DefaultRequestHeaders.Add("X-Customer-Token", token);
 
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var agent = await db.Agents.FirstAsync(a => a.IsActive);
+
         // Provide a valid small audio base64 payload
         var dummyAudioBase64 = Convert.ToBase64String(new byte[] { 82, 73, 70, 70, 36, 0, 0, 0, 87, 65, 86, 69 });
         var turnRequest = new
         {
             sessionId = sessionId,
             conversationId = convId,
+            agentId = agent.Id,
             audioBase64 = dummyAudioBase64
         };
 

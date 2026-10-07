@@ -1286,17 +1286,26 @@ app.MapPost("/api/voice/turn", async (
             return Results.BadRequest(new { message = "Message text or audio is required." });
         }
 
-        // Fallback to active agent if AgentId is empty
+        // Fallback to conversation AgentId or first active agent if AgentId is empty
         Guid effectiveAgentId = req.AgentId;
         if (effectiveAgentId == Guid.Empty)
         {
-            var activeAgent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.IsActive, token);
-            if (activeAgent != null)
+            var conv = await db.Conversations.AsNoTracking().FirstOrDefaultAsync(c => c.Id == req.ConversationId, token);
+            if (conv != null && conv.AgentId != Guid.Empty)
             {
-                effectiveAgentId = activeAgent.Id;
+                effectiveAgentId = conv.AgentId;
+            }
+            else
+            {
+                var activeAgent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.IsActive, token);
+                if (activeAgent != null)
+                {
+                    effectiveAgentId = activeAgent.Id;
+                }
             }
         }
 
+        string? orchestratorError = null;
         // Process user message through LLM orchestrator (acquires and releases LLM permit internally)
         await foreach (var chatEvent in orchestrator.ProcessUserMessageAsync(effectiveAgentId, req.ConversationId, userMessage, token))
         {
@@ -1305,11 +1314,20 @@ app.MapPost("/api/voice/turn", async (
             {
                 assistantText.Append(chatEvent.Content);
             }
+            else if (chatEvent.EventType == "error")
+            {
+                orchestratorError = chatEvent.Content;
+            }
         }
 
         if (token.IsCancellationRequested || !session.IsTurnActive(turnContext.TurnId))
         {
             return Results.StatusCode(499); // Client Closed Request / Interrupted
+        }
+
+        if (!string.IsNullOrEmpty(orchestratorError) && assistantText.Length == 0)
+        {
+            return Results.Problem(detail: orchestratorError, statusCode: StatusCodes.Status500InternalServerError);
         }
 
         var reply = assistantText.ToString();
