@@ -57,9 +57,11 @@ TestResults/
 recordings/
 audio_samples/
 
-# External Tools / Downloaded Repositories
+# External Tools / Downloaded Repositories & Models
 skills-main/
 scratch/
+models/
+tests/artifacts/
 .venv*/
 __pycache__/
 *.pyc

@@ -167,6 +167,8 @@ export default function Dashboard() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const micIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const recordingSessionIdRef = useRef<number>(0);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
 
   // Settings form state
   const [agentForm, setAgentForm] = useState<Partial<Agent>>({});
@@ -181,6 +183,14 @@ export default function Dashboard() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // Clean up recording tracks and intervals on component unmount
+  useEffect(() => {
+    return () => {
+      if (micIntervalRef.current) clearInterval(micIntervalRef.current);
+      if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(t => t.stop());
+    };
+  }, []);
 
   // Load persisted session and admin keys from browser sessionStorage on mount
   useEffect(() => {
@@ -433,6 +443,8 @@ export default function Dashboard() {
       return;
     }
 
+    const currentRecId = ++recordingSessionIdRef.current;
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -442,6 +454,13 @@ export default function Dashboard() {
         }
       });
 
+      if (currentRecId !== recordingSessionIdRef.current) {
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
+
+      mediaStreamRef.current = stream;
+
       const mimeTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4', ''];
       const supportedMime = mimeTypes.find(t => !t || (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t))) || '';
 
@@ -450,13 +469,16 @@ export default function Dashboard() {
       audioChunksRef.current = [];
 
       recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
+        if (e.data && e.data.size > 0 && currentRecId === recordingSessionIdRef.current) {
           audioChunksRef.current.push(e.data);
         }
       };
 
       recorder.onstop = async () => {
-        stream.getTracks().forEach(track => track.stop());
+        if (mediaStreamRef.current) {
+          mediaStreamRef.current.getTracks().forEach(track => track.stop());
+          mediaStreamRef.current = null;
+        }
         if (micIntervalRef.current) {
           clearInterval(micIntervalRef.current);
           micIntervalRef.current = null;
@@ -464,6 +486,11 @@ export default function Dashboard() {
         setIsRecordingMic(false);
         setIsRecording(false);
         setMicDuration(0);
+
+        // Guard against obsolete recording identities
+        if (currentRecId !== recordingSessionIdRef.current) {
+          return;
+        }
 
         const chunks = audioChunksRef.current;
         if (chunks.length === 0) return;
@@ -479,10 +506,11 @@ export default function Dashboard() {
 
         const reader = new FileReader();
         reader.onloadend = async () => {
+          if (currentRecId !== recordingSessionIdRef.current) return;
           const base64Data = (reader.result as string)?.split(',')[1];
           if (base64Data) {
             if (targetMode === 'voice') {
-              await handleSendVoiceTurn(undefined, base64Data);
+              await handleSendVoiceTurn(undefined, base64Data, mime);
             } else {
               // For chat, send audio to STT then send user message
               try {
@@ -499,9 +527,10 @@ export default function Dashboard() {
                   headers,
                   body: formData
                 });
+                if (currentRecId !== recordingSessionIdRef.current) return;
                 if (sttRes.ok) {
                   const data = await sttRes.json();
-                  if (data.text) {
+                  if (data.text && currentRecId === recordingSessionIdRef.current) {
                     handleSendMessage(data.text);
                   }
                 }
@@ -544,7 +573,15 @@ export default function Dashboard() {
 
   const stopVoiceRecording = () => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      mediaRecorderRef.current.stop();
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (err) {
+        console.error('Error stopping recorder:', err);
+      }
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(t => t.stop());
+      mediaStreamRef.current = null;
     }
   };
 
@@ -642,6 +679,8 @@ export default function Dashboard() {
     if (!voiceSessionId) return;
     isInterruptedRef.current = true;
     activeVoiceRequestIdRef.current++; // Invalidate any pending in-flight request
+    recordingSessionIdRef.current++;   // Invalidate any active recording
+    stopVoiceRecording();
     setIsVoiceProcessing(false);
     try {
       if (audioPlayerRef.current) {
@@ -664,7 +703,7 @@ export default function Dashboard() {
     }
   };
 
-  const handleSendVoiceTurn = async (messageText?: string, audioBase64?: string) => {
+  const handleSendVoiceTurn = async (messageText?: string, audioBase64?: string, mimeType?: string) => {
     const textToSend = messageText !== undefined ? messageText : voiceText;
     if ((!textToSend.trim() && !audioBase64) || !selectedAgent) return;
     isInterruptedRef.current = false;
@@ -704,7 +743,8 @@ export default function Dashboard() {
           conversationId: currentConv,
           agentId: selectedAgent.id,
           message: textToSend || null,
-          audioBase64: audioBase64 || null
+          audioBase64: audioBase64 || null,
+          mimeType: mimeType || null
         })
       });
 

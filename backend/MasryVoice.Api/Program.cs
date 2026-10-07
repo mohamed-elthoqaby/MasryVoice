@@ -251,7 +251,14 @@ builder.Services.AddTransient<ITtsProvider>(sp =>
     return sp.GetRequiredService<SimulatedTtsProvider>();
 });
 builder.Services.AddSingleton<VoiceSessionManager>();
-builder.Services.AddSingleton<VoiceAdmissionManager>();
+var voiceAdmissionOptions = new VoiceAdmissionOptions
+{
+    MaxConcurrentStt = int.TryParse(builder.Configuration["Voice:MaxConcurrentStt"], out var sttC) ? sttC : 2,
+    MaxConcurrentTts = int.TryParse(builder.Configuration["Voice:MaxConcurrentTts"], out var ttsC) ? ttsC : 2,
+    MaxQueueLength = int.TryParse(builder.Configuration["Voice:MaxQueueLength"], out var qLen) ? qLen : 5,
+    QueueWaitTimeoutSeconds = int.TryParse(builder.Configuration["Voice:QueueWaitTimeoutSeconds"], out var qTo) ? qTo : 15
+};
+builder.Services.AddSingleton(new VoiceAdmissionManager(voiceAdmissionOptions));
 
 // 12. Register Durable Outbox Processor Background Service
 builder.Services.AddHostedService<DurableOutboxProcessor>();
@@ -1173,9 +1180,15 @@ app.MapPost("/api/voice/stt", async (
         var transcribed = await stt.TranscribeAudioAsync(stream, file.ContentType ?? "audio/wav", "ar", linkedCts.Token);
         return Results.Ok(new { text = transcribed });
     }
-    catch (VoiceOverloadException)
+    catch (VoiceOverloadException ex)
     {
-        return Results.StatusCode(StatusCodes.Status429TooManyRequests);
+        ctx.Response.Headers.RetryAfter = ex.RetryAfterSeconds.ToString();
+        return Results.Json(new
+        {
+            code = ex.Code,
+            message = ex.Message,
+            retryAfterSeconds = ex.RetryAfterSeconds
+        }, statusCode: StatusCodes.Status429TooManyRequests);
     }
     catch (OperationCanceledException)
     {
@@ -1230,9 +1243,15 @@ app.MapPost("/api/voice/tts", async (
         var audio = await tts.SynthesizeSpeechAsync(req.Text, req.LanguageCode ?? "ar-EG", linkedCts.Token);
         return Results.File(audio.ToArray(), "audio/wav");
     }
-    catch (VoiceOverloadException)
+    catch (VoiceOverloadException ex)
     {
-        return Results.StatusCode(StatusCodes.Status429TooManyRequests);
+        ctx.Response.Headers.RetryAfter = ex.RetryAfterSeconds.ToString();
+        return Results.Json(new
+        {
+            code = ex.Code,
+            message = ex.Message,
+            retryAfterSeconds = ex.RetryAfterSeconds
+        }, statusCode: StatusCodes.Status429TooManyRequests);
     }
     catch (OperationCanceledException)
     {
@@ -1283,17 +1302,54 @@ app.MapPost("/api/voice/turn", async (
         // If audio base64 is provided instead of text, transcribe with STT under bounded admission
         if (string.IsNullOrWhiteSpace(userMessage) && !string.IsNullOrWhiteSpace(req.AudioBase64))
         {
-            var audioBytes = Convert.FromBase64String(req.AudioBase64);
+            // 1. Route-specific buffering check: max ~14MB base64 string
+            if (req.AudioBase64.Length > 14 * 1024 * 1024)
+            {
+                return Results.Json(new { code = "AUDIO_PAYLOAD_TOO_LARGE", message = "حجم تشفير الصوت يتجاوز الحد المسموح به (10 ميجابايت)." }, statusCode: StatusCodes.Status413PayloadTooLarge);
+            }
+
+            // 2. Safe Base64 decoding
+            byte[] audioBytes;
+            try
+            {
+                audioBytes = Convert.FromBase64String(req.AudioBase64);
+            }
+            catch (FormatException)
+            {
+                return Results.BadRequest(new { code = "INVALID_BASE64_AUDIO", message = "ترميز الصوت بتنسيق Base64 غير صالح أو تالف." });
+            }
+
+            // 3. Decoded size bounds
+            if (audioBytes.Length > 10 * 1024 * 1024)
+            {
+                return Results.Json(new { code = "AUDIO_SIZE_EXCEEDED", message = "حجم ملف الصوت يتجاوز الحد الأقصى المسموح به (10 ميجابايت)." }, statusCode: StatusCodes.Status413PayloadTooLarge);
+            }
+            if (audioBytes.Length < 12)
+            {
+                return Results.BadRequest(new { code = "AUDIO_TRUNCATED_OR_CORRUPT", message = "ملف الصوت مبتور أو لا يحتوي على ترويسة صالحة." });
+            }
+
+            // 4. Server-side duration inspection (30s limit)
+            var durationSec = AudioDurationHelper.EstimateDurationSeconds(audioBytes);
+            if (durationSec.HasValue && durationSec.Value > 30.5)
+            {
+                return Results.BadRequest(new { code = "AUDIO_DURATION_EXCEEDED", message = $"مدة التسجيل الصوتي ({durationSec.Value:F1} ثانية) تتجاوز الحد الأقصى المسموح به وهو 30 ثانية." });
+            }
+
+            // 5. Container & MIME preservation
+            var effectiveMime = !string.IsNullOrWhiteSpace(req.MimeType) ? req.MimeType
+                : (audioBytes.Length >= 4 && audioBytes[0] == (byte)'R' && audioBytes[1] == (byte)'I' ? "audio/wav" : "audio/webm");
+
             using (var sttPermit = await admission.AcquireSttPermitAsync(token))
             using (var audioStream = new MemoryStream(audioBytes))
             {
-                userMessage = await stt.TranscribeAudioAsync(audioStream, "audio/wav", "ar", token);
+                userMessage = await stt.TranscribeAudioAsync(audioStream, effectiveMime, "ar", token);
             }
         }
 
         if (string.IsNullOrWhiteSpace(userMessage))
         {
-            return Results.BadRequest(new { message = "Message text or audio is required." });
+            return Results.BadRequest(new { code = "MESSAGE_OR_AUDIO_REQUIRED", message = "النص أو الصوت مطلوب لإتمام الجولة الصوتية." });
         }
 
         // Fallback to conversation AgentId or first active agent if AgentId is empty
@@ -1359,9 +1415,15 @@ app.MapPost("/api/voice/turn", async (
             audioBase64 = Convert.ToBase64String(audioBytesOut.ToArray())
         });
     }
-    catch (VoiceOverloadException)
+    catch (VoiceOverloadException ex)
     {
-        return Results.StatusCode(StatusCodes.Status429TooManyRequests);
+        ctx.Response.Headers.RetryAfter = ex.RetryAfterSeconds.ToString();
+        return Results.Json(new
+        {
+            code = ex.Code,
+            message = ex.Message,
+            retryAfterSeconds = ex.RetryAfterSeconds
+        }, statusCode: StatusCodes.Status429TooManyRequests);
     }
     catch (OperationCanceledException)
     {
@@ -1438,7 +1500,8 @@ public record VoiceTurnRequest(
     Guid ConversationId,
     Guid AgentId,
     string? Message = null,
-    string? AudioBase64 = null
+    string? AudioBase64 = null,
+    string? MimeType = null
 );
 
 public partial class Program { }

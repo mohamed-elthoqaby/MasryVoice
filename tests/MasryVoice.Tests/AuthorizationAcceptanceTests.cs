@@ -1077,5 +1077,86 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
         Assert.True(json.TryGetProperty("audioBase64", out var audioBase64Prop));
         Assert.False(string.IsNullOrWhiteSpace(audioBase64Prop.GetString()));
     }
+
+    [Fact]
+    public async Task VoiceTurn_Enforces_AudioSize_And_InvalidBase64_And_DurationLimits()
+    {
+        var client = _factory.CreateClient();
+        var (sessionId, convId, token) = await CreateSessionAsync(client);
+        client.DefaultRequestHeaders.Add("X-Customer-Token", token);
+
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var agent = await db.Agents.FirstAsync(a => a.IsActive);
+
+        // 1. Invalid Base64 audio -> 400 Bad Request
+        var invalidB64Res = await client.PostAsJsonAsync("/api/voice/turn", new
+        {
+            sessionId,
+            conversationId = convId,
+            agentId = agent.Id,
+            audioBase64 = "not-valid-base64%%%!!!"
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, invalidB64Res.StatusCode);
+        var b64Err = await invalidB64Res.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("INVALID_BASE64_AUDIO", b64Err.GetProperty("code").GetString());
+
+        // 2. Truncated audio (< 12 bytes) -> 400 Bad Request
+        var truncatedB64 = Convert.ToBase64String(new byte[] { 1, 2, 3 });
+        var truncRes = await client.PostAsJsonAsync("/api/voice/turn", new
+        {
+            sessionId,
+            conversationId = convId,
+            agentId = agent.Id,
+            audioBase64 = truncatedB64
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, truncRes.StatusCode);
+        var truncErr = await truncRes.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("AUDIO_TRUNCATED_OR_CORRUPT", truncErr.GetProperty("code").GetString());
+
+        // 3. Audio duration exceeded (> 30s) -> 400 Bad Request
+        // Build valid WAV header with byteRate=32000 (16kHz 16-bit Mono) and 35 seconds of data (35 * 32000 = 1120000 bytes)
+        using var ms = new MemoryStream();
+        using (var writer = new BinaryWriter(ms))
+        {
+            writer.Write("RIFF"u8);
+            writer.Write(36 + 1120000);
+            writer.Write("WAVE"u8);
+            writer.Write("fmt "u8);
+            writer.Write(16);
+            writer.Write((short)1); // PCM
+            writer.Write((short)1); // Mono
+            writer.Write(16000);    // SampleRate
+            writer.Write(32000);    // ByteRate
+            writer.Write((short)2); // BlockAlign
+            writer.Write((short)16);// BitsPerSample
+            writer.Write("data"u8);
+            writer.Write(1120000);  // 35 seconds
+            writer.Write(new byte[64]); // small buffer to satisfy length check
+        }
+        var overlongB64 = Convert.ToBase64String(ms.ToArray());
+        var overlongRes = await client.PostAsJsonAsync("/api/voice/turn", new
+        {
+            sessionId,
+            conversationId = convId,
+            agentId = agent.Id,
+            audioBase64 = overlongB64
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, overlongRes.StatusCode);
+        var overlongErr = await overlongRes.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("AUDIO_DURATION_EXCEEDED", overlongErr.GetProperty("code").GetString());
+
+        // 4. Oversized payload (> 10MB) -> 413 Payload Too Large
+        var oversizedBytes = new byte[10 * 1024 * 1024 + 1024];
+        var oversizedB64 = Convert.ToBase64String(oversizedBytes);
+        var oversizedRes = await client.PostAsJsonAsync("/api/voice/turn", new
+        {
+            sessionId,
+            conversationId = convId,
+            agentId = agent.Id,
+            audioBase64 = oversizedB64
+        });
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedRes.StatusCode);
+    }
 }
 

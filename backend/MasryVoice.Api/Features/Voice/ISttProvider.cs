@@ -38,7 +38,9 @@ public class WhisperSttProvider : ISttProvider
         using var content = new MultipartFormDataContent();
         var streamContent = new StreamContent(audioStream);
         streamContent.Headers.ContentType = new MediaTypeHeaderValue(contentType);
-        content.Add(streamContent, "file", "audio.wav");
+        var ext = contentType.Contains("webm", StringComparison.OrdinalIgnoreCase) ? ".webm"
+            : (contentType.Contains("ogg", StringComparison.OrdinalIgnoreCase) ? ".ogg" : ".wav");
+        content.Add(streamContent, "file", $"audio{ext}");
         content.Add(new StringContent("whisper-1"), "model");
         content.Add(new StringContent(language), "language");
 
