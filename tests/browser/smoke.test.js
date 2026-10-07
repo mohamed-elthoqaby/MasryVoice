@@ -337,6 +337,173 @@ async function runBrowserSmokeSuite() {
     console.log('   Subsequent voice turn completed successfully and verified in UI with exact turn ID and content.');
     assertNoPageErrors('Post-Interruption Turn');
 
+    // Part D: Deterministic Race Regression 1 - Interrupt A, complete B and start playback, then release obsolete A (Simulated)
+    // Asserts obsolete A (HTTP 200) does not stop B's playback, reset speaking indicator, or overwrite B's turn state
+    console.log(' - Part D: Regression 1 - Interrupt A, start B playback, release obsolete A (Simulated)...');
+    let releaseA200 = null;
+    const promiseA200 = new Promise(resolve => { releaseA200 = resolve; });
+
+    await page.route('**/api/voice/turn', async route => {
+      const data = route.request().postDataJSON();
+      if (data && data.message && data.message.includes('طلب أ للمقاطعة 200')) {
+        console.log('   [Intercept Part D] Holding Request A in flight...');
+        await promiseA200;
+        console.log('   [Intercept Part D] Releasing Request A with HTTP 200...');
+        await route.continue();
+      } else {
+        await route.continue();
+      }
+    });
+
+    // 1. Send Request A
+    await page.waitForSelector('#voice-input-text:not([disabled])', { timeout: 15000 });
+    await page.fill('#voice-input-text', 'طلب أ للمقاطعة 200 (Simulated)');
+    await page.click('#send-voice-turn-btn');
+    await page.waitForTimeout(300); // Wait for Request A to be in flight
+
+    // 2. Interrupt Request A
+    await page.click('#voice-barge-in-btn');
+    console.log('   [Part D] Clicked Barge-In to interrupt Request A.');
+    await page.waitForSelector('#voice-interrupted-indicator', { timeout: 5000 });
+
+    // 3. Send Request B and wait for it to complete and start active playback
+    await page.waitForSelector('#voice-input-text:not([disabled])', { timeout: 15000 });
+    await page.fill('#voice-input-text', 'طلب ب يكتمل ويبدأ تشغيل الصوت (Simulated)');
+    await page.click('#send-voice-turn-btn');
+
+    // Wait for B's playback to start
+    await page.waitForSelector('#voice-speaking-indicator', { timeout: 25000 });
+    await page.waitForFunction(() => {
+      const audio = document.querySelector('audio');
+      return audio && !audio.paused && audio.currentTime >= 0;
+    }, { timeout: 10000 });
+    const turnIdB = await page.$eval('#voice-turn-id-display', el => el.innerText.trim());
+    const contentB = await page.$eval('#voice-response-content-display', el => el.innerText.trim());
+    console.log(`   [Part D] Request B is actively playing: turn=${turnIdB}`);
+
+    // 4. Release obsolete Request A (returns HTTP 200 while B is actively playing)
+    releaseA200();
+    await page.waitForTimeout(600); // Allow time for obsolete response to arrive
+
+    // 5. Assert B's playback and state remain completely intact
+    const audioStillPlayingB = await page.evaluate(() => {
+      const audio = document.querySelector('audio');
+      return audio && !audio.paused;
+    });
+    assert.strictEqual(Boolean(audioStillPlayingB), true, 'B audio playback must remain actively playing when obsolete A completes');
+
+    const speakingIndicatorB = await page.$('#voice-speaking-indicator');
+    assert.notStrictEqual(speakingIndicatorB, null, 'Speaking indicator must remain visible for B when obsolete A completes');
+
+    const interruptedIndicatorB = await page.$('#voice-interrupted-indicator');
+    assert.strictEqual(interruptedIndicatorB, null, 'Interrupted indicator must NOT be shown when obsolete A completes');
+
+    const currentTurnIdB = await page.$eval('#voice-turn-id-display', el => el.innerText.trim());
+    assert.strictEqual(currentTurnIdB, turnIdB, 'Turn ID must remain B turn ID');
+
+    const currentContentB = await page.$eval('#voice-response-content-display', el => el.innerText.trim());
+    assert.strictEqual(currentContentB, contentB, 'Response content must remain B response content');
+
+    console.log('   Regression 1 PASSED: B state and playback remained completely intact when obsolete A completed.');
+    await page.unroute('**/api/voice/turn');
+    // Stop playback cleanly
+    await page.click('#voice-barge-in-btn');
+    assertNoPageErrors('Voice Race Regression 1');
+
+    // Part E: Deterministic Race Regression 2 - Interrupt A, keep B pending, then release A (HTTP 499) (Simulated)
+    // Asserts obsolete A (cancellation / HTTP 499) does not terminate B's pending processing status
+    console.log(' - Part E: Regression 2 - Interrupt A, keep B pending, release obsolete A 499 (Simulated)...');
+    let releaseA499 = null;
+    const promiseA499 = new Promise(resolve => { releaseA499 = resolve; });
+
+    let releaseBPending = null;
+    const promiseBPending = new Promise(resolve => { releaseBPending = resolve; });
+
+    await page.route('**/api/voice/turn', async route => {
+      const data = route.request().postDataJSON();
+      if (data && data.message && data.message.includes('طلب أ للمقاطعة 499')) {
+        console.log('   [Intercept Part E] Holding Request A in flight...');
+        await promiseA499;
+        console.log('   [Intercept Part E] Fulfilling Request A with HTTP 499...');
+        await route.fulfill({
+          status: 499,
+          contentType: 'application/json',
+          body: JSON.stringify({ message: 'Client cancelled request' })
+        });
+      } else if (data && data.message && data.message.includes('طلب ب معلق')) {
+        console.log('   [Intercept Part E] Holding Request B in flight (pending)...');
+        await promiseBPending;
+        console.log('   [Intercept Part E] Releasing Request B...');
+        await route.continue();
+      } else {
+        await route.continue();
+      }
+    });
+
+    // 1. Send Request A
+    await page.waitForSelector('#voice-input-text:not([disabled])', { timeout: 15000 });
+    await page.fill('#voice-input-text', 'طلب أ للمقاطعة 499 (Simulated)');
+    await page.click('#send-voice-turn-btn');
+    await page.waitForTimeout(300);
+
+    // 2. Interrupt Request A
+    await page.click('#voice-barge-in-btn');
+    console.log('   [Part E] Clicked Barge-In to interrupt Request A.');
+    await page.waitForSelector('#voice-interrupted-indicator', { timeout: 5000 });
+
+    // 3. Send Request B (which is held in-flight)
+    await page.waitForSelector('#voice-input-text:not([disabled])', { timeout: 15000 });
+    await page.fill('#voice-input-text', 'طلب ب معلق للتحقق من استمرار المعالجة (Simulated)');
+    await page.click('#send-voice-turn-btn');
+    await page.waitForTimeout(300);
+
+    // 4. Assert Request B is processing (input disabled)
+    const bProcessingBefore = await page.$eval('#voice-input-text', el => el.disabled);
+    assert.strictEqual(bProcessingBefore, true, 'Request B must be actively processing (input disabled)');
+
+    // 5. Release obsolete Request A with HTTP 499 while B is still pending
+    releaseA499();
+    await page.waitForTimeout(600); // Allow time for 499 to be handled
+
+    // 6. Assert Request B REMAINED in processing state (input STILL disabled!)
+    const bProcessingAfter = await page.$eval('#voice-input-text', el => el.disabled);
+    assert.strictEqual(bProcessingAfter, true, 'Request B must REMAIN actively processing after obsolete A 499 completes');
+
+    // 7. Now release Request B to allow it to finish
+    const bTurnResponsePromise = page.waitForResponse(
+      resp => resp.url().includes('/api/voice/turn') && resp.request().method() === 'POST',
+      { timeout: 25000 }
+    );
+    releaseBPending();
+    const bResp = await bTurnResponsePromise;
+    assert.strictEqual(bResp.ok(), true, 'Request B must return HTTP 200 OK');
+    const bData = await bResp.json();
+
+    const expectedTurnIdB2 = `#${bData.turnId}`;
+    await page.waitForFunction(
+      (epoch) => {
+        const el = document.getElementById('voice-turn-id-display');
+        return el && el.innerText.trim() === epoch;
+      },
+      expectedTurnIdB2,
+      { timeout: 25000 }
+    );
+    const finalTurnIdB2 = await page.$eval('#voice-turn-id-display', el => el.innerText.trim());
+    assert.strictEqual(finalTurnIdB2, expectedTurnIdB2, 'UI must display B turn ID upon B completion');
+
+    await page.waitForFunction(
+      (snippet) => {
+        const el = document.getElementById('voice-response-content-display');
+        return el && el.innerText.includes(snippet);
+      },
+      bData.text.slice(0, 15),
+      { timeout: 25000 }
+    );
+
+    console.log('   Regression 2 PASSED: Request B remained processing until its own completion.');
+    await page.unroute('**/api/voice/turn');
+    assertNoPageErrors('Voice Race Regression 2');
+
     // Verify completion before closing browser
     await page.waitForLoadState('networkidle');
 

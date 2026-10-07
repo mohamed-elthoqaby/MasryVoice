@@ -555,7 +555,9 @@ export default function Dashboard() {
         headers,
         body: JSON.stringify({ conversationId: currentConv || null })
       });
+      if (currentRequestId !== activeVoiceRequestIdRef.current) return;
       const data = await res.json();
+      if (currentRequestId !== activeVoiceRequestIdRef.current) return;
       sId = data.sessionId;
       currentConv = data.conversationId;
       currentToken = data.customerToken;
@@ -563,6 +565,7 @@ export default function Dashboard() {
       updateSessionCredentials(data.conversationId, data.customerToken);
     }
 
+    if (currentRequestId !== activeVoiceRequestIdRef.current) return;
     setIsVoiceProcessing(true);
     setVoiceInterrupted(false);
     try {
@@ -579,11 +582,17 @@ export default function Dashboard() {
         })
       });
 
+      // Ignore obsolete completions entirely: do not modify playback, text, turn ID, or interruption status
+      if (currentRequestId !== activeVoiceRequestIdRef.current) {
+        return;
+      }
+
       if (res.ok) {
         const data = await res.json();
+        if (currentRequestId !== activeVoiceRequestIdRef.current) return;
 
-        // Reject stale/interrupted responses before applying turn ID, input, or response-state updates!
-        if (data.interrupted || isInterruptedRef.current || currentRequestId !== activeVoiceRequestIdRef.current) {
+        // If this specific active request was interrupted or returned interrupted flag
+        if (data.interrupted || isInterruptedRef.current) {
           setIsVoiceSpeaking(false);
           setVoiceInterrupted(true);
           return;
@@ -599,17 +608,28 @@ export default function Dashboard() {
             audioPlayerRef.current.src = audioSrc;
             setIsVoiceSpeaking(true);
             audioPlayerRef.current.play().catch(() => {});
-            audioPlayerRef.current.onended = () => setIsVoiceSpeaking(false);
+            audioPlayerRef.current.onended = () => {
+              if (currentRequestId === activeVoiceRequestIdRef.current) {
+                setIsVoiceSpeaking(false);
+              }
+            };
           }
         }
       } else if (res.status === 499) {
-        setIsVoiceSpeaking(false);
-        setVoiceInterrupted(true);
+        if (currentRequestId === activeVoiceRequestIdRef.current) {
+          setIsVoiceSpeaking(false);
+          setVoiceInterrupted(true);
+        }
       }
     } catch (err) {
-      console.error(err);
+      if (currentRequestId === activeVoiceRequestIdRef.current) {
+        console.error(err);
+      }
     } finally {
-      setIsVoiceProcessing(false);
+      // Only reset processing if this is still the active request
+      if (currentRequestId === activeVoiceRequestIdRef.current) {
+        setIsVoiceProcessing(false);
+      }
     }
   };
 
