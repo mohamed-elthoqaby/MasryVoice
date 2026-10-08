@@ -203,10 +203,12 @@ builder.Services.AddScoped<IBookingConfirmationService, BookingConfirmationServi
 builder.Services.AddScoped<CheckAvailabilityTool>();
 builder.Services.AddScoped<StageBookingTool>();
 builder.Services.AddScoped<GetBookingTool>();
+builder.Services.AddScoped<CancelBookingTool>();
 builder.Services.AddScoped<SearchKnowledgeBaseTool>();
 builder.Services.AddScoped<ITool>(sp => sp.GetRequiredService<CheckAvailabilityTool>());
 builder.Services.AddScoped<ITool>(sp => sp.GetRequiredService<StageBookingTool>());
 builder.Services.AddScoped<ITool>(sp => sp.GetRequiredService<GetBookingTool>());
+builder.Services.AddScoped<ITool>(sp => sp.GetRequiredService<CancelBookingTool>());
 builder.Services.AddScoped<ITool>(sp => sp.GetRequiredService<SearchKnowledgeBaseTool>());
 builder.Services.AddScoped<ToolRegistry>();
 
@@ -578,6 +580,73 @@ app.MapGet("/api/bookings/{id:guid}", async (Guid id, HttpContext ctx, AppDbCont
         status = booking.Status,
         idempotencyKey = booking.IdempotencyKey,
         createdAtUtc = booking.CreatedAtUtc
+    });
+}).RequireRateLimiting("api");
+
+// Cancel Booking Endpoint (Protected: Admin or Verified Owning Customer)
+app.MapPost("/api/bookings/{id:guid}/cancel", async (
+    Guid id,
+    HttpContext ctx,
+    AppDbContext db,
+    ISecurityService security,
+    Microsoft.Extensions.Caching.Memory.IMemoryCache cache,
+    CancellationToken ct) =>
+{
+    var booking = await db.Bookings.Include(b => b.Slot).FirstOrDefaultAsync(b => b.Id == id, ct);
+    if (booking == null) return Results.NotFound(new { success = false, message = "الحجز غير موجود." });
+
+    if (!booking.ConversationId.HasValue || !security.HasAccessToConversation(ctx, booking.ConversationId.Value))
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
+    if (booking.Status == "Cancelled")
+    {
+        return Results.Ok(new { success = true, message = "الحجز ملغى بالفعل مسبقاً.", bookingId = booking.Id, status = "Cancelled" });
+    }
+
+    booking.Status = "Cancelled";
+    if (booking.Slot != null)
+    {
+        booking.Slot.BookedCapacity = Math.Max(0, booking.Slot.BookedCapacity - 1);
+    }
+    else
+    {
+        var slot = await db.AvailabilitySlots.FirstOrDefaultAsync(s => s.Id == booking.SlotId, ct);
+        if (slot != null)
+        {
+            slot.BookedCapacity = Math.Max(0, slot.BookedCapacity - 1);
+        }
+    }
+
+    db.OutboxJobs.Add(new OutboxJob
+    {
+        Id = Guid.NewGuid(),
+        Topic = "BookingCancelled",
+        PayloadJson = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            bookingId = booking.Id,
+            customerName = booking.CustomerName,
+            customerPhone = booking.CustomerPhone,
+            serviceName = booking.ServiceName,
+            bookingDateUtc = booking.BookingDateUtc,
+            cancelledAtUtc = DateTime.UtcNow
+        }),
+        Status = "Pending",
+        CreatedAtUtc = DateTime.UtcNow,
+        NextRetryUtc = DateTime.UtcNow
+    });
+
+    await db.SaveChangesAsync(ct);
+    cache.Remove("slots_all");
+
+    return Results.Ok(new
+    {
+        success = true,
+        message = "تم إلغاء الحجز بنجاح.",
+        bookingId = booking.Id,
+        status = "Cancelled",
+        cairoTime = CairoTimeHelper.FormatCairoFriendly(booking.BookingDateUtc)
     });
 }).RequireRateLimiting("api");
 

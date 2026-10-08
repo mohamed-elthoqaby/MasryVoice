@@ -510,6 +510,28 @@ export default function Dashboard() {
     }
   };
 
+  const handleCancelBooking = async (bookingId: string) => {
+    if (!confirm('هل أنت متأكد من رغبتك في إلغاء هذا الحجز؟')) return;
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (adminKey) headers['X-Admin-Key'] = adminKey;
+      if (customerToken) headers['X-Customer-Token'] = customerToken;
+
+      const res = await fetch(`/api/bookings/${bookingId}/cancel`, {
+        method: 'POST',
+        headers
+      });
+      if (res.ok) {
+        fetchState();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        alert(data.message || 'تعذر إلغاء الحجز');
+      }
+    } catch (e: any) {
+      alert(`خطأ: ${e.message}`);
+    }
+  };
+
   // Real push-to-talk microphone audio recording (Web Audio / MediaRecorder API)
   const startVoiceRecording = async (targetMode: 'voice' | 'chat' = 'voice') => {
     setMicError(null);
@@ -1812,6 +1834,7 @@ export default function Dashboard() {
                           <th style={{ padding: '12px' }}>موعد الكشف (بتوقيت القاهرة)</th>
                           <th style={{ padding: '12px' }}>الحالة</th>
                           <th style={{ padding: '12px' }}>مفتاح Idempotency</th>
+                          <th style={{ padding: '12px' }}>الإجراءات</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1823,8 +1846,8 @@ export default function Dashboard() {
                             <td style={{ padding: '12px', color: '#10b981' }}>{b.cairoTimeFormatted}</td>
                             <td style={{ padding: '12px' }}>
                               <span style={{
-                                background: 'rgba(16, 185, 129, 0.1)',
-                                color: '#10b981',
+                                background: b.status === 'Confirmed' ? 'rgba(16, 185, 129, 0.1)' : b.status === 'Cancelled' ? 'rgba(239, 68, 68, 0.1)' : 'rgba(234, 179, 8, 0.1)',
+                                color: b.status === 'Confirmed' ? '#10b981' : b.status === 'Cancelled' ? '#ef4444' : '#facc15',
                                 padding: '4px 8px',
                                 borderRadius: '6px',
                                 fontSize: '0.75rem',
@@ -1834,6 +1857,28 @@ export default function Dashboard() {
                               </span>
                             </td>
                             <td style={{ padding: '12px', color: 'var(--text-dim)', fontSize: '0.75rem' }} dir="ltr">{b.idempotencyKey}</td>
+                            <td style={{ padding: '12px' }}>
+                              {b.status === 'Confirmed' ? (
+                                <button
+                                  type="button"
+                                  onClick={() => handleCancelBooking(b.id)}
+                                  style={{
+                                    background: 'rgba(239, 68, 68, 0.15)',
+                                    border: '1px solid rgba(239, 68, 68, 0.3)',
+                                    color: '#f87171',
+                                    padding: '4px 10px',
+                                    borderRadius: '6px',
+                                    fontSize: '0.75rem',
+                                    fontWeight: 600,
+                                    cursor: 'pointer'
+                                  }}
+                                >
+                                  إلغاء الحجز
+                                </button>
+                              ) : (
+                                <span style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>-</span>
+                              )}
+                            </td>
                           </tr>
                         ))}
                       </tbody>
@@ -2667,7 +2712,7 @@ export default function Dashboard() {
                     قائمة الأدوات المسموح بها لهذا الوكيل (Tool Allowlist)
                   </label>
                   <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
-                    {['CheckAvailability', 'StageBooking', 'GetBooking', 'SearchKnowledgeBase'].map(tool => {
+                    {['CheckAvailability', 'StageBooking', 'GetBooking', 'CancelBooking', 'SearchKnowledgeBase'].map(tool => {
                       const isAllowed = agentForm.allowedTools?.includes(tool);
                       return (
                         <label

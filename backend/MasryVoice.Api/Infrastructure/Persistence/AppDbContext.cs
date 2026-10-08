@@ -200,7 +200,7 @@ public class AppDbContext : DbContext
                 ModelName = "qwen2.5:3b",
                 Temperature = 0.2,
                 IsActive = true,
-                AllowedToolsJson = "[\"CheckAvailability\",\"StageBooking\",\"GetBooking\",\"SearchKnowledgeBase\"]",
+                AllowedToolsJson = "[\"CheckAvailability\",\"StageBooking\",\"GetBooking\",\"CancelBooking\",\"SearchKnowledgeBase\"]",
                 SystemPrompt = promptText
             };
 

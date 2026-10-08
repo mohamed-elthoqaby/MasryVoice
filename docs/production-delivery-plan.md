@@ -16,8 +16,8 @@ In compliance with [AGENTS.md](file:///w:/AI%20Voice%20Agent/AGENTS.md):
 | Phase | Description | Status | Evidence Reference |
 |---|---|---|---|
 | **Phase A** | Operational Foundation, Transport & Safety | **COMPLETED & LOCALLY_VERIFIED** | `docs/evidence/phaseA-webm-PASSED.json` |
-| **Phase B** | Agent Engine, Grounded Availability & Bookings | **IN PROGRESS** | Unit tests + UI contract tests |
-| **Phase C** | Knowledge / RAG, Durable Outbox & Reminders | **PENDING** | Outbox workers + SQLite/Postgres schemas |
+| **Phase B** | Agent Engine, Grounded Availability & Bookings | **COMPLETED & LOCALLY_VERIFIED** | `PhaseBBookingAndDialectTests.cs`, `AuthorizationAcceptanceTests.cs` |
+| **Phase C** | Knowledge / RAG, Durable Outbox & Reminders | **IN PROGRESS** | Outbox workers + SQLite/Postgres schemas |
 | **Phase D** | Integrated Voice Pipeline & Telephony Bridge | **LOCALLY_VERIFIED (Transport/Speech)** | `scripts/verify_webm_pipeline.py` |
 | **Phase E** | External Integrations (M365, WhatsApp, Telegram) | **IN PROGRESS (Mock Contracts)** | Integration contract tests |
 | **Phase F** | Production Hardening, Backup & Capacity Benchmarks | **PENDING** | Benchmark scripts & templates |
@@ -39,11 +39,16 @@ In compliance with [AGENTS.md](file:///w:/AI%20Voice%20Agent/AGENTS.md):
   *Status*: `LOCALLY_VERIFIED` (`docs/evidence/phaseA-webm-PASSED.json`)
 
 ### Phase B: Agent Engine, Grounded Availability & Booking Lifecycle
-- [ ] **B.1 Grounded Availability Queries**: Egyptian Arabic date/time entity resolution; enforce DB slot capacity check before proposing times.
-- [ ] **B.2 Two-Stage Booking Confirmation**: Conversational draft creation -> explicit confirmation card -> HMAC token validated finalization.
-- [ ] **B.3 Conflict & Idempotency Enforcement**: Prevent double-booking on concurrent calls using DB transactions and unique constraints.
-- [ ] **B.4 Frontend Booking Confirmation UX**: Explicit modal/card in Next.js UI showing patient name, phone, slot time, doctor/specialty with Confirm/Cancel actions.
-- [ ] **B.5 Admin Dashboard Management**: Bookings list, search, status filter, cancellation, and manual slot adjustments.
+- [x] **B.1 Grounded Availability Queries**: Egyptian Arabic date/time entity resolution (`بكرة`, `بعد بكرة`, `التلات`, weekdays); specialty filter; enforce DB slot capacity check before proposing times.  
+  *Status*: `LOCALLY_VERIFIED` (`PhaseBBookingAndDialectTests.cs`)
+- [x] **B.2 Two-Stage Booking Confirmation**: Conversational draft creation (`StageBooking`) -> explicit confirmation card -> HMAC token validated finalization (`IBookingConfirmationService`).  
+  *Status*: `LOCALLY_VERIFIED` (`VerticalSliceTests.cs`)
+- [x] **B.3 Conflict & Idempotency Enforcement**: Prevent double-booking on concurrent calls using ACID conditional SQL transactions and unique constraints.  
+  *Status*: `LOCALLY_VERIFIED` (`PhaseBBookingAndDialectTests.cs`, `BookingConfirmationService.cs`)
+- [x] **B.4 Frontend Booking Confirmation UX**: Explicit card in Next.js UI showing patient name, phone, slot time, doctor/specialty with Confirm action and HMAC token header.  
+  *Status*: `LOCALLY_VERIFIED` (`frontend/src/app/page.tsx`)
+- [x] **B.5 Admin Dashboard Management & Cancellation**: Bookings list, status filter, cancellation endpoint (`POST /api/bookings/{id}/cancel`), and conversational `CancelBookingTool` with capacity decrement and outbox notifications.  
+  *Status*: `LOCALLY_VERIFIED` (`AuthorizationAcceptanceTests.cs`, `PhaseBBookingAndDialectTests.cs`)
 
 ### Phase C: Knowledge/RAG, Durable Jobs & Reminders
 - [ ] **C.1 Clinic Knowledge Search**: Semantic/lexical search for clinic services, operating hours, prices, and doctor profiles.

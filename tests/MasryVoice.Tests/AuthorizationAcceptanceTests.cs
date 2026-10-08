@@ -1319,5 +1319,65 @@ public class AuthorizationAcceptanceTests : IClassFixture<WebApplicationFactory<
         Assert.Contains("المواعيد المتاحة", dbMessages[0].Content);
         Assert.Contains("محمد عاطف", dbMessages[1].Content);
     }
+
+    [Fact]
+    public async Task CancelBookingEndpoint_EnforcesOwnership_AndCancelsBooking()
+    {
+        var client = _factory.CreateClient();
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var sec = scope.ServiceProvider.GetRequiredService<ISecurityService>();
+
+        var agent = await db.Agents.FirstAsync();
+        var convId = Guid.NewGuid();
+        db.Conversations.Add(new Conversation { Id = convId, AgentId = agent.Id });
+
+        var slot = await db.AvailabilitySlots.FirstAsync();
+        slot.TotalCapacity = 5;
+        slot.BookedCapacity = 2;
+
+        var booking = new Booking
+        {
+            Id = Guid.NewGuid(),
+            ConversationId = convId,
+            SlotId = slot.Id,
+            CustomerName = "فاطمة حسن",
+            CustomerPhone = "01098765432",
+            ServiceName = slot.ServiceName,
+            BookingDateUtc = slot.StartTimeUtc,
+            Status = "Confirmed",
+            IdempotencyKey = $"idemp_cancel_test_{Guid.NewGuid():N}",
+            RequestHash = "hash_cancel",
+            CreatedAtUtc = DateTime.UtcNow
+        };
+        db.Bookings.Add(booking);
+        await db.SaveChangesAsync();
+
+        // 1. Unauthenticated or foreign conversation caller rejected with 403 Forbidden
+        var foreignToken = sec.GenerateCustomerToken(Guid.NewGuid(), "01199999999");
+        var reqForeign = new HttpRequestMessage(HttpMethod.Post, $"/api/bookings/{booking.Id}/cancel");
+        reqForeign.Headers.Add("X-Customer-Token", foreignToken);
+        var resForeign = await client.SendAsync(reqForeign);
+        Assert.Equal(HttpStatusCode.Forbidden, resForeign.StatusCode);
+
+        // 2. Verified owning customer succeeds
+        var ownerToken = sec.GenerateCustomerToken(convId, "01098765432");
+        var reqOwner = new HttpRequestMessage(HttpMethod.Post, $"/api/bookings/{booking.Id}/cancel");
+        reqOwner.Headers.Add("X-Customer-Token", ownerToken);
+        var resOwner = await client.SendAsync(reqOwner);
+        Assert.Equal(HttpStatusCode.OK, resOwner.StatusCode);
+
+        // 3. Verify in database: status is Cancelled, capacity decremented from 2 to 1
+        using var verifyScope = _factory.Services.CreateScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var updatedBooking = await verifyDb.Bookings.FindAsync(booking.Id);
+        Assert.NotNull(updatedBooking);
+        Assert.Equal("Cancelled", updatedBooking.Status);
+
+        var updatedSlot = await verifyDb.AvailabilitySlots.FindAsync(slot.Id);
+        Assert.NotNull(updatedSlot);
+        Assert.Equal(1, updatedSlot.BookedCapacity);
+    }
 }
+
 
