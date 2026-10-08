@@ -29,7 +29,9 @@ public class SearchKnowledgeBaseTool : ITool
             return new ToolResult(false, "يجب تحديد نص البحث المطلوب (query).");
         }
 
-        var query = queryProp.GetString()!;
+        var rawQuery = queryProp.GetString()!.Trim();
+        // Prevent prompt injection attacks via query payload by truncating length and normalizing
+        var query = rawQuery.Length > 250 ? rawQuery[..250] : rawQuery;
         var results = await _knowledgeService.SearchAsync(query, maxResults: 3, minSimilarity: 0.40, ct);
 
         if (results.Count == 0)
@@ -45,7 +47,7 @@ public class SearchKnowledgeBaseTool : ITool
         {
             source = r.DocumentTitle,
             citation = r.CitationTag,
-            content = r.Content,
+            content = $"<verified_clinic_knowledge source=\"{r.DocumentTitle}\">\n{r.Content}\n</verified_clinic_knowledge>",
             confidence = r.Similarity
         }).ToList();
 

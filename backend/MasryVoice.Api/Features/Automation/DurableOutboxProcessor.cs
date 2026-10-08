@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using MasryVoice.Api.Common;
 using MasryVoice.Api.Domain;
 using MasryVoice.Api.Infrastructure.Persistence;
 
@@ -25,6 +26,7 @@ public class DurableOutboxProcessor : BackgroundService
         {
             try
             {
+                await EnqueueUpcomingRemindersAsync(stoppingToken);
                 await ProcessPendingJobsAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -47,6 +49,61 @@ public class DurableOutboxProcessor : BackgroundService
         }
 
         _logger.LogInformation("DurableOutboxProcessor gracefully stopped.");
+    }
+
+    public async Task<int> EnqueueUpcomingRemindersAsync(CancellationToken ct)
+    {
+        using var scope = _serviceProvider.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var now = DateTime.UtcNow;
+        var reminderWindowEnd = now.AddHours(24);
+
+        // Scan upcoming confirmed bookings in the next 24 hours
+        var upcomingBookings = await db.Bookings
+            .Where(b => b.Status == "Confirmed" && b.BookingDateUtc > now && b.BookingDateUtc <= reminderWindowEnd)
+            .ToListAsync(ct);
+
+        if (upcomingBookings.Count == 0) return 0;
+
+        int enqueuedCount = 0;
+        foreach (var booking in upcomingBookings)
+        {
+            var bookingIdStr = booking.Id.ToString();
+            var alreadyEnqueued = await db.OutboxJobs.AnyAsync(
+                o => o.Topic == "BookingReminder" && o.PayloadJson.Contains(bookingIdStr), ct);
+
+            if (!alreadyEnqueued)
+            {
+                db.OutboxJobs.Add(new OutboxJob
+                {
+                    Id = Guid.NewGuid(),
+                    Topic = "BookingReminder",
+                    PayloadJson = JsonSerializer.Serialize(new
+                    {
+                        bookingId = booking.Id,
+                        customerName = booking.CustomerName,
+                        customerPhone = booking.CustomerPhone,
+                        serviceName = booking.ServiceName,
+                        bookingDateUtc = booking.BookingDateUtc,
+                        cairoTime = CairoTimeHelper.FormatCairoFriendly(booking.BookingDateUtc),
+                        reminderScheduledAtUtc = DateTime.UtcNow
+                    }),
+                    Status = "Pending",
+                    CreatedAtUtc = DateTime.UtcNow,
+                    NextRetryUtc = DateTime.UtcNow
+                });
+                enqueuedCount++;
+            }
+        }
+
+        if (enqueuedCount > 0)
+        {
+            await db.SaveChangesAsync(ct);
+            _logger.LogInformation("Enqueued {Count} automated appointment reminder jobs.", enqueuedCount);
+        }
+
+        return enqueuedCount;
     }
 
     public async Task<int> ProcessPendingJobsAsync(CancellationToken ct)
@@ -104,7 +161,10 @@ public class DurableOutboxProcessor : BackgroundService
         {
             case "BookingConfirmed":
                 _logger.LogInformation("Outbox dispatched: Customer SMS/WhatsApp booking confirmation for job {JobId}.", job.Id);
-                // Here: integration with SMS provider / Webhook gateway (e.g. Twilio, Infobip, local gateway)
+                break;
+
+            case "BookingCancelled":
+                _logger.LogInformation("Outbox dispatched: Cancellation notice for job {JobId}.", job.Id);
                 break;
 
             case "BookingReminder":

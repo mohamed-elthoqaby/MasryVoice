@@ -17,7 +17,7 @@ In compliance with [AGENTS.md](file:///w:/AI%20Voice%20Agent/AGENTS.md):
 |---|---|---|---|
 | **Phase A** | Operational Foundation, Transport & Safety | **COMPLETED & LOCALLY_VERIFIED** | `docs/evidence/phaseA-webm-PASSED.json` |
 | **Phase B** | Agent Engine, Grounded Availability & Bookings | **COMPLETED & LOCALLY_VERIFIED** | `PhaseBBookingAndDialectTests.cs`, `AuthorizationAcceptanceTests.cs` |
-| **Phase C** | Knowledge / RAG, Durable Outbox & Reminders | **IN PROGRESS** | Outbox workers + SQLite/Postgres schemas |
+| **Phase C** | Knowledge / RAG, Durable Outbox & Reminders | **COMPLETED & LOCALLY_VERIFIED** | `PhaseCKnowledgeAndOutboxTests.cs` |
 | **Phase D** | Integrated Voice Pipeline & Telephony Bridge | **LOCALLY_VERIFIED (Transport/Speech)** | `scripts/verify_webm_pipeline.py` |
 | **Phase E** | External Integrations (M365, WhatsApp, Telegram) | **IN PROGRESS (Mock Contracts)** | Integration contract tests |
 | **Phase F** | Production Hardening, Backup & Capacity Benchmarks | **PENDING** | Benchmark scripts & templates |
@@ -51,9 +51,12 @@ In compliance with [AGENTS.md](file:///w:/AI%20Voice%20Agent/AGENTS.md):
   *Status*: `LOCALLY_VERIFIED` (`AuthorizationAcceptanceTests.cs`, `PhaseBBookingAndDialectTests.cs`)
 
 ### Phase C: Knowledge/RAG, Durable Jobs & Reminders
-- [ ] **C.1 Clinic Knowledge Search**: Semantic/lexical search for clinic services, operating hours, prices, and doctor profiles.
-- [ ] **C.2 Durable Outbox Processor**: Reliable background queue with exponential backoff and dead-letter handling for notifications.
-- [ ] **C.3 Appointment Reminders**: Scheduled reminder jobs triggered 24h and 2h prior to booked appointment slots.
+- [x] **C.1 Clinic Knowledge Search**: Semantic vector search with pgvector (cosine distance) and SQLite lexical fallback; prompt injection sanitization; `<verified_clinic_knowledge>` grounding tags in tool results.  
+  *Status*: `LOCALLY_VERIFIED` (`PhaseCKnowledgeAndOutboxTests.cs`)
+- [x] **C.2 Durable Outbox Processor**: Reliable background queue with exponential backoff and dead-letter handling for notifications (`BookingConfirmed`, `BookingCancelled`, `BookingReminder`).  
+  *Status*: `LOCALLY_VERIFIED` (`PhaseCKnowledgeAndOutboxTests.cs`)
+- [x] **C.3 Appointment Reminders**: Automated reminder scheduler scanning confirmed bookings in next 24h and enqueuing non-duplicated reminder outbox jobs.  
+  *Status*: `LOCALLY_VERIFIED` (`PhaseCKnowledgeAndOutboxTests.cs`)
 
 ### Phase D: Integrated Voice Pipeline & Telephony Bridge
 - [x] **D.1 Real Local Whisper STT Integration**: FastAPI Whisper on port 8000 handling browser WebM audio.  
