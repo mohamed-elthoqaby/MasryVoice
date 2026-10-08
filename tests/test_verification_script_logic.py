@@ -102,6 +102,62 @@ class TestVerificationScriptLogic(unittest.TestCase):
             vscript.validate_backend_providers("Ollama", "Whisper", "Piper",
                                               resolved_llm="DeterministicFakeLlmProvider")
 
+    def test_final_gate_succeeds_when_all_criteria_passed(self):
+        """Verifies that when all REQUIRED_CRITERIA_FULL pass, main() succeeds cleanly."""
+        def mock_execute(args, report):
+            for crit in vscript.REQUIRED_CRITERIA_FULL:
+                report["verifications"][crit] = "PASSED"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch.object(vscript, "execute_verification", side_effect=mock_execute), \
+                 patch.object(vscript, "ARTIFACTS_DIR", tmp_dir), \
+                 patch("sys.argv", ["verify.py"]):
+                # Should not raise SystemExit
+                vscript.main()
+
+    def test_final_gate_fails_when_criterion_is_missing_or_failed(self):
+        """Verifies that if any required criterion (e.g. tts_benchmark) is missing or failed, main() exits 1."""
+        def mock_execute_missing_tts(args, report):
+            for crit in vscript.REQUIRED_CRITERIA_FULL:
+                if crit != "tts_benchmark":
+                    report["verifications"][crit] = "PASSED"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch.object(vscript, "execute_verification", side_effect=mock_execute_missing_tts), \
+                 patch.object(vscript, "ARTIFACTS_DIR", tmp_dir), \
+                 patch("sys.argv", ["verify.py"]):
+                with self.assertRaises(SystemExit) as ctx:
+                    vscript.main()
+                self.assertEqual(ctx.exception.code, 1)
+
+    def test_component_only_mode_behavior(self):
+        """Verifies component-only mode exits nonzero on failure, and succeeds (exits 0) on pass."""
+        # 1. Failure case
+        def mock_execute_fail(args, report):
+            for crit in vscript.REQUIRED_CRITERIA_COMPONENT:
+                if crit != "tts_benchmark":
+                    report["verifications"][crit] = "PASSED"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch.object(vscript, "execute_verification", side_effect=mock_execute_fail), \
+                 patch.object(vscript, "ARTIFACTS_DIR", tmp_dir), \
+                 patch("sys.argv", ["verify.py", "--skip-backend"]):
+                with self.assertRaises(SystemExit) as ctx:
+                    vscript.main()
+                self.assertEqual(ctx.exception.code, 1)
+
+        # 2. Success case (PARTIAL)
+        def mock_execute_pass(args, report):
+            for crit in vscript.REQUIRED_CRITERIA_COMPONENT:
+                report["verifications"][crit] = "PASSED"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch.object(vscript, "execute_verification", side_effect=mock_execute_pass), \
+                 patch.object(vscript, "ARTIFACTS_DIR", tmp_dir), \
+                 patch("sys.argv", ["verify.py", "--skip-backend"]):
+                # Must exit cleanly without exception
+                vscript.main()
+
 
 if __name__ == "__main__":
     unittest.main()

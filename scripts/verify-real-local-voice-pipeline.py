@@ -328,6 +328,7 @@ def execute_verification(args, report):
     with open(tts_sample_path, "wb") as f:
         f.write(tts_bytes)
 
+    assert len(tts_bytes) > 44, "Isolated TTS generated empty audio payload"
     report["timings_ms"]["tts_isolated_ms"] = round(t_tts, 2)
     report["stages"]["tts_benchmark"] = {
         "text": tts_text,
@@ -335,6 +336,7 @@ def execute_verification(args, report):
         "bytes": len(tts_bytes),
         "sample_artifact": os.path.basename(tts_sample_path)
     }
+    report["verifications"]["tts_benchmark"] = "PASSED"
 
     # -----------------------------------------------------------------
     # Stage 5: Live End-to-End Voice Booking, Staging & Confirmation Lifecycle
@@ -722,8 +724,7 @@ def main():
     ]
     if failed_items:
         print(f"[FAILURE] The following required criteria did not pass: {failed_items}\n")
-        if args.strict or not args.skip_backend:
-            sys.exit(1)
+        sys.exit(1)
     elif args.skip_backend:
         print("[PARTIAL] Component-only mode completed successfully (backend E2E turns skipped).\n")
     else:

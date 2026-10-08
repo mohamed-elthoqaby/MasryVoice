@@ -1,6 +1,7 @@
 # Launcher for Backend API with dedicated isolated acceptance database ($0 Cost)
 $env:ASPNETCORE_ENVIRONMENT = "Testing"
-$env:ConnectionStrings__Sqlite = "Data Source=masryvoice_real_voice_acceptance.db"
+$AcceptanceDbPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\backend\MasryVoice.Api\masryvoice_real_voice_acceptance.db"))
+$env:ConnectionStrings__Sqlite = "Data Source=$AcceptanceDbPath"
 $env:DatabaseProvider = "Sqlite"
 $env:Database__InitializeSchema = "true"
 $env:Database__AutoSeed = "true"
