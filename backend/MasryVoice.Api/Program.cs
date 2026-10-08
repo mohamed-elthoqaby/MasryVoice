@@ -14,6 +14,7 @@ using MasryVoice.Api.Features.Automation;
 using MasryVoice.Api.Features.Telephony;
 using MasryVoice.Api.Common;
 using MasryVoice.Api.Domain;
+using MasryVoice.Api.Features.Integrations;
 using Microsoft.Extensions.Caching.Memory;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -46,6 +47,28 @@ builder.Services.AddSingleton(sp =>
     return new InferenceThrottlingManager(opts);
 });
 
+// Validate security secrets: Reject missing or placeholder production secrets at startup
+var adminKeyConfig = builder.Configuration["Security:AdminKey"];
+var hmacSecretConfig = builder.Configuration["Security:HmacSecret"];
+if (builder.Environment.IsProduction())
+{
+    if (string.IsNullOrWhiteSpace(adminKeyConfig) ||
+        adminKeyConfig.Contains("YOUR_ADMIN", StringComparison.OrdinalIgnoreCase) ||
+        adminKeyConfig.Contains("placeholder", StringComparison.OrdinalIgnoreCase) ||
+        adminKeyConfig.Length < 16)
+    {
+        throw new InvalidOperationException("Production startup rejected: Security:AdminKey must be a non-placeholder secret with at least 16 characters.");
+    }
+
+    if (string.IsNullOrWhiteSpace(hmacSecretConfig) ||
+        hmacSecretConfig.Contains("YOUR_HMAC", StringComparison.OrdinalIgnoreCase) ||
+        hmacSecretConfig.Contains("placeholder", StringComparison.OrdinalIgnoreCase) ||
+        hmacSecretConfig.Length < 16)
+    {
+        throw new InvalidOperationException("Production startup rejected: Security:HmacSecret must be a non-placeholder secret with at least 16 characters.");
+    }
+}
+
 // ASP.NET Core Bounded RateLimiter for general API traffic and expensive inference
 builder.Services.AddRateLimiter(options =>
 {
@@ -69,13 +92,17 @@ builder.Services.AddRateLimiter(options =>
         }), token);
     };
 
-    // Global / API policy: 60 req/min per IP
+    // Global / API policy: configurable req/min per IP (bounded defaults)
     options.AddPolicy("api", httpContext =>
     {
-        var clientIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown-client";
+        var config = httpContext.RequestServices.GetRequiredService<IConfiguration>();
+        int apiPermits = config.GetValue<int>("RateLimiting:ApiPermitLimit", builder.Environment.IsProduction() ? 60 : 300);
+        var clientIp = (builder.Environment.IsEnvironment("Testing") ? httpContext.Request.Headers["X-Test-Client-Id"].FirstOrDefault() : null)
+            ?? httpContext.Connection.RemoteIpAddress?.ToString()
+            ?? "unknown-client";
         return RateLimitPartition.GetFixedWindowLimiter(clientIp, _ => new FixedWindowRateLimiterOptions
         {
-            PermitLimit = 60,
+            PermitLimit = apiPermits,
             Window = TimeSpan.FromMinutes(1),
             QueueLimit = 0
         });
@@ -84,20 +111,25 @@ builder.Services.AddRateLimiter(options =>
     // Dedicated policy for expensive LLM / Speech inference endpoints
     options.AddPolicy("inference", httpContext =>
     {
-        var clientIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown-client";
+        var config = httpContext.RequestServices.GetRequiredService<IConfiguration>();
+        int inferenceTokenLimit = config.GetValue<int>("RateLimiting:InferenceTokenLimit", 20);
+        int inferenceTokensPerPeriod = config.GetValue<int>("RateLimiting:InferenceTokensPerPeriod", 5);
+        var clientIp = (builder.Environment.IsEnvironment("Testing") ? httpContext.Request.Headers["X-Test-Client-Id"].FirstOrDefault() : null)
+            ?? httpContext.Connection.RemoteIpAddress?.ToString()
+            ?? "unknown-client";
         return RateLimitPartition.GetTokenBucketLimiter(clientIp, _ => new TokenBucketRateLimiterOptions
         {
-            TokenLimit = 20,
-            TokensPerPeriod = 5,
+            TokenLimit = inferenceTokenLimit,
+            TokensPerPeriod = Math.Max(1, inferenceTokensPerPeriod),
             ReplenishmentPeriod = TimeSpan.FromSeconds(10),
             QueueLimit = 0
         });
     });
 
-    // Test-controllable policy for rate limit verification
+    // Test-controllable policy for rate limit verification: Expose test partition header exclusively in Testing
     options.AddPolicy("test-rate-limit", httpContext =>
     {
-        var partitionKey = httpContext.Request.Headers["X-Test-Client-Id"].FirstOrDefault()
+        var partitionKey = (builder.Environment.IsEnvironment("Testing") ? httpContext.Request.Headers["X-Test-Client-Id"].FirstOrDefault() : null)
             ?? httpContext.Connection.RemoteIpAddress?.ToString()
             ?? "default-client";
         return RateLimitPartition.GetFixedWindowLimiter(partitionKey, _ => new FixedWindowRateLimiterOptions
@@ -127,17 +159,22 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 
 // 5. Register HTTP Client & LLM Provider
 builder.Services.AddHttpClient();
-
-var llmChoice = builder.Configuration["LlmProvider"] ?? "Ollama";
-if (llmChoice.Equals("DeterministicFake", StringComparison.OrdinalIgnoreCase))
+builder.Services.AddSingleton<DeterministicFakeLlmProvider>();
+builder.Services.AddHttpClient<OllamaLlmProvider>();
+builder.Services.AddTransient<ILlmProvider>(sp =>
 {
-    builder.Services.AddSingleton<ILlmProvider, DeterministicFakeLlmProvider>();
-}
-else
-{
-    builder.Services.AddHttpClient<OllamaLlmProvider>();
-    builder.Services.AddTransient<ILlmProvider, OllamaLlmProvider>();
-}
+    var config = sp.GetRequiredService<IConfiguration>();
+    var choice = config["LlmProvider"] ?? (builder.Environment.IsEnvironment("Testing") ? "DeterministicFake" : "Ollama");
+    if (choice.Equals("DeterministicFake", StringComparison.OrdinalIgnoreCase))
+    {
+        return sp.GetRequiredService<DeterministicFakeLlmProvider>();
+    }
+    if (choice.Equals("Ollama", StringComparison.OrdinalIgnoreCase))
+    {
+        return sp.GetRequiredService<OllamaLlmProvider>();
+    }
+    throw new InvalidOperationException($"Unknown LLM provider configuration: '{choice}'");
+});
 
 // 6. Register Security & Auth Service
 builder.Services.AddSingleton<ISecurityService, SecurityService>();
@@ -167,10 +204,12 @@ builder.Services.AddScoped<IBookingConfirmationService, BookingConfirmationServi
 builder.Services.AddScoped<CheckAvailabilityTool>();
 builder.Services.AddScoped<StageBookingTool>();
 builder.Services.AddScoped<GetBookingTool>();
+builder.Services.AddScoped<CancelBookingTool>();
 builder.Services.AddScoped<SearchKnowledgeBaseTool>();
 builder.Services.AddScoped<ITool>(sp => sp.GetRequiredService<CheckAvailabilityTool>());
 builder.Services.AddScoped<ITool>(sp => sp.GetRequiredService<StageBookingTool>());
 builder.Services.AddScoped<ITool>(sp => sp.GetRequiredService<GetBookingTool>());
+builder.Services.AddScoped<ITool>(sp => sp.GetRequiredService<CancelBookingTool>());
 builder.Services.AddScoped<ITool>(sp => sp.GetRequiredService<SearchKnowledgeBaseTool>());
 builder.Services.AddScoped<ToolRegistry>();
 
@@ -178,40 +217,94 @@ builder.Services.AddScoped<ToolRegistry>();
 builder.Services.AddScoped<AgentOrchestrator>();
 
 // 11. Register Speech Pipeline & Voice Session
-var sttProviderType = builder.Configuration["Voice:SttProvider"] ?? "Simulated";
-if (sttProviderType.Equals("Whisper", StringComparison.OrdinalIgnoreCase) ||
-    sttProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
-{
-    var sttBaseUrl = builder.Configuration["Voice:SttBaseUrl"] ?? "http://127.0.0.1:8000";
-    builder.Services.AddHttpClient<ISttProvider, WhisperSttProvider>(c =>
-    {
-        c.BaseAddress = new Uri(sttBaseUrl);
-        c.Timeout = TimeSpan.FromSeconds(30);
-    });
-}
-else
-{
-    builder.Services.AddSingleton<ISttProvider, SimulatedSttProvider>();
-}
+builder.Services.AddSingleton<SimulatedSttProvider>();
+builder.Services.AddSingleton<SimulatedTtsProvider>();
 
-var ttsProviderType = builder.Configuration["Voice:TtsProvider"] ?? "Simulated";
-if (ttsProviderType.Equals("LocalEgyptian", StringComparison.OrdinalIgnoreCase) ||
-    ttsProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
+var sttBaseUrl = builder.Configuration["Voice:SttBaseUrl"] 
+    ?? builder.Configuration["Voice:SpeechServerUrl"] 
+    ?? "http://127.0.0.1:8000";
+builder.Services.AddHttpClient<WhisperSttProvider>(c =>
 {
-    var ttsBaseUrl = builder.Configuration["Voice:TtsBaseUrl"] ?? "http://127.0.0.1:8000";
-    builder.Services.AddHttpClient<ITtsProvider, LocalEgyptianTtsProvider>(c =>
+    c.BaseAddress = new Uri(sttBaseUrl);
+    c.Timeout = TimeSpan.FromSeconds(30);
+});
+
+var ttsBaseUrl = builder.Configuration["Voice:TtsBaseUrl"] 
+    ?? builder.Configuration["Voice:SpeechServerUrl"] 
+    ?? "http://127.0.0.1:8000";
+builder.Services.AddHttpClient<LocalEgyptianTtsProvider>(c =>
+{
+    c.BaseAddress = new Uri(ttsBaseUrl);
+    c.Timeout = TimeSpan.FromSeconds(30);
+});
+
+builder.Services.AddTransient<ISttProvider>(sp =>
+{
+    var config = sp.GetRequiredService<IConfiguration>();
+    var sttProviderType = config["Voice:SttProvider"] ?? "Simulated";
+    if (sttProviderType.Equals("Whisper", StringComparison.OrdinalIgnoreCase) ||
+        sttProviderType.Equals("LocalEgyptian", StringComparison.OrdinalIgnoreCase) ||
+        sttProviderType.Equals("LocalEgyptianVoice", StringComparison.OrdinalIgnoreCase) ||
+        sttProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
     {
-        c.BaseAddress = new Uri(ttsBaseUrl);
-        c.Timeout = TimeSpan.FromSeconds(30);
-    });
-}
-else
+        return sp.GetRequiredService<WhisperSttProvider>();
+    }
+    if (sttProviderType.Equals("Simulated", StringComparison.OrdinalIgnoreCase))
+    {
+        return sp.GetRequiredService<SimulatedSttProvider>();
+    }
+    throw new InvalidOperationException($"Unknown STT provider configuration: '{sttProviderType}'");
+});
+
+builder.Services.AddTransient<ITtsProvider>(sp =>
 {
-    builder.Services.AddSingleton<ITtsProvider, SimulatedTtsProvider>();
-}
+    var config = sp.GetRequiredService<IConfiguration>();
+    var ttsProviderType = config["Voice:TtsProvider"] ?? "Simulated";
+    if (ttsProviderType.Equals("LocalEgyptian", StringComparison.OrdinalIgnoreCase) ||
+        ttsProviderType.Equals("LocalEgyptianVoice", StringComparison.OrdinalIgnoreCase) ||
+        ttsProviderType.Equals("Piper", StringComparison.OrdinalIgnoreCase) ||
+        ttsProviderType.Equals("Real", StringComparison.OrdinalIgnoreCase))
+    {
+        return sp.GetRequiredService<LocalEgyptianTtsProvider>();
+    }
+    if (ttsProviderType.Equals("Simulated", StringComparison.OrdinalIgnoreCase))
+    {
+        return sp.GetRequiredService<SimulatedTtsProvider>();
+    }
+    throw new InvalidOperationException($"Unknown TTS provider configuration: '{ttsProviderType}'");
+});
 builder.Services.AddSingleton<VoiceSessionManager>();
+var voiceAdmissionOptions = new VoiceAdmissionOptions
+{
+    MaxConcurrentStt = int.TryParse(builder.Configuration["Voice:MaxConcurrentStt"], out var sttC) ? sttC : 2,
+    MaxConcurrentTts = int.TryParse(builder.Configuration["Voice:MaxConcurrentTts"], out var ttsC) ? ttsC : 2,
+    MaxQueueLength = int.TryParse(builder.Configuration["Voice:MaxQueueLength"], out var qLen) ? qLen : 5,
+    QueueWaitTimeoutSeconds = int.TryParse(builder.Configuration["Voice:QueueWaitTimeoutSeconds"], out var qTo) ? qTo : 15
+};
+builder.Services.AddSingleton(new VoiceAdmissionManager(voiceAdmissionOptions));
 
-// 12. Register Durable Outbox Processor Background Service
+// 12. Register Integrations (Calendar, WhatsApp, Telegram) & Durable Outbox
+builder.Services.AddHttpClient();
+var integrationMode = builder.Configuration["Integrations:ProviderMode"] ?? "Mock";
+if (string.Equals(integrationMode, "Production", StringComparison.OrdinalIgnoreCase) ||
+    string.Equals(integrationMode, "RealCloud", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddSingleton<ICalendarIntegrationService, Microsoft365CalendarService>();
+    builder.Services.AddSingleton<IWhatsAppMessagingService, WhatsAppCloudApiService>();
+    builder.Services.AddSingleton<ITelegramMessagingService, TelegramBotService>();
+}
+else
+{
+    builder.Services.AddSingleton<MockCalendarIntegrationService>();
+    builder.Services.AddSingleton<ICalendarIntegrationService>(sp => sp.GetRequiredService<MockCalendarIntegrationService>());
+
+    builder.Services.AddSingleton<MockWhatsAppMessagingService>();
+    builder.Services.AddSingleton<IWhatsAppMessagingService>(sp => sp.GetRequiredService<MockWhatsAppMessagingService>());
+
+    builder.Services.AddSingleton<MockTelegramMessagingService>();
+    builder.Services.AddSingleton<ITelegramMessagingService>(sp => sp.GetRequiredService<MockTelegramMessagingService>());
+}
+builder.Services.AddSingleton<IntegrationDispatchCoordinator>();
 builder.Services.AddHostedService<DurableOutboxProcessor>();
 
 // 13. Register Asterisk AudioSocket Telephony Adapter
@@ -236,7 +329,8 @@ using (var scope = app.Services.CreateScope())
 
     if (shouldInitSchema)
     {
-        await db.Database.EnsureCreatedAsync();
+        var logger = scope.ServiceProvider.GetService<ILogger<AppDbContext>>();
+        await DatabaseMigrationHelper.ApplyMigrationsAsync(db, logger);
     }
 
     if (shouldSeed)
@@ -249,40 +343,93 @@ using (var scope = app.Services.CreateScope())
 // API Endpoints
 // ----------------------------------------------------
 
-// Health & System Status Endpoint (With Inference, Automation & Telephony Metrics)
+// ----------------------------------------------------
+// Health & System Status Endpoints
+// ----------------------------------------------------
+
+// Liveness Probe (Process is alive and responding)
+app.MapGet("/api/health/live", () => Results.Ok(new
+{
+    status = "Alive",
+    environment = builder.Environment.EnvironmentName,
+    timestampUtc = DateTime.UtcNow
+}));
+
+// Readiness Probe (Strict dependency connectivity: Database must be reachable within bounded timeout)
+app.MapGet("/api/health/ready", async (AppDbContext db) =>
+{
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+    bool dbOk = false;
+    try
+    {
+        dbOk = await db.Database.CanConnectAsync(cts.Token);
+    }
+    catch { }
+
+    if (!dbOk)
+    {
+        return Results.Json(new
+        {
+            status = "Unhealthy",
+            environment = builder.Environment.EnvironmentName,
+            databaseConnected = false,
+            reason = "Database unreachable"
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
+    return Results.Ok(new
+    {
+        status = "Ready",
+        environment = builder.Environment.EnvironmentName,
+        databaseConnected = true,
+        timestampUtc = DateTime.UtcNow
+    });
+});
+
+// Comprehensive System Health (Returns 503 if database fails, 200 if healthy)
 app.MapGet("/api/health", async (
     AppDbContext db,
     IConfiguration cfg,
     InferenceThrottlingManager throttling,
     ITelephonyAdapter telephony,
-    VoiceSessionManager voiceSessions) =>
+    VoiceSessionManager voiceSessions,
+    ILlmProvider llm,
+    ISttProvider stt,
+    ITtsProvider tts) =>
 {
     var nowCairo = CairoTimeHelper.NowCairo;
     var isBusinessHours = CairoTimeHelper.IsBusinessHours(nowCairo);
 
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
     bool dbOk = false;
     int pendingOutbox = 0;
     int deadLetterOutbox = 0;
     try
     {
-        dbOk = await db.Database.CanConnectAsync();
+        dbOk = await db.Database.CanConnectAsync(cts.Token);
         if (dbOk)
         {
-            pendingOutbox = await db.OutboxJobs.CountAsync(j => j.Status == "Pending");
-            deadLetterOutbox = await db.OutboxJobs.CountAsync(j => j.Status == "DeadLetter");
+            pendingOutbox = await db.OutboxJobs.CountAsync(j => j.Status == "Pending", cts.Token);
+            deadLetterOutbox = await db.OutboxJobs.CountAsync(j => j.Status == "DeadLetter", cts.Token);
         }
     }
     catch { }
 
-    return Results.Ok(new
+    var payload = new
     {
-        status = "Healthy",
+        status = dbOk ? "Healthy" : "Unhealthy",
+        environment = builder.Environment.EnvironmentName,
         timestampUtc = DateTime.UtcNow,
         cairoTime = nowCairo.ToString("yyyy-MM-dd HH:mm:ss"),
         isCairoBusinessHours = isBusinessHours,
         businessSchedule = "Sun-Thu 09:00 - 17:00 (Africa/Cairo)",
         databaseConnected = dbOk,
         configuredLlmProvider = cfg["LlmProvider"] ?? "Ollama",
+        configuredSttProvider = cfg["Voice:SttProvider"] ?? "Simulated",
+        configuredTtsProvider = cfg["Voice:TtsProvider"] ?? "Simulated",
+        resolvedLlmType = llm.GetType().Name,
+        resolvedSttType = stt.GetType().Name,
+        resolvedTtsType = tts.GetType().Name,
         defaultModel = cfg["Ollama:DefaultModel"] ?? "qwen2.5:3b",
         inferenceLoad = new
         {
@@ -301,10 +448,17 @@ app.MapGet("/api/health", async (
             isListening = telephony.IsListening,
             activeCalls = telephony.ActiveCallsCount
         }
-    });
+    };
+
+    if (!dbOk)
+    {
+        return Results.Json(payload, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
+    return Results.Ok(payload);
 });
 
-// Agent Management Endpoints (With AsNoTracking and Cache Invalidation)
+// Agent Management Endpoints (Admin Protected with Rate Limiting)
 app.MapGet("/api/agents", async (AppDbContext db) =>
 {
     var agents = await db.Agents.AsNoTracking().OrderBy(a => a.CreatedAtUtc).ToListAsync();
@@ -320,10 +474,16 @@ app.MapGet("/api/agents", async (AppDbContext db) =>
         allowedTools = a.GetAllowedTools(),
         createdAtUtc = a.CreatedAtUtc
     }));
-});
+}).RequireRateLimiting("api");
 
-app.MapPost("/api/agents", async (AppDbContext db, Microsoft.Extensions.Caching.Memory.IMemoryCache cache, AgentUpdateRequest req) =>
+app.MapPost("/api/agents", async (HttpContext ctx, AppDbContext db, ISecurityService security, Microsoft.Extensions.Caching.Memory.IMemoryCache cache, AgentUpdateRequest req) =>
 {
+    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
+    if (!security.ValidateAdminKey(authHeader))
+    {
+        return Results.Unauthorized();
+    }
+
     var agent = await db.Agents.FirstOrDefaultAsync(a => a.Id == req.Id);
     if (agent == null)
     {
@@ -333,11 +493,11 @@ app.MapPost("/api/agents", async (AppDbContext db, Microsoft.Extensions.Caching.
 
     agent.Name = req.Name;
     agent.SystemPrompt = req.SystemPrompt;
-    agent.ModelName = req.ModelName;
-    agent.LanguageCode = req.LanguageCode;
+    agent.ModelName = string.IsNullOrWhiteSpace(req.ModelName) ? "qwen2.5:1.5b" : req.ModelName;
+    agent.LanguageCode = string.IsNullOrWhiteSpace(req.LanguageCode) ? "ar-EG" : req.LanguageCode;
     agent.Temperature = req.Temperature;
     agent.IsActive = req.IsActive;
-    agent.SetAllowedTools(req.AllowedTools);
+    agent.SetAllowedTools(req.AllowedTools ?? new List<string>());
 
     await db.SaveChangesAsync();
 
@@ -345,7 +505,7 @@ app.MapPost("/api/agents", async (AppDbContext db, Microsoft.Extensions.Caching.
     cache.Remove($"agent_{agent.Id}");
 
     return Results.Ok(agent);
-});
+}).RequireRateLimiting("api");
 
 // Available Slots Endpoint (With AsNoTracking & 15s Read-Cache with Invalidation)
 app.MapGet("/api/slots", async (AppDbContext db, Microsoft.Extensions.Caching.Memory.IMemoryCache cache, string? date) =>
@@ -383,7 +543,7 @@ app.MapGet("/api/slots", async (AppDbContext db, Microsoft.Extensions.Caching.Me
 
     cache.Set(cacheKey, resultList, TimeSpan.FromSeconds(15));
     return Results.Ok(resultList);
-});
+}).RequireRateLimiting("api");
 
 // Bookings List Endpoint (Admin Protected)
 app.MapGet("/api/bookings", async (HttpContext ctx, AppDbContext db, ISecurityService security) =>
@@ -405,6 +565,7 @@ app.MapGet("/api/bookings", async (HttpContext ctx, AppDbContext db, ISecuritySe
     {
         id = b.Id,
         slotId = b.SlotId,
+        conversationId = b.ConversationId,
         customerName = b.CustomerName,
         customerPhone = b.CustomerPhone,
         serviceName = b.ServiceName,
@@ -414,25 +575,16 @@ app.MapGet("/api/bookings", async (HttpContext ctx, AppDbContext db, ISecuritySe
         idempotencyKey = b.IdempotencyKey,
         createdAtUtc = b.CreatedAtUtc
     }));
-});
+}).RequireRateLimiting("api");
 
-// Single Booking Lookup Endpoint (Protected: Admin or Authorized Customer)
+// Single Booking Lookup Endpoint (Protected: Admin or Verified Owning Customer)
 app.MapGet("/api/bookings/{id:guid}", async (Guid id, HttpContext ctx, AppDbContext db, ISecurityService security) =>
 {
     var booking = await db.Bookings.AsNoTracking().Include(b => b.Slot).FirstOrDefaultAsync(b => b.Id == id);
     if (booking == null) return Results.NotFound();
 
-    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
-    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
-
-    bool isAdmin = security.ValidateAdminKey(authHeader);
-    bool isCustomer = false;
-    if (!isAdmin && !string.IsNullOrEmpty(customerToken))
-    {
-        isCustomer = security.ValidateCustomerAccess(customerToken, Guid.Empty, booking.CustomerPhone);
-    }
-
-    if (!isAdmin && !isCustomer)
+    // Strict ownership: Access is bound to the owning conversation, not a caller-supplied phone number
+    if (!booking.ConversationId.HasValue || !security.HasAccessToConversation(ctx, booking.ConversationId.Value))
     {
         return Results.StatusCode(StatusCodes.Status403Forbidden);
     }
@@ -441,6 +593,7 @@ app.MapGet("/api/bookings/{id:guid}", async (Guid id, HttpContext ctx, AppDbCont
     {
         id = booking.Id,
         slotId = booking.SlotId,
+        conversationId = booking.ConversationId,
         customerName = booking.CustomerName,
         customerPhone = booking.CustomerPhone,
         serviceName = booking.ServiceName,
@@ -450,11 +603,163 @@ app.MapGet("/api/bookings/{id:guid}", async (Guid id, HttpContext ctx, AppDbCont
         idempotencyKey = booking.IdempotencyKey,
         createdAtUtc = booking.CreatedAtUtc
     });
-});
+}).RequireRateLimiting("api");
 
-// Pending Bookings Endpoint (AsNoTracking)
-app.MapGet("/api/bookings/pending", async (AppDbContext db, Guid? conversationId) =>
+// Cancel Booking Endpoint (Protected: Admin or Verified Owning Customer)
+app.MapPost("/api/bookings/{id:guid}/cancel", async (
+    Guid id,
+    HttpContext ctx,
+    AppDbContext db,
+    ISecurityService security,
+    Microsoft.Extensions.Caching.Memory.IMemoryCache cache,
+    CancellationToken ct) =>
 {
+    var booking = await db.Bookings.Include(b => b.Slot).FirstOrDefaultAsync(b => b.Id == id, ct);
+    if (booking == null) return Results.NotFound(new { success = false, message = "الحجز غير موجود." });
+
+    if (!booking.ConversationId.HasValue || !security.HasAccessToConversation(ctx, booking.ConversationId.Value))
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
+    if (booking.Status == "Cancelled")
+    {
+        return Results.Ok(new { success = true, message = "الحجز ملغى بالفعل مسبقاً.", bookingId = booking.Id, status = "Cancelled" });
+    }
+
+    booking.Status = "Cancelled";
+    if (booking.Slot != null)
+    {
+        booking.Slot.BookedCapacity = Math.Max(0, booking.Slot.BookedCapacity - 1);
+    }
+    else
+    {
+        var slot = await db.AvailabilitySlots.FirstOrDefaultAsync(s => s.Id == booking.SlotId, ct);
+        if (slot != null)
+        {
+            slot.BookedCapacity = Math.Max(0, slot.BookedCapacity - 1);
+        }
+    }
+
+    db.OutboxJobs.Add(new OutboxJob
+    {
+        Id = Guid.NewGuid(),
+        Topic = "BookingCancelled",
+        PayloadJson = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            bookingId = booking.Id,
+            customerName = booking.CustomerName,
+            customerPhone = booking.CustomerPhone,
+            serviceName = booking.ServiceName,
+            bookingDateUtc = booking.BookingDateUtc,
+            cancelledAtUtc = DateTime.UtcNow
+        }),
+        Status = "Pending",
+        CreatedAtUtc = DateTime.UtcNow,
+        NextRetryUtc = DateTime.UtcNow
+    });
+
+    await db.SaveChangesAsync(ct);
+    cache.Remove("slots_all");
+
+    return Results.Ok(new
+    {
+        success = true,
+        message = "تم إلغاء الحجز بنجاح.",
+        bookingId = booking.Id,
+        status = "Cancelled",
+        cairoTime = CairoTimeHelper.FormatCairoFriendly(booking.BookingDateUtc)
+    });
+}).RequireRateLimiting("api");
+
+// Test Fixtures Cleanup Endpoint (Admin Protected: for safely scoped acceptance test fixture cleanup)
+app.MapDelete("/api/admin/fixtures", async (
+    HttpContext ctx,
+    AppDbContext db,
+    ISecurityService security,
+    Microsoft.Extensions.Caching.Memory.IMemoryCache cache,
+    IWebHostEnvironment env,
+    [Microsoft.AspNetCore.Mvc.FromQuery] string? conversationIds,
+    CancellationToken ct) =>
+{
+    if (env.IsProduction())
+    {
+        return Results.NotFound();
+    }
+
+    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
+    if (!security.ValidateAdminKey(authHeader))
+    {
+        return Results.Unauthorized();
+    }
+
+    if (string.IsNullOrWhiteSpace(conversationIds))
+    {
+        return Results.BadRequest(new { message = "conversationIds parameter is required" });
+    }
+
+    var guids = conversationIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(s => Guid.TryParse(s, out var g) ? g : Guid.Empty)
+        .Where(g => g != Guid.Empty)
+        .ToList();
+
+    if (guids.Count == 0)
+    {
+        return Results.BadRequest(new { message = "No valid GUIDs provided" });
+    }
+
+    var pendingBookings = await db.PendingBookings.Where(pb => guids.Contains(pb.ConversationId)).ToListAsync(ct);
+    var slotIds = pendingBookings.Select(pb => pb.SlotId).Distinct().ToList();
+
+    var bookings = await db.Bookings.Where(b => b.ConversationId != null && guids.Contains(b.ConversationId.Value)).ToListAsync(ct);
+    foreach (var b in bookings)
+    {
+        if (!slotIds.Contains(b.SlotId)) slotIds.Add(b.SlotId);
+    }
+
+    db.Bookings.RemoveRange(bookings);
+    db.PendingBookings.RemoveRange(pendingBookings);
+
+    var conversations = await db.Conversations.Where(c => guids.Contains(c.Id)).ToListAsync(ct);
+    db.Conversations.RemoveRange(conversations);
+
+    await db.SaveChangesAsync(ct);
+
+    foreach (var slotId in slotIds)
+    {
+        var activeCount = await db.Bookings.CountAsync(b => b.SlotId == slotId && b.Status == "Confirmed", ct);
+        var slot = await db.AvailabilitySlots.FirstOrDefaultAsync(s => s.Id == slotId, ct);
+        if (slot != null)
+        {
+            slot.BookedCapacity = activeCount;
+        }
+    }
+    await db.SaveChangesAsync(ct);
+    cache.Remove("slots_all");
+
+    return Results.Ok(new { success = true, cleanedConversations = guids.Count, cleanedBookings = bookings.Count });
+}).RequireRateLimiting("api");
+
+
+// Pending Bookings Endpoint (Protected: Admin or Verified Owning Customer)
+app.MapGet("/api/bookings/pending", async (HttpContext ctx, AppDbContext db, ISecurityService security, Guid? conversationId) =>
+{
+    if (!conversationId.HasValue || conversationId.Value == Guid.Empty)
+    {
+        var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
+        if (!security.ValidateAdminKey(authHeader))
+        {
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+        }
+    }
+    else
+    {
+        if (!security.HasAccessToConversation(ctx, conversationId.Value))
+        {
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+        }
+    }
+
     var query = db.PendingBookings.AsNoTracking().Include(pb => pb.Slot).AsQueryable();
     if (conversationId.HasValue && conversationId.Value != Guid.Empty)
     {
@@ -474,17 +779,61 @@ app.MapGet("/api/bookings/pending", async (AppDbContext db, Guid? conversationId
         status = pb.Status,
         createdAtUtc = pb.CreatedAtUtc
     }));
-});
+}).RequireRateLimiting("api");
 
-// Stage Pending Booking Draft Endpoint
+// Server Session Generation Endpoint (Protected: Server-minted conversation session)
+app.MapPost("/api/sessions", async (AppDbContext db, ISecurityService security, CancellationToken ct) =>
+{
+    var convId = Guid.NewGuid();
+    var agent = await db.Agents.FirstOrDefaultAsync(ct);
+    var conv = new Conversation
+    {
+        Id = convId,
+        AgentId = agent?.Id ?? Guid.Parse("11111111-1111-1111-1111-111111111111"),
+        Channel = "web",
+        Status = "Active",
+        StartedAtUtc = DateTime.UtcNow,
+        LastActiveAtUtc = DateTime.UtcNow
+    };
+    db.Conversations.Add(conv);
+    await db.SaveChangesAsync(ct);
+
+    var token = security.GenerateCustomerToken(convId, null);
+    return Results.Ok(new
+    {
+        conversationId = convId,
+        customerToken = token
+    });
+}).RequireRateLimiting("api");
+
+// Stage Pending Booking Draft Endpoint (Protected: Verified Owning Customer or Admin)
 app.MapPost("/api/bookings/stage", async (
+    HttpContext ctx,
     AppDbContext db,
+    ISecurityService security,
     [Microsoft.AspNetCore.Mvc.FromBody] StageBookingRequest req,
     CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(req.CustomerName) || string.IsNullOrWhiteSpace(req.CustomerPhone))
     {
         return Results.BadRequest(new { success = false, message = "CustomerName and CustomerPhone are required." });
+    }
+
+    if (req.ConversationId == Guid.Empty)
+    {
+        return Results.BadRequest(new { success = false, message = "ConversationId is required." });
+    }
+
+    // Must be an existing conversation owned by the caller (or admin)
+    var convExists = await db.Conversations.AnyAsync(c => c.Id == req.ConversationId, ct);
+    if (!convExists)
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
+    if (!security.HasAccessToConversation(ctx, req.ConversationId))
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
     }
 
     AvailabilitySlot? slot = null;
@@ -513,26 +862,7 @@ app.MapPost("/api/bookings/stage", async (
     var serviceName = string.IsNullOrWhiteSpace(req.ServiceName) ? slot.ServiceName : req.ServiceName;
     var requestHash = PendingBooking.ComputeRequestHash(slot.Id, req.CustomerPhone, req.CustomerName, serviceName);
 
-    var convId = req.ConversationId == Guid.Empty ? Guid.NewGuid() : req.ConversationId;
-    var conv = await db.Conversations.FirstOrDefaultAsync(c => c.Id == convId, ct);
-    if (conv == null)
-    {
-        var agent = await db.Agents.FirstOrDefaultAsync(ct);
-        conv = new Conversation
-        {
-            Id = convId,
-            AgentId = agent?.Id ?? Guid.Parse("11111111-1111-1111-1111-111111111111"),
-            CustomerName = req.CustomerName,
-            CustomerPhoneNumber = req.CustomerPhone,
-            Channel = "web",
-            Status = "Active",
-            StartedAtUtc = DateTime.UtcNow,
-            LastActiveAtUtc = DateTime.UtcNow
-        };
-        db.Conversations.Add(conv);
-        await db.SaveChangesAsync(ct);
-    }
-
+    var convId = req.ConversationId;
     var idempotencyKey = $"idemp_{convId:N}_{slot.Id:N}_{req.CustomerPhone}";
     var pending = await db.PendingBookings.FirstOrDefaultAsync(pb => pb.ConversationId == convId, ct);
     if (pending != null)
@@ -568,6 +898,9 @@ app.MapPost("/api/bookings/stage", async (
 
     await db.SaveChangesAsync(ct);
 
+    // Staging must NOT provide an alternative anonymous token-minting path.
+    var existingCustomerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
+
     return Results.Ok(new
     {
         success = true,
@@ -579,18 +912,33 @@ app.MapPost("/api/bookings/stage", async (
         serviceName = pending.ServiceName,
         requestHash = pending.RequestHash,
         cairoTime = CairoTimeHelper.FormatCairoFriendly(slot.StartTimeUtc),
-        status = pending.Status
+        status = pending.Status,
+        customerToken = existingCustomerToken
     });
-});
+}).RequireRateLimiting("api");
 
-// Explicit Customer Confirmation Action Endpoint
+// Explicit Customer Confirmation Action Endpoint (Protected: Verified Owning Customer or Admin)
 app.MapPost("/api/bookings/confirm", async (
+    HttpContext ctx,
+    AppDbContext db,
     IBookingConfirmationService confirmationService,
     ISecurityService security,
     Microsoft.Extensions.Caching.Memory.IMemoryCache cache,
-    ConfirmBookingRequest req,
+    [Microsoft.AspNetCore.Mvc.FromBody] ConfirmBookingRequest req,
     CancellationToken ct) =>
 {
+    var pending = await db.PendingBookings.AsNoTracking().FirstOrDefaultAsync(pb => pb.Id == req.PendingBookingId, ct);
+    if (pending == null)
+    {
+        return Results.NotFound(new { success = false, message = "طلب الحجز المعلق غير موجود في النظام." });
+    }
+
+    // Require a validated owner or authorized admin before confirmation or credential issuance
+    if (!security.HasAccessToConversation(ctx, pending.ConversationId) || req.ConversationId != pending.ConversationId)
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
     var result = await confirmationService.ConfirmPendingBookingAsync(
         req.ConversationId,
         req.PendingBookingId,
@@ -602,35 +950,36 @@ app.MapPost("/api/bookings/confirm", async (
         return Results.BadRequest(result);
     }
 
-    // Generate signed customer token for future verified access
-    string? customerToken = null;
-    if (result.Data != null)
+    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
+    string? issuedToken = customerToken;
+    if (string.IsNullOrEmpty(issuedToken) && result.Data != null)
     {
         var phone = ((dynamic)result.Data).customerPhone as string;
-        customerToken = security.GenerateCustomerToken(req.ConversationId, phone);
+        issuedToken = security.GenerateCustomerToken(req.ConversationId, phone);
     }
 
     cache.Remove("slots_all");
+
+    Guid? bookingId = null;
+    if (result.Data != null)
+    {
+        try { bookingId = (Guid)((dynamic)result.Data).bookingId; } catch { }
+    }
 
     return Results.Ok(new
     {
         result.Success,
         result.Message,
+        bookingId,
         result.Data,
-        customerToken
+        customerToken = issuedToken
     });
-});
+}).RequireRateLimiting("api");
 
 // Conversation History & Tool Execution Logs (Protected: Admin or Customer)
 app.MapGet("/api/conversations/{id:guid}", async (Guid id, HttpContext ctx, AppDbContext db, ISecurityService security) =>
 {
-    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
-    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
-
-    bool isAdmin = security.ValidateAdminKey(authHeader);
-    bool isCustomer = security.ValidateCustomerAccess(customerToken, id);
-
-    if (!isAdmin && !isCustomer)
+    if (!security.HasAccessToConversation(ctx, id))
     {
         return Results.StatusCode(StatusCodes.Status403Forbidden);
     }
@@ -677,25 +1026,72 @@ app.MapGet("/api/conversations/{id:guid}", async (Guid id, HttpContext ctx, AppD
             executedAtUtc = t.ExecutedAtUtc
         })
     });
-});
+}).RequireRateLimiting("api");
 
-// Server-Sent Events (SSE) Streaming Text Chat Endpoint
+// Server-Sent Events (SSE) Streaming Text Chat Endpoint (Protected: Verified Owner or New Anonymous Session)
 app.MapPost("/api/chat/stream", async (
     HttpContext httpContext,
+    AppDbContext db,
     AgentOrchestrator orchestrator,
     ISecurityService security,
+    ILogger<Program> logger,
     [Microsoft.AspNetCore.Mvc.FromBody] ChatStreamRequest request,
     CancellationToken ct) =>
 {
+    var authHeader = httpContext.Request.Headers["Authorization"].FirstOrDefault() ?? httpContext.Request.Headers["X-Admin-Key"].FirstOrDefault();
+    bool isAdmin = security.ValidateAdminKey(authHeader);
+
+    Guid convId;
+    string customerToken;
+
+    if (!request.ConversationId.HasValue || request.ConversationId.Value == Guid.Empty)
+    {
+        // Start new anonymous customer session: server generates identifier and scoped credential
+        convId = Guid.NewGuid();
+        var agent = await db.Agents.FirstOrDefaultAsync(ct);
+        db.Conversations.Add(new Conversation
+        {
+            Id = convId,
+            AgentId = agent?.Id ?? Guid.Parse("11111111-1111-1111-1111-111111111111"),
+            Channel = "web",
+            Status = "Active",
+            StartedAtUtc = DateTime.UtcNow,
+            LastActiveAtUtc = DateTime.UtcNow
+        });
+        await db.SaveChangesAsync(ct);
+        customerToken = security.GenerateCustomerToken(convId, null);
+    }
+    else
+    {
+        var conv = await db.Conversations.FirstOrDefaultAsync(c => c.Id == request.ConversationId.Value, ct);
+        if (conv == null)
+        {
+            // Reject unauthorized supplied identifiers
+            httpContext.Response.StatusCode = StatusCodes.Status403Forbidden;
+            httpContext.Response.ContentType = "application/json";
+            await httpContext.Response.WriteAsJsonAsync(new { message = "المعرف المقدم غير مصرح به." }, ct);
+            return;
+        }
+
+        if (!security.HasAccessToConversation(httpContext, request.ConversationId.Value))
+        {
+            httpContext.Response.StatusCode = StatusCodes.Status403Forbidden;
+            httpContext.Response.ContentType = "application/json";
+            await httpContext.Response.WriteAsJsonAsync(new { message = "غير مصرح بالوصول إلى هذه المحادثة." }, ct);
+            return;
+        }
+
+        convId = request.ConversationId.Value;
+        customerToken = httpContext.Request.Headers["X-Customer-Token"].FirstOrDefault()
+            ?? (isAdmin ? security.GenerateCustomerToken(convId, null) : string.Empty);
+    }
+
     httpContext.Response.Headers.ContentType = "text/event-stream";
     httpContext.Response.Headers.CacheControl = "no-cache";
     httpContext.Response.Headers.Connection = "keep-alive";
 
-    var convId = request.ConversationId == Guid.Empty ? Guid.NewGuid() : request.ConversationId;
     using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, httpContext.RequestAborted);
 
-    // Issue customer session token
-    var customerToken = security.GenerateCustomerToken(convId, null);
     var initEvent = JsonSerializer.Serialize(new
     {
         conversationId = convId,
@@ -705,16 +1101,24 @@ app.MapPost("/api/chat/stream", async (
     await httpContext.Response.WriteAsync($"data: {initEvent}\n\n", linkedCts.Token);
     await httpContext.Response.Body.FlushAsync(linkedCts.Token);
 
+    var effectiveAgentId = request.AgentId;
+    if (effectiveAgentId == Guid.Empty)
+    {
+        var existingConv = await db.Conversations.FirstOrDefaultAsync(c => c.Id == convId, ct);
+        effectiveAgentId = existingConv?.AgentId ?? (await db.Agents.FirstOrDefaultAsync(ct))?.Id ?? Guid.Parse("11111111-1111-1111-1111-111111111111");
+    }
+
     try
     {
-        await foreach (var chatEvent in orchestrator.ProcessUserMessageAsync(request.AgentId, convId, request.Message, linkedCts.Token))
+        await foreach (var chatEvent in orchestrator.ProcessUserMessageAsync(effectiveAgentId, convId, request.Message, linkedCts.Token))
         {
             var jsonEvent = JsonSerializer.Serialize(new
             {
                 conversationId = convId,
                 type = chatEvent.EventType,
                 content = chatEvent.Content,
-                metadata = chatEvent.Metadata
+                metadata = chatEvent.Metadata,
+                correlationId = httpContext.TraceIdentifier
             });
 
             await httpContext.Response.WriteAsync($"data: {jsonEvent}\n\n", linkedCts.Token);
@@ -724,6 +1128,20 @@ app.MapPost("/api/chat/stream", async (
     catch (OperationCanceledException) when (httpContext.RequestAborted.IsCancellationRequested)
     {
         // Client disconnected; cancellation propagated to release locks & permits
+    }
+    catch (Exception ex) when (!httpContext.RequestAborted.IsCancellationRequested)
+    {
+        logger.LogError(ex, "Chat stream failure correlationId={CorrelationId}", httpContext.TraceIdentifier);
+        var errEvent = JsonSerializer.Serialize(new
+        {
+            conversationId = convId,
+            type = "error",
+            content = "عذراً، حدث خطأ أثناء معالجة المحادثة.",
+            metadata = new ChatErrorInfo("INTERNAL_ERROR", "chat"),
+            correlationId = httpContext.TraceIdentifier
+        });
+        await httpContext.Response.WriteAsync($"data: {errEvent}\n\n", ct);
+        await httpContext.Response.Body.FlushAsync(ct);
     }
 }).RequireRateLimiting("inference");
 
@@ -743,7 +1161,7 @@ app.MapPost("/api/knowledge/ingest", async (HttpContext ctx, IKnowledgeService k
 
     var doc = await knowledge.IngestDocumentAsync(req.Title, req.FileName ?? "doc.md", req.Content, req.Category ?? "General");
     return Results.Ok(new { doc.Id, doc.Title, doc.ChunkCount, doc.CreatedAtUtc });
-});
+}).RequireRateLimiting("inference");
 
 app.MapGet("/api/knowledge/documents", async (HttpContext ctx, AppDbContext db, ISecurityService security) =>
 {
@@ -752,102 +1170,611 @@ app.MapGet("/api/knowledge/documents", async (HttpContext ctx, AppDbContext db, 
 
     var docs = await db.KnowledgeDocuments.AsNoTracking().OrderByDescending(d => d.CreatedAtUtc).ToListAsync();
     return Results.Ok(docs);
-});
+}).RequireRateLimiting("api");
 
 app.MapGet("/api/knowledge/search", async (IKnowledgeService knowledge, string query) =>
 {
     if (string.IsNullOrWhiteSpace(query)) return Results.BadRequest(new { message = "Query parameter is required." });
     var results = await knowledge.SearchAsync(query);
     return Results.Ok(results);
-});
+}).RequireRateLimiting("inference");
 
 // ----------------------------------------------------
 // Voice Pipeline Endpoints
 // ----------------------------------------------------
 
-app.MapPost("/api/voice/session", (VoiceSessionManager sessionMgr, [Microsoft.AspNetCore.Mvc.FromBody] VoiceSessionRequest req) =>
+app.MapPost("/api/voice/session", async (
+    HttpContext ctx,
+    AppDbContext db,
+    VoiceSessionManager sessionMgr,
+    ISecurityService security,
+    [Microsoft.AspNetCore.Mvc.FromBody] VoiceSessionRequest req) =>
 {
-    var convId = req.ConversationId == Guid.Empty ? Guid.NewGuid() : req.ConversationId;
-    var sessionId = Guid.NewGuid();
-    var session = sessionMgr.GetOrCreateSession(sessionId, convId);
-    return Results.Ok(new { sessionId, conversationId = convId });
-});
+    var authHeader = ctx.Request.Headers["Authorization"].FirstOrDefault() ?? ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
+    var customerToken = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
+    bool isAdmin = security.ValidateAdminKey(authHeader);
 
-app.MapPost("/api/voice/interrupt", (VoiceSessionManager sessionMgr, [Microsoft.AspNetCore.Mvc.FromBody] VoiceInterruptRequest req) =>
-{
-    var interrupted = sessionMgr.Interrupt(req.SessionId);
-    return Results.Ok(new { sessionId = req.SessionId, interrupted });
-});
+    Guid convId;
+    string customerTokenToReturn;
 
-app.MapPost("/api/voice/stt", async (ISttProvider stt, HttpRequest request, CancellationToken ct) =>
-{
-    if (!request.HasFormContentType || request.Form.Files.Count == 0)
+    if (!req.ConversationId.HasValue || req.ConversationId.Value == Guid.Empty)
     {
-        var text = await stt.TranscribeAudioAsync(request.Body, request.ContentType ?? "audio/wav", "ar", ct);
-        return Results.Ok(new { text });
+        convId = Guid.NewGuid();
+        customerTokenToReturn = security.GenerateCustomerToken(convId, null);
+
+        var agent = await db.Agents.FirstOrDefaultAsync();
+        db.Conversations.Add(new Conversation
+        {
+            Id = convId,
+            AgentId = agent?.Id ?? Guid.NewGuid(),
+            Channel = "WebVoice",
+            Status = "Active",
+            StartedAtUtc = DateTime.UtcNow,
+            LastActiveAtUtc = DateTime.UtcNow
+        });
+        await db.SaveChangesAsync();
+    }
+    else
+    {
+        var conv = await db.Conversations.FirstOrDefaultAsync(c => c.Id == req.ConversationId.Value);
+        if (conv == null)
+        {
+            // Reject unauthorized supplied identifiers
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+        }
+
+        if (!security.HasAccessToConversation(ctx, req.ConversationId.Value))
+        {
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+        }
+
+        convId = req.ConversationId.Value;
+        customerTokenToReturn = customerToken ?? (isAdmin ? security.GenerateCustomerToken(convId, null) : string.Empty);
     }
 
-    var file = request.Form.Files[0];
-    await using var stream = file.OpenReadStream();
-    var transcribed = await stt.TranscribeAudioAsync(stream, file.ContentType, "ar", ct);
-    return Results.Ok(new { text = transcribed });
+    var sessionId = Guid.NewGuid();
+    sessionMgr.GetOrCreateSession(sessionId, convId);
+    return Results.Ok(new { sessionId, conversationId = convId, customerToken = customerTokenToReturn });
 }).RequireRateLimiting("inference");
 
-app.MapPost("/api/voice/tts", async (ITtsProvider tts, [Microsoft.AspNetCore.Mvc.FromBody] TtsSynthesizeRequest req, CancellationToken ct) =>
+app.MapPost("/api/voice/interrupt", (
+    HttpContext ctx,
+    VoiceSessionManager sessionMgr,
+    ISecurityService security,
+    [Microsoft.AspNetCore.Mvc.FromBody] VoiceInterruptRequest req) =>
+{
+    var session = sessionMgr.GetSession(req.SessionId);
+    if (session == null)
+    {
+        return Results.NotFound(new { message = "الجلسة الصوتية غير موجودة." });
+    }
+
+    if (!security.HasAccessToConversation(ctx, session.ConversationId))
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
+    var interrupted = sessionMgr.Interrupt(req.SessionId);
+    return Results.Ok(new { sessionId = req.SessionId, interrupted });
+}).RequireRateLimiting("inference");
+
+app.MapPost("/api/voice/stt", async (
+    HttpContext ctx,
+    ISecurityService security,
+    VoiceAdmissionManager admission,
+    ISttProvider stt,
+    HttpRequest request,
+    ILogger<Program> logger,
+    CancellationToken ct) =>
+{
+    // Authorization check: Require AdminKey or ownership of conversation
+    var convIdStr = request.Headers["X-Conversation-Id"].FirstOrDefault() 
+                    ?? request.Query["conversationId"].FirstOrDefault();
+    bool authorized = false;
+    var adminKey = request.Headers["X-Admin-Key"].FirstOrDefault();
+    if (security.ValidateAdminKey(adminKey))
+    {
+        authorized = true;
+    }
+    else if (!string.IsNullOrEmpty(convIdStr) && Guid.TryParse(convIdStr, out var parsedConvId))
+    {
+        authorized = security.HasAccessToConversation(ctx, parsedConvId);
+    }
+    else
+    {
+        var token = request.Headers["X-Customer-Token"].FirstOrDefault();
+        var tokenConvId = security.GetTokenConversationId(token);
+        if (tokenConvId.HasValue && tokenConvId.Value != Guid.Empty)
+        {
+            authorized = security.ValidateCustomerAccess(token, tokenConvId.Value);
+        }
+    }
+
+    if (!authorized)
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
+    // Enforce audio size limit (10 MB max)
+    const long MaxAudioSizeBytes = 10 * 1024 * 1024;
+    if (request.ContentLength.HasValue && request.ContentLength.Value > MaxAudioSizeBytes)
+    {
+        return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+    }
+
+    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, ctx.RequestAborted);
+    try
+    {
+        using var permit = await admission.AcquireSttPermitAsync(linkedCts.Token);
+
+        if (!request.HasFormContentType || request.Form.Files.Count == 0)
+        {
+            var text = await stt.TranscribeAudioAsync(request.Body, request.ContentType ?? "audio/wav", "ar", linkedCts.Token);
+            return Results.Ok(new { text });
+        }
+
+        var file = request.Form.Files[0];
+        if (file.Length > MaxAudioSizeBytes)
+        {
+            return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+        }
+
+        await using var stream = file.OpenReadStream();
+        var transcribed = await stt.TranscribeAudioAsync(stream, file.ContentType ?? "audio/wav", "ar", linkedCts.Token);
+        return Results.Ok(new { text = transcribed });
+    }
+    catch (OperationCanceledException) when (linkedCts.IsCancellationRequested)
+    {
+        return Results.StatusCode(499); // caller disconnected / cancelled
+    }
+    catch (Exception ex)
+    {
+        return VoiceErrorResults.Respond(ctx, logger, VoiceFailureClassifier.Classify(ex, "stt"), ex);
+    }
+}).RequireRateLimiting("inference");
+
+app.MapPost("/api/voice/tts", async (
+    HttpContext ctx,
+    ISecurityService security,
+    VoiceAdmissionManager admission,
+    ITtsProvider tts,
+    ILogger<Program> logger,
+    [Microsoft.AspNetCore.Mvc.FromBody] TtsSynthesizeRequest req,
+    CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(req.Text)) return Results.BadRequest();
-    var audio = await tts.SynthesizeSpeechAsync(req.Text, req.LanguageCode ?? "ar-EG", ct);
-    return Results.File(audio.ToArray(), "audio/wav");
+    if (req.Text.Length > 2000)
+    {
+        return Results.BadRequest(new { message = "Text exceeds maximum limit of 2000 characters." });
+    }
+
+    // Authorization check
+    bool authorized = false;
+    var adminKey = ctx.Request.Headers["X-Admin-Key"].FirstOrDefault();
+    if (security.ValidateAdminKey(adminKey))
+    {
+        authorized = true;
+    }
+    else if (req.ConversationId.HasValue && req.ConversationId.Value != Guid.Empty)
+    {
+        authorized = security.HasAccessToConversation(ctx, req.ConversationId.Value);
+    }
+    else
+    {
+        var token = ctx.Request.Headers["X-Customer-Token"].FirstOrDefault();
+        var tokenConvId = security.GetTokenConversationId(token);
+        if (tokenConvId.HasValue && tokenConvId.Value != Guid.Empty)
+        {
+            authorized = security.ValidateCustomerAccess(token, tokenConvId.Value);
+        }
+    }
+
+    if (!authorized)
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
+    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, ctx.RequestAborted);
+    try
+    {
+        using var permit = await admission.AcquireTtsPermitAsync(linkedCts.Token);
+        var audio = await tts.SynthesizeSpeechAsync(req.Text, req.LanguageCode ?? "ar-EG", linkedCts.Token);
+        return Results.File(audio.ToArray(), "audio/wav");
+    }
+    catch (OperationCanceledException) when (linkedCts.IsCancellationRequested)
+    {
+        return Results.StatusCode(499);
+    }
+    catch (Exception ex)
+    {
+        return VoiceErrorResults.Respond(ctx, logger, VoiceFailureClassifier.Classify(ex, "tts"), ex);
+    }
 }).RequireRateLimiting("inference");
 
 app.MapPost("/api/voice/turn", async (
+    HttpContext ctx,
     VoiceSessionManager sessionMgr,
+    VoiceAdmissionManager admission,
     AgentOrchestrator orchestrator,
+    ISttProvider stt,
     ITtsProvider tts,
+    ISecurityService security,
+    AppDbContext db,
+    ILogger<Program> logger,
     [Microsoft.AspNetCore.Mvc.FromBody] VoiceTurnRequest req,
     CancellationToken ct) =>
 {
-    var session = sessionMgr.GetOrCreateSession(req.SessionId, req.ConversationId);
-    using var turnContext = session.StartNewTurn();
+    // Must resolve an existing session (Do not use GetOrCreateSession for control operations)
+    var session = sessionMgr.GetSession(req.SessionId);
+    if (session == null)
+    {
+        return Results.NotFound(new { message = "الجلسة الصوتية غير موجودة." });
+    }
 
+    // Reject mismatched request ConversationId
+    if (req.ConversationId != session.ConversationId)
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
+    // Authorize its stored owning conversation
+    if (!security.HasAccessToConversation(ctx, session.ConversationId))
+    {
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
+    }
+
+    using var turnContext = session.StartNewTurn();
+    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(turnContext.Token, ctx.RequestAborted);
+    var token = linkedCts.Token;
+
+    var turnStartTimeUtc = DateTime.UtcNow;
+    var turnSw = System.Diagnostics.Stopwatch.StartNew();
+    double sttDurationMs = 0;
+    double llmDurationMs = 0;
+    double ttsDurationMs = 0;
+
+    var stage = "request"; // updated as the turn advances so failures are attributed to the right pipeline stage
     var assistantText = new System.Text.StringBuilder();
     try
     {
-        await foreach (var chatEvent in orchestrator.ProcessUserMessageAsync(req.AgentId, req.ConversationId, req.Message, turnContext.Token))
+        string userMessage = req.Message ?? string.Empty;
+
+        // If audio base64 is provided, prioritize STT transcription over any client-sent text
+        // This guarantees audio recordings are never bypassed by stale client transcripts
+        if (!string.IsNullOrWhiteSpace(req.AudioBase64))
         {
-            if (turnContext.Token.IsCancellationRequested) break;
+            // 1. Route-specific buffering check: max ~14MB base64 string
+            if (req.AudioBase64.Length > 14 * 1024 * 1024)
+            {
+                return Results.Json(new { code = "AUDIO_PAYLOAD_TOO_LARGE", message = "حجم تشفير الصوت يتجاوز الحد المسموح به (10 ميجابايت)." }, statusCode: StatusCodes.Status413PayloadTooLarge);
+            }
+
+            // 2. Safe Base64 decoding
+            byte[] audioBytes;
+            try
+            {
+                audioBytes = Convert.FromBase64String(req.AudioBase64);
+            }
+            catch (FormatException)
+            {
+                return Results.BadRequest(new { code = "INVALID_BASE64_AUDIO", message = "ترميز الصوت بتنسيق Base64 غير صالح أو تالف." });
+            }
+
+            // 3. Decoded size bounds
+            if (audioBytes.Length > 10 * 1024 * 1024)
+            {
+                return Results.Json(new { code = "AUDIO_SIZE_EXCEEDED", message = "حجم ملف الصوت يتجاوز الحد الأقصى المسموح به (10 ميجابايت)." }, statusCode: StatusCodes.Status413PayloadTooLarge);
+            }
+
+            // 4. Server-side container and duration inspection
+            var validation = AudioDurationHelper.Validate(audioBytes);
+            if (!validation.IsValid)
+            {
+                return Results.BadRequest(new { code = validation.ErrorCode ?? "AUDIO_TRUNCATED_OR_CORRUPT", message = validation.ErrorMessage ?? "ملف الصوت مبتور أو تالف." });
+            }
+
+            // 5. Container & MIME preservation
+            var effectiveMime = !string.IsNullOrWhiteSpace(req.MimeType) ? req.MimeType
+                : (audioBytes.Length >= 4 && audioBytes[0] == (byte)'R' && audioBytes[1] == (byte)'I' ? "audio/wav" : "audio/webm");
+
+            stage = "stt";
+            var sttSw = System.Diagnostics.Stopwatch.StartNew();
+            using (var sttPermit = await admission.AcquireSttPermitAsync(token))
+            using (var audioStream = new MemoryStream(audioBytes))
+            {
+                userMessage = await stt.TranscribeAudioAsync(audioStream, effectiveMime, "ar", token);
+            }
+            sttSw.Stop();
+            sttDurationMs = sttSw.Elapsed.TotalMilliseconds;
+        }
+
+        if (string.IsNullOrWhiteSpace(userMessage))
+        {
+            return Results.BadRequest(new { code = "MESSAGE_OR_AUDIO_REQUIRED", message = "النص أو الصوت مطلوب لإتمام الجولة الصوتية." });
+        }
+
+        // Fallback to conversation AgentId or first active agent if AgentId is empty
+        Guid effectiveAgentId = req.AgentId;
+        if (effectiveAgentId == Guid.Empty)
+        {
+            var conv = await db.Conversations.AsNoTracking().FirstOrDefaultAsync(c => c.Id == req.ConversationId, token);
+            if (conv != null && conv.AgentId != Guid.Empty)
+            {
+                effectiveAgentId = conv.AgentId;
+            }
+            else
+            {
+                var activeAgent = await db.Agents.AsNoTracking().FirstOrDefaultAsync(a => a.IsActive, token);
+                if (activeAgent != null)
+                {
+                    effectiveAgentId = activeAgent.Id;
+                }
+            }
+        }
+
+        string? orchestratorError = null;
+        ChatErrorInfo? orchestratorErrorInfo = null;
+        stage = "llm";
+        var llmSw = System.Diagnostics.Stopwatch.StartNew();
+        // Process user message through LLM orchestrator (acquires and releases LLM permit internally)
+        await foreach (var chatEvent in orchestrator.ProcessUserMessageAsync(effectiveAgentId, req.ConversationId, userMessage, token))
+        {
+            if (token.IsCancellationRequested) break;
             if (chatEvent.EventType == "token" && !string.IsNullOrEmpty(chatEvent.Content))
             {
                 assistantText.Append(chatEvent.Content);
             }
+            else if (chatEvent.EventType == "error")
+            {
+                orchestratorError = chatEvent.Content;
+                orchestratorErrorInfo = chatEvent.Metadata as ChatErrorInfo;
+            }
         }
+        llmSw.Stop();
+        llmDurationMs = llmSw.Elapsed.TotalMilliseconds;
 
-        if (turnContext.Token.IsCancellationRequested || !session.IsTurnActive(turnContext.TurnId))
+        if (token.IsCancellationRequested || !session.IsTurnActive(turnContext.TurnId))
         {
             return Results.StatusCode(499); // Client Closed Request / Interrupted
         }
 
-        var reply = assistantText.ToString();
-        var audioBytes = await tts.SynthesizeSpeechAsync(reply, "ar-EG", turnContext.Token);
+        if (!string.IsNullOrEmpty(orchestratorError))
+        {
+            if (orchestratorErrorInfo?.Code == "LLM_EMPTY_RESPONSE")
+            {
+                orchestratorError = null; // Fall back to clinic greeting or tool-grounded clarification rather than 502
+            }
+            else
+            {
+                // An upstream/admission failure fails the turn, even if some text had streamed: never speak or persist a
+                // partial reply as a success. The orchestrator already refused to save an empty/partial assistant turn.
+                var info = orchestratorErrorInfo ?? new ChatErrorInfo("LLM_PROVIDER_UNAVAILABLE", "llm");
+                return VoiceErrorResults.Respond(ctx, logger,
+                    VoiceFailureClassifier.FromChatError(info.Code, info.Stage, orchestratorError, info.RetryAfterSeconds));
+            }
+        }
+
+        var reply = assistantText.ToString().Trim();
+        if (string.IsNullOrWhiteSpace(reply))
+        {
+            var hasPending = await db.PendingBookings.AnyAsync(p => p.ConversationId == req.ConversationId && p.Status == "Pending", token);
+            if (hasPending)
+            {
+                reply = "تم تجهيز مسودة الحجز بنجاح يا فندم، يرجى مراجعة التفاصيل وتأكيد الحجز.";
+            }
+            else
+            {
+                // Only inspect CheckAvailability executed during the current turn (not stale previous turns)
+                var currentTurnAvailability = await db.ToolExecutions
+                    .Where(t => t.ConversationId == req.ConversationId && t.ToolName == "CheckAvailability" && t.ExecutedAtUtc >= turnStartTimeUtc)
+                    .OrderByDescending(t => t.ExecutedAtUtc)
+                    .FirstOrDefaultAsync(token);
+
+                if (currentTurnAvailability != null && currentTurnAvailability.Status == "Success" && !string.IsNullOrWhiteSpace(currentTurnAvailability.ResultJson))
+                {
+                    bool hasSlots = false;
+                    bool isAlternativeDate = false;
+                    string toolMessage = "";
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(currentTurnAvailability.ResultJson);
+                        var root = doc.RootElement;
+
+                        if (root.TryGetProperty("Message", out var msgProp) || root.TryGetProperty("message", out msgProp))
+                        {
+                            toolMessage = msgProp.GetString() ?? "";
+                        }
+
+                        JsonElement dataElem = default;
+                        bool hasData = root.TryGetProperty("Data", out dataElem) || root.TryGetProperty("data", out dataElem);
+
+                        JsonElement slotsElem = default;
+                        bool foundSlots = false;
+                        if (hasData && dataElem.ValueKind == JsonValueKind.Object)
+                        {
+                            foundSlots = dataElem.TryGetProperty("availableSlots", out slotsElem) || dataElem.TryGetProperty("AvailableSlots", out slotsElem);
+                        }
+                        if (!foundSlots)
+                        {
+                            foundSlots = root.TryGetProperty("availableSlots", out slotsElem) || root.TryGetProperty("AvailableSlots", out slotsElem);
+                        }
+
+                        if (foundSlots && slotsElem.ValueKind == JsonValueKind.Array && slotsElem.GetArrayLength() > 0)
+                        {
+                            hasSlots = true;
+                            if (toolMessage.Contains("لا توجد مواعيد متاحة في تاريخ") || toolMessage.Contains("أقرب مواعيد أخرى"))
+                            {
+                                isAlternativeDate = true;
+                            }
+                        }
+                    }
+                    catch { }
+
+                    if (hasSlots)
+                    {
+                        if (isAlternativeDate)
+                        {
+                            reply = !string.IsNullOrWhiteSpace(toolMessage)
+                                ? $"{toolMessage} تحب نقترح على حضرتك ميعاد من هذه البدائل؟"
+                                : "لا توجد مواعيد متاحة في التاريخ المطلوب، ولكن توجد أقرب مواعيد أخرى بديلة، تحب نقترح على حضرتك ميعاد منها؟";
+                        }
+                        else
+                        {
+                            reply = !string.IsNullOrWhiteSpace(toolMessage)
+                                ? $"{toolMessage} تحب أحجز لحضرتك ميعاد في المواعيد المتاحة؟"
+                                : "تم التحقق من المواعيد المتاحة في عيادة النور التخصصية، تحب أحجز لحضرتك ميعاد في المواعيد المتاحة؟";
+                        }
+                    }
+                    else
+                    {
+                        reply = "لا توجد مواعيد متاحة حالياً في التاريخ المطلوب بعيادة النور التخصصية، تحب نقترح على حضرتك أقرب موعد بديل؟";
+                    }
+                }
+                else
+                {
+                    reply = "أهلاً بحضرتك يا فندم في عيادة النور التخصصية، ممكن توضح طلبك أو تذكر الخدمة والاسم المطلوب للحجز؟";
+                }
+            }
+
+            // Save actual spoken text into conversation messages so history accurately records what was spoken
+            var lastAssistantMsg = await db.Messages
+                .Where(m => m.ConversationId == req.ConversationId && m.Role == "assistant")
+                .OrderByDescending(m => m.SequenceNumber)
+                .FirstOrDefaultAsync(token);
+            if (lastAssistantMsg != null && string.IsNullOrWhiteSpace(lastAssistantMsg.Content))
+            {
+                lastAssistantMsg.Content = reply;
+                await db.SaveChangesAsync(token);
+            }
+            else
+            {
+                var maxSeq = await db.Messages
+                    .Where(m => m.ConversationId == req.ConversationId)
+                    .Select(m => (int?)m.SequenceNumber)
+                    .MaxAsync(token) ?? 0;
+                db.Messages.Add(new Message
+                {
+                    Id = Guid.NewGuid(),
+                    ConversationId = req.ConversationId,
+                    Role = "assistant",
+                    Content = reply,
+                    SequenceNumber = maxSeq + 1,
+                    CreatedAtUtc = DateTime.UtcNow
+                });
+                await db.SaveChangesAsync(token);
+            }
+        }
+
+        // Synthesize response speech with TTS under separate bounded admission (Zero nested deadlock!)
+        stage = "tts";
+        var ttsSw = System.Diagnostics.Stopwatch.StartNew();
+        ReadOnlyMemory<byte> audioBytesOut;
+        using (var ttsPermit = await admission.AcquireTtsPermitAsync(token))
+        {
+            audioBytesOut = await tts.SynthesizeSpeechAsync(reply, "ar-EG", token);
+        }
+        ttsSw.Stop();
+        ttsDurationMs = ttsSw.Elapsed.TotalMilliseconds;
+
+        turnSw.Stop();
+        var totalTurnMs = turnSw.Elapsed.TotalMilliseconds;
 
         return Results.Ok(new
         {
             turnId = turnContext.TurnId,
             sessionId = req.SessionId,
             conversationId = req.ConversationId,
+            userText = userMessage,
             text = reply,
-            audioBase64 = Convert.ToBase64String(audioBytes.ToArray())
+            audioBase64 = Convert.ToBase64String(audioBytesOut.ToArray()),
+            timings = new
+            {
+                sttMs = Math.Round(sttDurationMs, 2),
+                llmMs = Math.Round(llmDurationMs, 2),
+                ttsMs = Math.Round(ttsDurationMs, 2),
+                totalMs = Math.Round(totalTurnMs, 2)
+            }
         });
     }
-    catch (OperationCanceledException)
+    catch (OperationCanceledException) when (token.IsCancellationRequested)
     {
-        return Results.StatusCode(499); // Graceful barge-in interruption status
+        return Results.StatusCode(499); // Graceful barge-in interruption / caller disconnect
+    }
+    catch (Exception ex)
+    {
+        return VoiceErrorResults.Respond(ctx, logger, VoiceFailureClassifier.Classify(ex, stage), ex);
     }
 }).RequireRateLimiting("inference");
 
-// Test endpoint for validating rate limiting behavior and headers
-app.MapGet("/api/test/rate-limited", () => Results.Ok(new { status = "ok" }))
-    .RequireRateLimiting("test-rate-limit");
+// Test endpoint for validating rate limiting behavior and headers (Exposed strictly in Testing environment)
+if (app.Environment.IsEnvironment("Testing"))
+{
+    app.MapGet("/api/test/rate-limited", () => Results.Ok(new { status = "ok" }))
+        .RequireRateLimiting("test-rate-limit");
+}
+
+// ----------------------------------------------------
+// External Channel Integrations (M365, WhatsApp, Telegram)
+// ----------------------------------------------------
+
+// Status of all configured channel integrations & external blockers
+app.MapGet("/api/integrations/status", (IntegrationDispatchCoordinator coordinator, IConfiguration cfg) =>
+{
+    var mode = cfg["Integrations:ProviderMode"] ?? "Mock";
+    return Results.Ok(coordinator.GetStatus(mode));
+});
+
+// WhatsApp Cloud API Webhook Verification (Meta Hub Challenge)
+app.MapGet("/api/integrations/whatsapp/webhook", (
+    [Microsoft.AspNetCore.Mvc.FromQuery(Name = "hub.mode")] string? mode,
+    [Microsoft.AspNetCore.Mvc.FromQuery(Name = "hub.verify_token")] string? token,
+    [Microsoft.AspNetCore.Mvc.FromQuery(Name = "hub.challenge")] string? challenge,
+    IConfiguration cfg) =>
+{
+    var expectedToken = cfg["Integrations:WhatsApp:VerifyToken"] ?? "masryvoice_webhook_token";
+    if (mode == "subscribe" && token == expectedToken)
+    {
+        return Results.Text(challenge ?? "");
+    }
+    return Results.StatusCode(403);
+});
+
+// WhatsApp Cloud API Inbound Webhook Receiver
+app.MapPost("/api/integrations/whatsapp/webhook", async (
+    HttpRequest request,
+    IWhatsAppMessagingService whatsAppService,
+    ILogger<Program> logger) =>
+{
+    using var reader = new StreamReader(request.Body);
+    var body = await reader.ReadToEndAsync();
+    var signature = request.Headers["X-Hub-Signature-256"].FirstOrDefault();
+
+    if (!whatsAppService.VerifyWebhookSignature(body, signature))
+    {
+        return Results.StatusCode(401);
+    }
+
+    logger.LogInformation("WhatsApp inbound webhook validated and received. Payload length: {Len}", body.Length);
+    return Results.Ok(new { status = "received", timestampUtc = DateTime.UtcNow });
+});
+
+// Telegram Bot Inbound Webhook Receiver
+app.MapPost("/api/integrations/telegram/webhook", async (
+    HttpRequest request,
+    ITelegramMessagingService telegramService,
+    ILogger<Program> logger) =>
+{
+    var secretHeader = request.Headers["X-Telegram-Bot-Api-Secret-Token"].FirstOrDefault();
+    if (!telegramService.VerifyWebhookSecret(secretHeader))
+    {
+        return Results.StatusCode(401);
+    }
+
+    using var reader = new StreamReader(request.Body);
+    var body = await reader.ReadToEndAsync();
+    logger.LogInformation("Telegram inbound webhook validated and received. Payload length: {Len}", body.Length);
+    return Results.Ok(new { status = "received", timestampUtc = DateTime.UtcNow });
+});
 
 app.Run();
 
@@ -856,8 +1783,8 @@ app.Run();
 // ----------------------------------------------------
 public record ChatStreamRequest(
     Guid AgentId,
-    Guid ConversationId,
-    string Message
+    Guid? ConversationId = null,
+    string Message = ""
 );
 
 public record AgentUpdateRequest(
@@ -893,7 +1820,7 @@ public record IngestDocumentRequest(
 );
 
 public record VoiceSessionRequest(
-    Guid ConversationId
+    Guid? ConversationId = null
 );
 
 public record VoiceInterruptRequest(
@@ -902,14 +1829,17 @@ public record VoiceInterruptRequest(
 
 public record TtsSynthesizeRequest(
     string Text,
-    string? LanguageCode = "ar-EG"
+    string? LanguageCode = "ar-EG",
+    Guid? ConversationId = null
 );
 
 public record VoiceTurnRequest(
     Guid SessionId,
     Guid ConversationId,
     Guid AgentId,
-    string Message
+    string? Message = null,
+    string? AudioBase64 = null,
+    string? MimeType = null
 );
 
 public partial class Program { }

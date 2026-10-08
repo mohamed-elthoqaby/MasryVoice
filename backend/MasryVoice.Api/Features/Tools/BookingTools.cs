@@ -31,14 +31,16 @@ public class CheckAvailabilityTool : ITool
         var nowCairo = CairoTimeHelper.NowCairo;
         var targetDate = nowCairo.Date;
 
+        string? requestedService = null;
+        if (arguments.TryGetProperty("service", out var servProp) && !string.IsNullOrWhiteSpace(servProp.GetString()))
+        {
+            requestedService = servProp.GetString()!.Trim();
+        }
+
         if (arguments.TryGetProperty("date", out var dateProp) && !string.IsNullOrWhiteSpace(dateProp.GetString()))
         {
-            var dateStr = dateProp.GetString()!.Trim().ToLowerInvariant();
-            if (dateStr.Contains("tomorrow") || dateStr.Contains("بكره") || dateStr.Contains("بكرة") || dateStr.Contains("غدا"))
-            {
-                targetDate = nowCairo.Date.AddDays(1);
-            }
-            else if (DateTime.TryParse(dateStr, out var parsedDate))
+            var dateStr = dateProp.GetString()!.Trim();
+            if (EgyptianDateTimeParser.TryParseEgyptianDate(dateStr, nowCairo, out var parsedDate))
             {
                 targetDate = parsedDate.Date;
             }
@@ -47,15 +49,31 @@ public class CheckAvailabilityTool : ITool
         var dayStartUtc = CairoTimeHelper.CairoToUtc(targetDate);
         var dayEndUtc = CairoTimeHelper.CairoToUtc(targetDate.AddDays(1));
 
-        var availableSlots = await _db.AvailabilitySlots
-            .Where(s => s.StartTimeUtc >= dayStartUtc && s.StartTimeUtc < dayEndUtc && s.BookedCapacity < s.TotalCapacity)
+        var query = _db.AvailabilitySlots
+            .Where(s => s.StartTimeUtc >= dayStartUtc && s.StartTimeUtc < dayEndUtc && s.BookedCapacity < s.TotalCapacity);
+
+        if (!string.IsNullOrWhiteSpace(requestedService))
+        {
+            var filter = requestedService.ToLowerInvariant();
+            query = query.Where(s => s.ServiceName.ToLower().Contains(filter));
+        }
+
+        var availableSlots = await query
             .OrderBy(s => s.StartTimeUtc)
             .ToListAsync(ct);
 
         if (availableSlots.Count == 0)
         {
-            var nextSlots = await _db.AvailabilitySlots
-                .Where(s => s.StartTimeUtc >= DateTime.UtcNow && s.BookedCapacity < s.TotalCapacity)
+            var fallbackQuery = _db.AvailabilitySlots
+                .Where(s => s.StartTimeUtc >= DateTime.UtcNow && s.BookedCapacity < s.TotalCapacity);
+
+            if (!string.IsNullOrWhiteSpace(requestedService))
+            {
+                var filter = requestedService.ToLowerInvariant();
+                fallbackQuery = fallbackQuery.Where(s => s.ServiceName.ToLower().Contains(filter));
+            }
+
+            var nextSlots = await fallbackQuery
                 .OrderBy(s => s.StartTimeUtc)
                 .Take(4)
                 .ToListAsync(ct);
@@ -139,8 +157,16 @@ public class StageBookingTool : ITool
             );
         }
         var customerName = nameProp.GetString()!.Trim();
+        if (customerName.Length < 2)
+        {
+            return new ToolResult(
+                Success: false,
+                ErrorCode: "INVALID_CUSTOMER_NAME",
+                Message: "خطأ: يرجى كتابة الاسم بالكامل لتسجيل الحجز."
+            );
+        }
 
-        // 2. Validate customer phone
+        // 2. Validate customer phone with Egyptian normalization
         if (!arguments.TryGetProperty("customerPhone", out var phoneProp) || string.IsNullOrWhiteSpace(phoneProp.GetString()))
         {
             return new ToolResult(
@@ -149,7 +175,17 @@ public class StageBookingTool : ITool
                 Message: "خطأ: رقم تليفون العميل مطلوب لتجهيز الحجز."
             );
         }
-        var customerPhone = phoneProp.GetString()!.Trim();
+        var rawPhone = phoneProp.GetString()!.Trim();
+        var normalizedPhone = EgyptianDateTimeParser.NormalizeEgyptianPhone(rawPhone);
+        if (string.IsNullOrWhiteSpace(normalizedPhone))
+        {
+            return new ToolResult(
+                Success: false,
+                ErrorCode: "INVALID_PHONE_NUMBER",
+                Message: "خطأ: رقم التليفون غير صحيح. يرجى إدخال رقم محمول مصري مكون من 11 رقماً يبدأ بـ 01 (مثل 01012345678)."
+            );
+        }
+        var customerPhone = normalizedPhone;
 
         // 3. Resolve slot
         Guid slotId = Guid.Empty;
@@ -283,6 +319,12 @@ public class GetBookingTool : ITool
 
         var query = _db.Bookings.AsQueryable();
 
+        // Strict ownership: Bind query to the current conversation to prevent cross-conversation disclosure
+        if (conversationId != Guid.Empty)
+        {
+            query = query.Where(b => b.ConversationId == conversationId);
+        }
+
         if (parsedBookingId.HasValue)
         {
             query = query.Where(b => b.Id == parsedBookingId.Value);
@@ -325,6 +367,140 @@ public class GetBookingTool : ITool
             Success: true,
             Message: $"تم العثور على {results.Count} حجز.",
             Data: new { bookings = results }
+        );
+    }
+}
+
+public class CancelBookingTool : ITool
+{
+    private readonly AppDbContext _db;
+
+    public CancelBookingTool(AppDbContext db)
+    {
+        _db = db;
+    }
+
+    public ToolDefinition Definition => new()
+    {
+        Name = "CancelBooking",
+        Description = "إلغاء حجز مؤكد للعميل بالاسم أو برقم التليفون أو برقم الحجز وتحرير الموعد في جدول العيادة. (إلغاء حجز موعد)",
+        Parameters = new()
+        {
+            ["bookingId"] = new("string", "رقم الحجز الفريد إن وجد", Required: false),
+            ["customerPhone"] = new("string", "رقم تليفون العميل المسجل به الحجز", Required: false),
+            ["reason"] = new("string", "سبب الإلغاء إن ذكره العميل", Required: false)
+        }
+    };
+
+    public async Task<ToolResult> ExecuteAsync(JsonElement arguments, Guid conversationId, CancellationToken ct)
+    {
+        Guid? parsedBookingId = null;
+        if (arguments.TryGetProperty("bookingId", out var idProp) && Guid.TryParse(idProp.GetString(), out var g))
+        {
+            parsedBookingId = g;
+        }
+
+        string? phone = null;
+        if (arguments.TryGetProperty("customerPhone", out var phoneProp))
+        {
+            var raw = phoneProp.GetString();
+            phone = EgyptianDateTimeParser.NormalizeEgyptianPhone(raw) ?? raw?.Trim();
+        }
+
+        var query = _db.Bookings.Include(b => b.Slot).AsQueryable();
+
+        // Enforce conversation ownership to prevent cross-customer access
+        if (conversationId != Guid.Empty)
+        {
+            query = query.Where(b => b.ConversationId == conversationId);
+        }
+
+        if (parsedBookingId.HasValue)
+        {
+            query = query.Where(b => b.Id == parsedBookingId.Value);
+        }
+        else if (!string.IsNullOrWhiteSpace(phone))
+        {
+            query = query.Where(b => b.CustomerPhone == phone);
+        }
+        else
+        {
+            return new ToolResult(
+                Success: false,
+                ErrorCode: "MISSING_SEARCH_CRITERIA",
+                Message: "يرجى تقديم رقم الحجز أو رقم تليفون العميل لإلغاء الحجز."
+            );
+        }
+
+        var booking = await query
+            .OrderByDescending(b => b.CreatedAtUtc)
+            .FirstOrDefaultAsync(ct);
+
+        if (booking == null)
+        {
+            return new ToolResult(
+                Success: false,
+                ErrorCode: "BOOKING_NOT_FOUND",
+                Message: "لم يتم العثور على حجز نشط مطابق للبيانات في هذه المحادثة."
+            );
+        }
+
+        if (booking.Status == "Cancelled")
+        {
+            return new ToolResult(
+                Success: true,
+                Message: $"هذا الحجز ملغى بالفعل مسبقاً (رقم الحجز: {booking.Id}).",
+                Data: new { bookingId = booking.Id, status = "Cancelled" }
+            );
+        }
+
+        booking.Status = "Cancelled";
+
+        // Free up slot capacity atomically
+        if (booking.Slot != null)
+        {
+            booking.Slot.BookedCapacity = Math.Max(0, booking.Slot.BookedCapacity - 1);
+        }
+        else
+        {
+            var slot = await _db.AvailabilitySlots.FirstOrDefaultAsync(s => s.Id == booking.SlotId, ct);
+            if (slot != null)
+            {
+                slot.BookedCapacity = Math.Max(0, slot.BookedCapacity - 1);
+            }
+        }
+
+        // Atomically enqueue durable OutboxJob inside the same change tracker
+        _db.OutboxJobs.Add(new OutboxJob
+        {
+            Id = Guid.NewGuid(),
+            Topic = "BookingCancelled",
+            PayloadJson = JsonSerializer.Serialize(new
+            {
+                bookingId = booking.Id,
+                customerName = booking.CustomerName,
+                customerPhone = booking.CustomerPhone,
+                serviceName = booking.ServiceName,
+                bookingDateUtc = booking.BookingDateUtc,
+                cancelledAtUtc = DateTime.UtcNow
+            }),
+            Status = "Pending",
+            CreatedAtUtc = DateTime.UtcNow,
+            NextRetryUtc = DateTime.UtcNow
+        });
+
+        await _db.SaveChangesAsync(ct);
+
+        return new ToolResult(
+            Success: true,
+            Message: $"تم إلغاء حجزك بنجاح يا فندم (حجز {booking.ServiceName} لموعد {CairoTimeHelper.FormatCairoFriendly(booking.BookingDateUtc)}). يسعدنا خدمتك في أي وقت آخر.",
+            Data: new
+            {
+                bookingId = booking.Id,
+                customerName = booking.CustomerName,
+                status = "Cancelled",
+                cairoTime = CairoTimeHelper.FormatCairoFriendly(booking.BookingDateUtc)
+            }
         );
     }
 }

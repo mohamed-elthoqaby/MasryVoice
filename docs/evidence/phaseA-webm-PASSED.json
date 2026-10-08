@@ -1,0 +1,62 @@
+{
+  "evidence": "prerecorded-webm-via-proxy (not physical mic)",
+  "base": "http://localhost:3000",
+  "results": [
+    {
+      "check": "session.fresh",
+      "ok": true,
+      "status": 200,
+      "ms": 495
+    },
+    {
+      "check": "stt.webm_opus_via_proxy",
+      "ok": true,
+      "status": 200,
+      "ms": 2557,
+      "mime": "audio/webm;codecs=opus",
+      "body": null,
+      "transcript_chars": 45
+    },
+    {
+      "check": "chat.stt_text",
+      "ok": true,
+      "status": 200,
+      "ms": 34562,
+      "done": true,
+      "errors": [],
+      "reply_chars": 411
+    },
+    {
+      "check": "chat.free",
+      "ok": true,
+      "status": 200,
+      "ms": 28932,
+      "done": true,
+      "errors": [],
+      "reply_chars": 395
+    },
+    {
+      "check": "chat.free",
+      "ok": true,
+      "status": 200,
+      "ms": 6309,
+      "done": true,
+      "errors": [],
+      "reply_chars": 161
+    },
+    {
+      "check": "turn.text",
+      "ok": true,
+      "status": 200,
+      "ms": 7984,
+      "body": null
+    },
+    {
+      "check": "turn.audio_webm",
+      "ok": true,
+      "status": 200,
+      "ms": 10160,
+      "body": null
+    }
+  ]
+}

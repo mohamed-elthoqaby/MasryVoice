@@ -253,11 +253,16 @@
                   "    var slots = pm.response.json();",
                   "    pm.expect(slots).to.be.an('array');",
                   "    pm.expect(slots.length).to.be.above(0);",
-                  "    var availableSlot = slots.find(function(s) { return s.isAvailable === true; });",
-                  "    pm.expect(availableSlot).to.not.be.undefined;",
-                  "    pm.environment.set('selectedSlotId', availableSlot.id);",
-                  "    pm.environment.set('selectedServiceName', availableSlot.serviceName);",
-                  "    pm.environment.set('selectedCairoTime', availableSlot.cairoTimeFormatted);",
+                  "    var availableSlots = slots.filter(function(s) { return s.isAvailable === true; });",
+                  "    pm.expect(availableSlots.length).to.be.above(1, 'Need at least 2 available slots for lifecycle and exhaustion testing');",
+                  "    var primary = availableSlots[0];",
+                  "    var exhaust = availableSlots[1];",
+                  "    pm.environment.set('selectedSlotId', primary.id);",
+                  "    pm.environment.set('selectedServiceName', primary.serviceName);",
+                  "    pm.environment.set('selectedCairoTime', primary.cairoTimeFormatted);",
+                  "    pm.environment.set('slotInitialBookedCapacity', primary.bookedCapacity);",
+                  "    pm.environment.set('exhaustSlotId', exhaust.id);",
+                  "    pm.environment.set('exhaustServiceName', exhaust.serviceName);",
                   "});"
                 ]
               }
@@ -270,55 +275,131 @@
       "name": "04_Booking_Lifecycle_And_Trust_Boundary",
       "item": [
         {
-          "name": "Stage Pending Booking Draft",
+          "name": "Create Server Session - Customer A",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/sessions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sessions"
+              ]
+            }
+          },
           "event": [
-            {
-              "listen": "prerequest",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "// Generate isolated conversation GUID and random test customer phone",
-                  "var convId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {",
-                  "    var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);",
-                  "    return v.toString(16);",
-                  "});",
-                  "var randPhone = '010' + Math.floor(10000000 + Math.random() * 90000000);",
-                  "pm.environment.set('currentConversationId', convId);",
-                  "pm.environment.set('currentCustomerPhone', randPhone);",
-                  "pm.environment.set('currentCustomerName', 'محمد أحمد عاطف');"
-                ]
-              }
-            },
             {
               "listen": "test",
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('Pending booking staged with 200 OK', function () {",
+                  "pm.test('Server session for Customer A created with 200 OK', function () {",
                   "    pm.response.to.have.status(200);",
                   "    var res = pm.response.json();",
-                  "    pm.expect(res.success).to.be.true;",
-                  "    pm.expect(res.status).to.eql('Pending');",
-                  "    pm.expect(res.pendingBookingId).to.be.a('string');",
-                  "    pm.expect(res.requestHash).to.be.a('string');",
-                  "    pm.environment.set('stagedPendingBookingId', res.pendingBookingId);",
-                  "    pm.environment.set('stagedRequestHash', res.requestHash);",
+                  "    pm.expect(res.conversationId).to.be.a('string');",
+                  "    pm.expect(res.customerToken).to.be.a('string');",
+                  "    pm.environment.set('conversationIdA', res.conversationId);",
+                  "    pm.environment.set('customerTokenA', res.customerToken);",
+                  "    pm.environment.set('customerPhoneA', '010' + Math.floor(10000000 + Math.random() * 90000000));",
+                  "    pm.environment.set('customerNameA', 'محمد أحمد عاطف');",
                   "});"
                 ]
               }
             }
-          ],
+          ]
+        },
+        {
+          "name": "Create Server Session - Customer B",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/sessions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sessions"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Server session for Customer B created with 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var res = pm.response.json();",
+                  "    pm.expect(res.conversationId).to.be.a('string');",
+                  "    pm.expect(res.customerToken).to.be.a('string');",
+                  "    pm.environment.set('conversationIdB', res.conversationId);",
+                  "    pm.environment.set('customerTokenB', res.customerToken);",
+                  "    pm.environment.set('customerPhoneB', '011' + Math.floor(10000000 + Math.random() * 90000000));",
+                  "    pm.environment.set('customerNameB', 'محمود حسن علي');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create Server Session - Unrelated Control Fixture",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/sessions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "sessions"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Server session for Control Fixture created with 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var res = pm.response.json();",
+                  "    pm.expect(res.conversationId).to.be.a('string');",
+                  "    pm.expect(res.customerToken).to.be.a('string');",
+                  "    pm.environment.set('controlConversationId', res.conversationId);",
+                  "    pm.environment.set('controlCustomerToken', res.customerToken);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Stage Pending Booking Draft - Customer A",
           "request": {
             "method": "POST",
             "header": [
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenA}}"
               }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"conversationId\": \"{{currentConversationId}}\",\n  \"customerName\": \"{{currentCustomerName}}\",\n  \"customerPhone\": \"{{currentCustomerPhone}}\",\n  \"slotId\": \"{{selectedSlotId}}\",\n  \"serviceName\": \"{{selectedServiceName}}\"\n}"
+              "raw": "{\n  \"conversationId\": \"{{conversationIdA}}\",\n  \"customerName\": \"{{customerNameA}}\",\n  \"customerPhone\": \"{{customerPhoneA}}\",\n  \"slotId\": \"{{selectedSlotId}}\",\n  \"serviceName\": \"{{selectedServiceName}}\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/bookings/stage",
@@ -331,15 +412,40 @@
                 "stage"
               ]
             }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Pending booking staged with 200 OK for Customer A', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var res = pm.response.json();",
+                  "    pm.expect(res.success).to.be.true;",
+                  "    pm.expect(res.status).to.eql('Pending');",
+                  "    pm.expect(res.pendingBookingId).to.be.a('string');",
+                  "    pm.expect(res.requestHash).to.be.a('string');",
+                  "    pm.environment.set('stagedPendingBookingIdA', res.pendingBookingId);",
+                  "    pm.environment.set('stagedRequestHashA', res.requestHash);",
+                  "});"
+                ]
+              }
+            }
+          ]
         },
         {
-          "name": "Verify Pending Booking In Pending List",
+          "name": "Verify Pending Booking In Pending List - Customer A",
           "request": {
             "method": "GET",
-            "header": [],
+            "header": [
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenA}}"
+              }
+            ],
             "url": {
-              "raw": "{{baseUrl}}/api/bookings/pending?conversationId={{currentConversationId}}",
+              "raw": "{{baseUrl}}/api/bookings/pending?conversationId={{conversationIdA}}",
               "host": [
                 "{{baseUrl}}"
               ],
@@ -351,7 +457,7 @@
               "query": [
                 {
                   "key": "conversationId",
-                  "value": "{{currentConversationId}}"
+                  "value": "{{conversationIdA}}"
                 }
               ]
             }
@@ -362,11 +468,11 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('Pending booking is listed in database', function () {",
+                  "pm.test('Pending booking is listed in database for Customer A', function () {",
                   "    pm.response.to.have.status(200);",
                   "    var list = pm.response.json();",
                   "    pm.expect(list).to.be.an('array');",
-                  "    var item = list.find(function(p) { return p.id === pm.environment.get('stagedPendingBookingId'); });",
+                  "    var item = list.find(function(p) { return p.id === pm.environment.get('stagedPendingBookingIdA'); });",
                   "    pm.expect(item).to.not.be.undefined;",
                   "    pm.expect(item.status).to.eql('Pending');",
                   "});"
@@ -376,7 +482,41 @@
           ]
         },
         {
-          "name": "Confirm Pending Booking - Explicit Customer Action",
+          "name": "Measure Slot Capacity Before Confirmation",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/slots",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "slots"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Slot booked capacity before confirmation matches initial value', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var slots = pm.response.json();",
+                  "    var slot = slots.find(function(s) { return s.id === pm.environment.get('selectedSlotId'); });",
+                  "    pm.expect(slot).to.not.be.undefined;",
+                  "    pm.expect(slot.bookedCapacity).to.eql(pm.environment.get('slotInitialBookedCapacity'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reject Confirmation - Missing Customer Token",
           "request": {
             "method": "POST",
             "header": [
@@ -387,7 +527,139 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"conversationId\": \"{{currentConversationId}}\",\n  \"pendingBookingId\": \"{{stagedPendingBookingId}}\",\n  \"expectedRequestHash\": \"{{stagedRequestHash}}\"\n}"
+              "raw": "{\n  \"conversationId\": \"{{conversationIdA}}\",\n  \"pendingBookingId\": \"{{stagedPendingBookingIdA}}\",\n  \"expectedRequestHash\": \"{{stagedRequestHashA}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/bookings/confirm",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "bookings",
+                "confirm"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Confirmation without token rejected with 403 Forbidden', function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reject Confirmation - Forged Customer Token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "eyJhbGciOiJIUzI1NiJ9.forged_customer.invalid_signature"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"conversationId\": \"{{conversationIdA}}\",\n  \"pendingBookingId\": \"{{stagedPendingBookingIdA}}\",\n  \"expectedRequestHash\": \"{{stagedRequestHashA}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/bookings/confirm",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "bookings",
+                "confirm"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Confirmation with forged token rejected with 403 Forbidden', function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reject Confirmation - Customer B Token On Customer A Booking",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenB}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"conversationId\": \"{{conversationIdA}}\",\n  \"pendingBookingId\": \"{{stagedPendingBookingIdA}}\",\n  \"expectedRequestHash\": \"{{stagedRequestHashA}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/bookings/confirm",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "bookings",
+                "confirm"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Confirmation with cross-user token rejected with 403 Forbidden', function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Confirm Pending Booking - Customer A Valid Action",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenA}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"conversationId\": \"{{conversationIdA}}\",\n  \"pendingBookingId\": \"{{stagedPendingBookingIdA}}\",\n  \"expectedRequestHash\": \"{{stagedRequestHashA}}\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/bookings/confirm",
@@ -413,8 +685,8 @@
                   "    pm.expect(res.success).to.be.true;",
                   "    pm.expect(res.customerToken).to.be.a('string');",
                   "    pm.expect(res.data.bookingId).to.be.a('string');",
-                  "    pm.environment.set('issuedCustomerToken', res.customerToken);",
-                  "    pm.environment.set('committedBookingId', res.data.bookingId);",
+                  "    pm.environment.set('issuedCustomerTokenA', res.customerToken);",
+                  "    pm.environment.set('committedBookingIdA', res.data.bookingId);",
                   "});"
                 ]
               }
@@ -422,24 +694,18 @@
           ]
         },
         {
-          "name": "Verify Customer Retrieval With Signed Session Token",
+          "name": "Measure Slot Capacity After Confirmation",
           "request": {
             "method": "GET",
-            "header": [
-              {
-                "key": "X-Customer-Token",
-                "value": "{{issuedCustomerToken}}"
-              }
-            ],
+            "header": [],
             "url": {
-              "raw": "{{baseUrl}}/api/bookings/{{committedBookingId}}",
+              "raw": "{{baseUrl}}/api/slots",
               "host": [
                 "{{baseUrl}}"
               ],
               "path": [
                 "api",
-                "bookings",
-                "{{committedBookingId}}"
+                "slots"
               ]
             }
           },
@@ -449,12 +715,54 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('Customer can retrieve their own booking via token', function () {",
+                  "pm.test('Slot booked capacity increased by exactly 1 after confirmation', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var slots = pm.response.json();",
+                  "    var slot = slots.find(function(s) { return s.id === pm.environment.get('selectedSlotId'); });",
+                  "    pm.expect(slot).to.not.be.undefined;",
+                  "    var initialCap = pm.environment.get('slotInitialBookedCapacity');",
+                  "    pm.expect(slot.bookedCapacity).to.eql(initialCap + 1);",
+                  "    pm.environment.set('slotCapacityAfterConfirm', slot.bookedCapacity);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Verify Customer A Retrieval With Signed Session Token",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Customer-Token",
+                "value": "{{issuedCustomerTokenA}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/bookings/{{committedBookingIdA}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "bookings",
+                "{{committedBookingIdA}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Customer A can retrieve their own booking via token', function () {",
                   "    pm.response.to.have.status(200);",
                   "    var b = pm.response.json();",
-                  "    pm.expect(b.id).to.eql(pm.environment.get('committedBookingId'));",
-                  "    pm.expect(b.customerName).to.eql(pm.environment.get('currentCustomerName'));",
-                  "    pm.expect(b.customerPhone).to.eql(pm.environment.get('currentCustomerPhone'));",
+                  "    pm.expect(b.id).to.eql(pm.environment.get('committedBookingIdA'));",
+                  "    pm.expect(b.customerName).to.eql(pm.environment.get('customerNameA'));",
+                  "    pm.expect(b.customerPhone).to.eql(pm.environment.get('customerPhoneA'));",
                   "    pm.expect(b.status).to.eql('Confirmed');",
                   "});"
                 ]
@@ -463,24 +771,24 @@
           ]
         },
         {
-          "name": "Customer B - Cross-User Booking Access Forbidden (Forged / Other Token)",
+          "name": "Customer B - Cross-User Booking Access Forbidden (Valid Token B)",
           "request": {
             "method": "GET",
             "header": [
               {
                 "key": "X-Customer-Token",
-                "value": "eyJhbGciOiJIUzI1NiJ9.unauthorized_customer.invalid_signature"
+                "value": "{{customerTokenB}}"
               }
             ],
             "url": {
-              "raw": "{{baseUrl}}/api/bookings/{{committedBookingId}}",
+              "raw": "{{baseUrl}}/api/bookings/{{committedBookingIdA}}",
               "host": [
                 "{{baseUrl}}"
               ],
               "path": [
                 "api",
                 "bookings",
-                "{{committedBookingId}}"
+                "{{committedBookingIdA}}"
               ]
             }
           },
@@ -490,7 +798,7 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"Cross-user booking access rejected with 403 Forbidden\", function () {",
+                  "pm.test('Cross-user booking access rejected with 403 Forbidden', function () {",
                   "    pm.response.to.have.status(403);",
                   "});"
                 ]
@@ -499,18 +807,22 @@
           ]
         },
         {
-          "name": "Duplicate Confirmation - Idempotency Safety",
+          "name": "Duplicate Confirmation Replay - Idempotency Safety",
           "request": {
             "method": "POST",
             "header": [
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenA}}"
               }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"conversationId\": \"{{currentConversationId}}\",\n  \"pendingBookingId\": \"{{stagedPendingBookingId}}\",\n  \"expectedRequestHash\": \"{{stagedRequestHash}}\"\n}"
+              "raw": "{\n  \"conversationId\": \"{{conversationIdA}}\",\n  \"pendingBookingId\": \"{{stagedPendingBookingIdA}}\",\n  \"expectedRequestHash\": \"{{stagedRequestHashA}}\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/bookings/confirm",
@@ -534,8 +846,111 @@
                   "    pm.response.to.have.status(200);",
                   "    var res = pm.response.json();",
                   "    pm.expect(res.success).to.be.true;",
-                  "    pm.expect(res.data.bookingId).to.eql(pm.environment.get('committedBookingId'));",
+                  "    pm.expect(res.data.bookingId).to.eql(pm.environment.get('committedBookingIdA'));",
                   "    pm.expect(res.message).to.include('مسجل بالفعل');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Measure Slot Capacity After Replay",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/slots",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "slots"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Slot capacity unchanged after duplicate confirmation replay', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var slots = pm.response.json();",
+                  "    var slot = slots.find(function(s) { return s.id === pm.environment.get('selectedSlotId'); });",
+                  "    pm.expect(slot).to.not.be.undefined;",
+                  "    pm.expect(slot.bookedCapacity).to.eql(pm.environment.get('slotCapacityAfterConfirm'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Verify Single Booking In Database - Exactly One Record",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Key",
+                "value": "{{adminKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/bookings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "bookings"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Safely scoped assertion by fixture booking intent: exactly one confirmed booking exists', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var bookings = pm.response.json();",
+                  "    var slotId = pm.environment.get('selectedSlotId');",
+                  "    var phone = pm.environment.get('customerPhoneA');",
+                  "    var convId = pm.environment.get('conversationIdA');",
+                  "    var service = pm.environment.get('selectedServiceName');",
+                  "    var committedId = pm.environment.get('committedBookingIdA');",
+                  "",
+                  "    pm.expect(slotId, 'selectedSlotId must be defined').to.be.ok;",
+                  "    pm.expect(phone, 'customerPhoneA must be defined').to.be.ok;",
+                  "    pm.expect(convId, 'conversationIdA must be defined').to.be.ok;",
+                  "    pm.expect(service, 'selectedServiceName must be defined').to.be.ok;",
+                  "    pm.expect(committedId, 'committedBookingIdA must be defined').to.be.ok;",
+                  "",
+                  "    // Scoped strictly by fixture booking intent: slot, customer phone, service name, and exact owning conversation",
+                  "    var intentMatches = bookings.filter(function(b) {",
+                  "        var matchSlot = b.slotId === slotId;",
+                  "        var matchPhone = b.customerPhone === phone;",
+                  "        var matchService = b.serviceName === service;",
+                  "        var matchStatus = b.status === 'Confirmed';",
+                  "        var matchConv = b.conversationId === convId;",
+                  "        return matchSlot && matchPhone && matchService && matchStatus && matchConv;",
+                  "    });",
+                  "",
+                  "    pm.expect(intentMatches.length, 'Must have exactly one booking matching intent').to.eql(1);",
+                  "    pm.expect(intentMatches[0].id).to.eql(committedId);",
+                  "    pm.expect(intentMatches[0].slotId).to.eql(slotId);",
+                  "    pm.expect(intentMatches[0].customerPhone).to.eql(phone);",
+                  "    pm.expect(intentMatches[0].serviceName).to.eql(service);",
+                  "    pm.expect(intentMatches[0].conversationId).to.eql(convId);",
+                  "});",
+                  "pm.test('Original booking ID preserved with exactly one committed record', function () {",
+                  "    var bookings = pm.response.json();",
+                  "    var matches = bookings.filter(function(b) { return b.id === pm.environment.get('committedBookingIdA'); });",
+                  "    pm.expect(matches.length).to.eql(1);",
                   "});"
                 ]
               }
@@ -550,11 +965,15 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenA}}"
               }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"conversationId\": \"{{currentConversationId}}\",\n  \"pendingBookingId\": \"{{stagedPendingBookingId}}\",\n  \"expectedRequestHash\": \"tampered_invalid_hash_value\"\n}"
+              "raw": "{\n  \"conversationId\": \"{{conversationIdA}}\",\n  \"pendingBookingId\": \"{{stagedPendingBookingIdA}}\",\n  \"expectedRequestHash\": \"tampered_invalid_hash_value\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/bookings/confirm",
@@ -592,11 +1011,15 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenA}}"
               }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"conversationId\": \"{{currentConversationId}}\",\n  \"pendingBookingId\": \"00000000-0000-0000-0000-000000000099\",\n  \"expectedRequestHash\": \"any_hash\"\n}"
+              "raw": "{\n  \"conversationId\": \"{{conversationIdA}}\",\n  \"pendingBookingId\": \"00000000-0000-0000-0000-000000000099\",\n  \"expectedRequestHash\": \"any_hash\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/bookings/confirm",
@@ -616,11 +1039,8 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('Nonexistent pending booking rejected with 400 Bad Request', function () {",
-                  "    pm.response.to.have.status(400);",
-                  "    var res = pm.response.json();",
-                  "    pm.expect(res.success).to.be.false;",
-                  "    pm.expect(res.errorCode).to.eql('PENDING_NOT_FOUND');",
+                  "pm.test('Nonexistent pending booking rejected with 404 Not Found', function () {",
+                  "    pm.response.to.have.status(404);",
                   "});"
                 ]
               }
@@ -628,18 +1048,32 @@
           ]
         },
         {
-          "name": "Verify Consumed Capacity Preserved After Duplicate Confirmation",
+          "name": "Reject Unauthorized Confirmation - Conversation Mismatch",
           "request": {
-            "method": "GET",
-            "header": [],
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenA}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"conversationId\": \"00000000-0000-0000-0000-000000000099\",\n  \"pendingBookingId\": \"{{stagedPendingBookingIdA}}\",\n  \"expectedRequestHash\": \"{{stagedRequestHashA}}\"\n}"
+            },
             "url": {
-              "raw": "{{baseUrl}}/api/slots",
+              "raw": "{{baseUrl}}/api/bookings/confirm",
               "host": [
                 "{{baseUrl}}"
               ],
               "path": [
                 "api",
-                "slots"
+                "bookings",
+                "confirm"
               ]
             }
           },
@@ -649,13 +1083,8 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"Slot capacity is preserved without double-decrement after replay\", function () {",
-                  "    pm.response.to.have.status(200);",
-                  "    var slots = pm.response.json();",
-                  "    var slot = slots.find(function(s) { return s.id === pm.environment.get(\"selectedSlotId\"); });",
-                  "    pm.expect(slot).to.not.be.undefined;",
-                  "    pm.expect(slot.bookedCapacity).to.be.at.most(slot.totalCapacity);",
-                  "    pm.expect(slot.bookedCapacity).to.eql(1);",
+                  "pm.test('Mismatched conversation rejected with 403 Forbidden', function () {",
+                  "    pm.response.to.have.status(403);",
                   "});"
                 ]
               }
@@ -663,18 +1092,22 @@
           ]
         },
         {
-          "name": "Reject Capacity Exhaustion - Booking Fully Booked Slot",
+          "name": "Capacity Exhaustion - Customer A Stages on Exhaustion Slot",
           "request": {
             "method": "POST",
             "header": [
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenA}}"
               }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"conversationId\": \"{{currentConversationId}}\",\n  \"customerName\": \"عميل آخر\",\n  \"customerPhone\": \"01099998888\",\n  \"slotId\": \"{{selectedSlotId}}\"\n}"
+              "raw": "{\n  \"conversationId\": \"{{conversationIdA}}\",\n  \"customerName\": \"{{customerNameA}}\",\n  \"customerPhone\": \"{{customerPhoneA}}\",\n  \"slotId\": \"{{exhaustSlotId}}\",\n  \"serviceName\": \"{{exhaustServiceName}}\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/bookings/stage",
@@ -694,11 +1127,12 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"Full slot rejected with 400 Bad Request on staging\", function () {",
-                  "    pm.response.to.have.status(400);",
+                  "pm.test('Customer A successfully stages pending booking on exhaustion slot', function () {",
+                  "    pm.response.to.have.status(200);",
                   "    var res = pm.response.json();",
-                  "    pm.expect(res.success).to.be.false;",
-                  "    pm.expect(res.message).to.include(\"fully booked\");",
+                  "    pm.expect(res.success).to.be.true;",
+                  "    pm.environment.set('stagedExhaustA', res.pendingBookingId);",
+                  "    pm.environment.set('stagedExhaustHashA', res.requestHash);",
                   "});"
                 ]
               }
@@ -706,18 +1140,70 @@
           ]
         },
         {
-          "name": "Reject Unauthorized Confirmation - Conversation Mismatch",
+          "name": "Capacity Exhaustion - Customer B Stages on Same Exhaustion Slot",
           "request": {
             "method": "POST",
             "header": [
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenB}}"
               }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"conversationId\": \"00000000-0000-0000-0000-000000000099\",\n  \"pendingBookingId\": \"{{stagedPendingBookingId}}\",\n  \"expectedRequestHash\": \"{{stagedRequestHash}}\"\n}"
+              "raw": "{\n  \"conversationId\": \"{{conversationIdB}}\",\n  \"customerName\": \"{{customerNameB}}\",\n  \"customerPhone\": \"{{customerPhoneB}}\",\n  \"slotId\": \"{{exhaustSlotId}}\",\n  \"serviceName\": \"{{exhaustServiceName}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/bookings/stage",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "bookings",
+                "stage"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Customer B successfully stages pending booking on same exhaustion slot', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var res = pm.response.json();",
+                  "    pm.expect(res.success).to.be.true;",
+                  "    pm.environment.set('stagedExhaustB', res.pendingBookingId);",
+                  "    pm.environment.set('stagedExhaustHashB', res.requestHash);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Capacity Exhaustion - Customer B Confirms Consuming Final Place",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenB}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"conversationId\": \"{{conversationIdB}}\",\n  \"pendingBookingId\": \"{{stagedExhaustB}}\",\n  \"expectedRequestHash\": \"{{stagedExhaustHashB}}\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/bookings/confirm",
@@ -737,11 +1223,59 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"Mismatched conversation rejected with CONVERSATION_MISMATCH\", function () {",
+                  "pm.test('Customer B confirmation succeeds and claims final place in slot', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var res = pm.response.json();",
+                  "    pm.expect(res.success).to.be.true;",
+                  "    pm.environment.set('exhaustBookingIdB', res.data.bookingId);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Capacity Exhaustion - Customer A Confirms After Slot Consumed (Assert Exhaustion)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{customerTokenA}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"conversationId\": \"{{conversationIdA}}\",\n  \"pendingBookingId\": \"{{stagedExhaustA}}\",\n  \"expectedRequestHash\": \"{{stagedExhaustHashA}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/bookings/confirm",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "bookings",
+                "confirm"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Confirmation rejected with 400 Bad Request due to capacity exhaustion', function () {",
                   "    pm.response.to.have.status(400);",
                   "    var res = pm.response.json();",
                   "    pm.expect(res.success).to.be.false;",
-                  "    pm.expect(res.errorCode).to.eql(\"CONVERSATION_MISMATCH\");",
+                  "    pm.expect(res.errorCode).to.eql('SLOT_FULLY_BOOKED');",
+                  "    pm.expect(res.message).to.include('تم حجز الموعد بالكامل');",
                   "});"
                 ]
               }
@@ -897,11 +1431,8 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "var sConvId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {",
-                  "    var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);",
-                  "    return v.toString(16);",
-                  "});",
-                  "pm.environment.set('streamConversationId', sConvId);"
+                  "// New anonymous customer session: server generates identifier and scoped credential",
+                  "pm.environment.unset('streamConversationId');"
                 ]
               }
             },
@@ -910,11 +1441,11 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"Chat stream returns 200 with text/event-stream content type\", function () {",
+                  "pm.test('Chat stream returns 200 with text/event-stream content type', function () {",
                   "    pm.response.to.have.status(200);",
-                  "    pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"text/event-stream\");",
+                  "    pm.expect(pm.response.headers.get('Content-Type')).to.include('text/event-stream');",
                   "    var body = pm.response.text();",
-                  "    pm.expect(body).to.include(\"data:\");",
+                  "    pm.expect(body).to.include('data:');",
                   "    pm.expect(body).to.include('\"type\":\"session\"');",
                   "    pm.expect(body).to.include('\"type\":\"token\"');",
                   "    pm.expect(body).to.include('\"type\":\"done\"');",
@@ -925,15 +1456,16 @@
                   "        if (line.startsWith('data:') && line.indexOf('\"session\"') !== -1) {",
                   "            try {",
                   "                var sessionObj = JSON.parse(line.replace(/^data:\\s*/, ''));",
-                  "                if (sessionObj.customerToken) {",
-                  "                    pm.environment.set(\"streamCustomerToken\", sessionObj.customerToken);",
+                  "                if (sessionObj.customerToken && sessionObj.conversationId) {",
+                  "                    pm.environment.set('streamConversationId', sessionObj.conversationId);",
+                  "                    pm.environment.set('streamCustomerToken', sessionObj.customerToken);",
                   "                    tokenFound = true;",
                   "                    break;",
                   "                }",
                   "            } catch(e) {}",
                   "        }",
                   "    }",
-                  "    pm.expect(tokenFound, \"Customer session token must be parsed from SSE stream\").to.be.true;",
+                  "    pm.expect(tokenFound, 'Customer session token and conversation ID must be parsed from SSE stream').to.be.true;",
                   "});"
                 ]
               }
@@ -949,7 +1481,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"agentId\": \"{{agentId}}\",\n  \"conversationId\": \"{{streamConversationId}}\",\n  \"message\": \"السلام عليكم، عايز أعرف المواعيد\"\n}"
+              "raw": "{\n  \"agentId\": \"{{agentId}}\",\n  \"conversationId\": null,\n  \"message\": \"السلام عليكم، عايز أعرف المواعيد\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/chat/stream",
@@ -1022,11 +1554,7 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "var vConvId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {",
-                  "    var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);",
-                  "    return v.toString(16);",
-                  "});",
-                  "pm.environment.set('voiceConversationId', vConvId);"
+                  "// Voice session starts with server-generated ID"
                 ]
               }
             },
@@ -1039,7 +1567,12 @@
                   "    pm.response.to.have.status(200);",
                   "    var res = pm.response.json();",
                   "    pm.expect(res.sessionId).to.be.a('string');",
+                  "    pm.expect(res.conversationId).to.be.a('string');",
                   "    pm.environment.set('activeVoiceSessionId', res.sessionId);",
+                  "    pm.environment.set('voiceConversationId', res.conversationId);",
+                  "    if (res.customerToken) {",
+                  "        pm.environment.set('voiceCustomerToken', res.customerToken);",
+                  "    }",
                   "});"
                 ]
               }
@@ -1055,7 +1588,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"conversationId\": \"{{voiceConversationId}}\"\n}"
+              "raw": "{\n  \"conversationId\": null\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/voice/session",
@@ -1077,6 +1610,10 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{voiceCustomerToken}}"
               }
             ],
             "body": {
@@ -1120,11 +1657,15 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Customer-Token",
+                "value": "{{voiceCustomerToken}}"
               }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"text\": \"أهلاً بحضرتك يا فندم في عيادة النور التخصصية\",\n  \"languageCode\": \"ar-EG\"\n}"
+              "raw": "{\n  \"text\": \"أهلاً بحضرتك يا فندم في عيادة النور التخصصية\",\n  \"languageCode\": \"ar-EG\",\n  \"conversationId\": \"{{voiceConversationId}}\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/api/voice/tts",
@@ -1328,6 +1869,201 @@
       "name": "09_Teardown_And_Sanitization",
       "item": [
         {
+          "name": "Actual Database Cleanup - Delete Test Fixtures (Admin)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "X-Admin-Key",
+                "value": "{{adminKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/fixtures?conversationIds={{conversationIdA}},{{conversationIdB}},{{streamConversationId}},{{voiceConversationId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "fixtures"
+              ],
+              "query": [
+                {
+                  "key": "conversationIds",
+                  "value": "{{conversationIdA}},{{conversationIdB}},{{streamConversationId}},{{voiceConversationId}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Database test fixtures safely deleted with 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var res = pm.response.json();",
+                  "    pm.expect(res.success).to.be.true;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Assert Cleanup Restores Fixture Slot Capacity",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/slots",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "slots"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Slot booked capacity restored to initial baseline capacity after cleanup', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var slots = pm.response.json();",
+                  "    var slot = slots.find(function(s) { return s.id === pm.environment.get('selectedSlotId'); });",
+                  "    pm.expect(slot).to.not.be.undefined;",
+                  "    var initialCap = pm.environment.get('slotInitialBookedCapacity');",
+                  "    pm.expect(slot.bookedCapacity).to.eql(initialCap);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Assert Control Fixture Preserved While Test Fixture Resources Removed",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Customer-Token",
+                "value": "{{controlCustomerToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/conversations/{{controlConversationId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "conversations",
+                "{{controlConversationId}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Unrelated control fixture preserved after test fixture cleanup', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var res = pm.response.json();",
+                  "    pm.expect(res.id).to.eql(pm.environment.get('controlConversationId'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Assert Test Fixture Resources Removed - Verify Deleted Conversation 404",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Admin-Key",
+                "value": "{{adminKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/conversations/{{conversationIdA}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "conversations",
+                "{{conversationIdA}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Deleted fixture conversation returns 404 Not Found', function () {",
+                  "    pm.response.to.have.status(404);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Clean Up Unrelated Control Fixture (Admin)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "X-Admin-Key",
+                "value": "{{adminKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/admin/fixtures?conversationIds={{controlConversationId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "admin",
+                "fixtures"
+              ],
+              "query": [
+                {
+                  "key": "conversationIds",
+                  "value": "{{controlConversationId}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Control fixture cleaned up safely with 200 OK', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "name": "Sanitize Environment Fixtures and Dynamic Tokens",
           "request": {
             "method": "GET",
@@ -1349,16 +2085,32 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"Environment sanitized and dynamic customer tokens cleared\", function () {",
-                  "    pm.environment.unset(\"issuedCustomerToken\");",
-                  "    pm.environment.unset(\"streamCustomerToken\");",
-                  "    pm.environment.unset(\"stagedPendingBookingId\");",
-                  "    pm.environment.unset(\"stagedRequestHash\");",
-                  "    pm.environment.unset(\"currentConversationId\");",
-                  "    pm.environment.unset(\"currentCustomerPhone\");",
-                  "    pm.environment.unset(\"currentCustomerName\");",
-                  "    pm.environment.unset(\"committedBookingId\");",
-                  "    pm.environment.unset(\"streamConversationId\");",
+                  "pm.test('Environment sanitized and dynamic customer tokens cleared', function () {",
+                  "    pm.environment.unset('conversationIdA');",
+                  "    pm.environment.unset('customerTokenA');",
+                  "    pm.environment.unset('customerPhoneA');",
+                  "    pm.environment.unset('customerNameA');",
+                  "    pm.environment.unset('conversationIdB');",
+                  "    pm.environment.unset('customerTokenB');",
+                  "    pm.environment.unset('customerPhoneB');",
+                  "    pm.environment.unset('customerNameB');",
+                  "    pm.environment.unset('controlConversationId');",
+                  "    pm.environment.unset('controlCustomerToken');",
+                  "    pm.environment.unset('stagedPendingBookingIdA');",
+                  "    pm.environment.unset('stagedRequestHashA');",
+                  "    pm.environment.unset('issuedCustomerTokenA');",
+                  "    pm.environment.unset('committedBookingIdA');",
+                  "    pm.environment.unset('slotCapacityAfterConfirm');",
+                  "    pm.environment.unset('stagedExhaustA');",
+                  "    pm.environment.unset('stagedExhaustHashA');",
+                  "    pm.environment.unset('stagedExhaustB');",
+                  "    pm.environment.unset('stagedExhaustHashB');",
+                  "    pm.environment.unset('exhaustBookingIdB');",
+                  "    pm.environment.unset('streamConversationId');",
+                  "    pm.environment.unset('streamCustomerToken');",
+                  "    pm.environment.unset('activeVoiceSessionId');",
+                  "    pm.environment.unset('voiceConversationId');",
+                  "    pm.environment.unset('voiceCustomerToken');",
                   "    pm.expect(true).to.be.true;",
                   "});"
                 ]

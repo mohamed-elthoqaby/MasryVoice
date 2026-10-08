@@ -10,20 +10,28 @@ public interface ITtsProvider
 }
 
 /// <summary>
-/// Production Egyptian Arabic Text-To-Speech Provider calling a real OpenAI-compatible TTS endpoint
-/// (e.g. Piper, Kokoro, Edge-TTS bridge, or local neural voice server).
-/// Strictly fails when the real endpoint is unavailable or returns errors.
+/// Production Text-To-Speech Provider calling a local OpenAI-compatible speech synthesis endpoint
+/// (e.g. Piper ONNX local offline engine).
+/// Strictly fails when the local endpoint is unavailable or returns errors.
 /// Never fabricates synthetic sine tones on failure.
 /// </summary>
 public class LocalEgyptianTtsProvider : ITtsProvider
 {
     private readonly HttpClient _httpClient;
+    private readonly Microsoft.Extensions.Configuration.IConfiguration? _config;
     private readonly ILogger<LocalEgyptianTtsProvider> _logger;
 
-    public LocalEgyptianTtsProvider(HttpClient httpClient, ILogger<LocalEgyptianTtsProvider> logger)
+    [Microsoft.Extensions.DependencyInjection.ActivatorUtilitiesConstructor]
+    public LocalEgyptianTtsProvider(HttpClient httpClient, Microsoft.Extensions.Configuration.IConfiguration? config, ILogger<LocalEgyptianTtsProvider> logger)
     {
         _httpClient = httpClient;
+        _config = config;
         _logger = logger;
+    }
+
+    public LocalEgyptianTtsProvider(HttpClient httpClient, ILogger<LocalEgyptianTtsProvider> logger)
+        : this(httpClient, null, logger)
+    {
     }
 
     public async Task<ReadOnlyMemory<byte>> SynthesizeSpeechAsync(string text, string languageCode = "ar-EG", CancellationToken ct = default)
@@ -32,13 +40,15 @@ public class LocalEgyptianTtsProvider : ITtsProvider
 
         if (string.IsNullOrWhiteSpace(text))
         {
-            throw new ArgumentException("Text to synthesize cannot be null or empty.", nameof(text));
+            throw new ArgumentException("Text cannot be null or empty.", nameof(text));
         }
 
+        var voice = _config?["Voice:TtsVoice"] ?? "ar_JO-kareem-low";
         var body = new
         {
             input = text,
-            voice = "ar-EG-SalmaNeural",
+            voice = voice,
+            model = "piper-tts",
             response_format = "wav"
         };
 
@@ -48,7 +58,7 @@ public class LocalEgyptianTtsProvider : ITtsProvider
         {
             var err = await response.Content.ReadAsStringAsync(ct);
             _logger.LogError("TTS request failed with status code {StatusCode}: {Error}", (int)response.StatusCode, err);
-            throw new HttpRequestException($"Local Egyptian TTS service returned HTTP {(int)response.StatusCode}: {err}");
+            throw new HttpRequestException($"Local TTS service returned HTTP {(int)response.StatusCode}: {err}", null, response.StatusCode);
         }
 
         var bytes = await response.Content.ReadAsByteArrayAsync(ct);

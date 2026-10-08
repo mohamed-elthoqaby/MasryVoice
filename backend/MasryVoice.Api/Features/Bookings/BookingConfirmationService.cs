@@ -194,6 +194,7 @@ public class BookingConfirmationService : IBookingConfirmationService
             var newBooking = new Booking
             {
                 Id = Guid.NewGuid(),
+                ConversationId = pending.ConversationId,
                 SlotId = pending.SlotId,
                 CustomerName = pending.CustomerName,
                 CustomerPhone = pending.CustomerPhone,

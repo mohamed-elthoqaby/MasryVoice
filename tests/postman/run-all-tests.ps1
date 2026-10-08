@@ -32,31 +32,46 @@ catch {
     exit 1
 }
 
-# 2. Run Postman CLI
-Write-Host "`n[2/3] Executing Postman Acceptance Test Suite via Postman CLI..."
-$postmanCmd = "collection run `"$CollectionPath`" -e `"$EnvPath`" -r cli,json --reporter-json-export `"$PostmanReportPath`""
-$p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c postman $postmanCmd" -NoNewWindow -Wait -PassThru
-$postmanExit = $p.ExitCode
+# 2. Run Postman CLI Twice Against Same Database (Preserve Both Reports)
+$Run1ReportPath = Join-Path $ReportsDir "postman-acceptance-run1.json"
+$Run2ReportPath = Join-Path $ReportsDir "postman-acceptance-run2.json"
+$SanitizeScript = Join-Path $ScriptDir "sanitize-report.js"
 
-if ($postmanExit -ne 0) {
-    Write-Host "Postman CLI acceptance tests failed with exit code $postmanExit."
-    exit $postmanExit
+Write-Host "`n[2/4] Executing Postman Acceptance Run 1 via Postman CLI..."
+$postmanCmd1 = "collection run `"$CollectionPath`" -e `"$EnvPath`" --env-var `"adminKey=$AdminKey`" -r cli,json --reporter-json-export `"$Run1ReportPath`""
+$p1 = Start-Process -FilePath "cmd.exe" -ArgumentList "/c postman $postmanCmd1" -NoNewWindow -Wait -PassThru
+if ($p1.ExitCode -ne 0) {
+    Write-Host "Postman CLI Run 1 failed with exit code $($p1.ExitCode)."
+    exit $p1.ExitCode
 }
-else {
-    Write-Host "Postman CLI Acceptance Tests: 100% Passed!"
-    Write-Host "Local JSON report exported to: $PostmanReportPath"
-}
+Write-Host "Postman CLI Run 1: 100% Passed!"
 
-# 3. Newman Export
-Write-Host "`nGenerating supplementary Newman JSON report to: $NewmanReportPath..."
-$newmanCmd = "run `"$CollectionPath`" -e `"$EnvPath`" -r json --reporter-json-export `"$NewmanReportPath`" --silent"
-$np = Start-Process -FilePath "cmd.exe" -ArgumentList "/c npx -y newman $newmanCmd" -NoNewWindow -Wait -PassThru
-if ($np.ExitCode -eq 0) {
-    Write-Host "Newman verification report exported successfully."
+Write-Host "`n[3/4] Executing Postman Acceptance Run 2 (re-verification against same isolated database without global reset)..."
+$postmanCmd2 = "collection run `"$CollectionPath`" -e `"$EnvPath`" --env-var `"adminKey=$AdminKey`" -r cli,json --reporter-json-export `"$Run2ReportPath`""
+$p2 = Start-Process -FilePath "cmd.exe" -ArgumentList "/c postman $postmanCmd2" -NoNewWindow -Wait -PassThru
+if ($p2.ExitCode -ne 0) {
+    Write-Host "Postman CLI Run 2 failed with exit code $($p2.ExitCode)."
+    exit $p2.ExitCode
 }
-else {
-    Write-Host "Newman run exited with code $($np.ExitCode)"
+Write-Host "Postman CLI Run 2: 100% Passed!"
+
+Write-Host "`nSanitizing Postman Acceptance Artifacts into sanitized directory..."
+$SanitizedDir = Join-Path $ReportsDir "sanitized"
+if (-not (Test-Path $SanitizedDir)) {
+    New-Item -ItemType Directory -Path $SanitizedDir -Force | Out-Null
 }
+$SanitizedRun1 = Join-Path $SanitizedDir "postman-acceptance-run1.json"
+$SanitizedRun2 = Join-Path $SanitizedDir "postman-acceptance-run2.json"
+$SanitizedReport = Join-Path $SanitizedDir "postman-acceptance.json"
+
+node $SanitizeScript $Run1ReportPath $SanitizedRun1
+if ($LASTEXITCODE -ne 0) { Write-Host "Sanitization failed for Run 1"; exit $LASTEXITCODE }
+
+node $SanitizeScript $Run2ReportPath $SanitizedRun2
+if ($LASTEXITCODE -ne 0) { Write-Host "Sanitization failed for Run 2"; exit $LASTEXITCODE }
+
+Copy-Item $SanitizedRun1 $SanitizedReport -Force
+
 
 # 4. Performance Benchmarks
 if (-not $SkipPerformance) {

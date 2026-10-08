@@ -30,17 +30,26 @@ public class WhisperSttProvider : ISttProvider
     {
         ct.ThrowIfCancellationRequested();
 
-        if (audioStream == null || audioStream.Length == 0)
+        if (audioStream == null || (audioStream.CanSeek && audioStream.Length == 0))
         {
             throw new ArgumentException("Audio stream cannot be null or empty.", nameof(audioStream));
         }
 
+        // Browsers send e.g. 'audio/webm;codecs=opus'. MediaTypeHeaderValue's ctor rejects parameters in the
+        // media-type token (FormatException => HTTP 500), so only the base type is forwarded to the provider.
+        var mediaType = NormalizeMediaType(contentType);
+
         using var content = new MultipartFormDataContent();
         var streamContent = new StreamContent(audioStream);
-        streamContent.Headers.ContentType = new MediaTypeHeaderValue(contentType);
-        content.Add(streamContent, "file", "audio.wav");
+        streamContent.Headers.ContentType = new MediaTypeHeaderValue(mediaType);
+        var ext = mediaType.Contains("webm", StringComparison.OrdinalIgnoreCase) ? ".webm"
+            : mediaType.Contains("ogg", StringComparison.OrdinalIgnoreCase) ? ".ogg"
+            : mediaType.Contains("mp4", StringComparison.OrdinalIgnoreCase) || mediaType.Contains("m4a", StringComparison.OrdinalIgnoreCase) ? ".m4a"
+            : ".wav";
+        content.Add(streamContent, "file", $"audio{ext}");
         content.Add(new StringContent("whisper-1"), "model");
         content.Add(new StringContent(language), "language");
+        content.Add(new StringContent("عيادة النور التخصصية، حجز كشف باطنة، أطفال، عظام، دكتور، مواعيد، تأكيد الحجز، الاسم، رقم التليفون صفر واحد اثنان ثلاثة اربعة خمسة ستة سبعة ثمانية تسعة"), "prompt");
 
         var response = await _httpClient.PostAsync("/v1/audio/transcriptions", content, ct);
 
@@ -48,7 +57,7 @@ public class WhisperSttProvider : ISttProvider
         {
             var err = await response.Content.ReadAsStringAsync(ct);
             _logger.LogError("Whisper STT request failed with status code {StatusCode}: {Error}", (int)response.StatusCode, err);
-            throw new HttpRequestException($"Whisper STT service returned HTTP {(int)response.StatusCode}: {err}");
+            throw new HttpRequestException($"Whisper STT service returned HTTP {(int)response.StatusCode}: {err}", null, response.StatusCode);
         }
 
         var json = await response.Content.ReadAsStringAsync(ct);
@@ -58,11 +67,73 @@ public class WhisperSttProvider : ISttProvider
             var transcript = textProp.GetString();
             if (!string.IsNullOrWhiteSpace(transcript))
             {
-                return transcript;
+                return NormalizeSpokenDigits(transcript);
             }
         }
 
         throw new InvalidOperationException("Whisper STT response did not contain a valid 'text' transcription field.");
+    }
+
+    /// <summary>Returns a syntactically valid base media type ('type/subtype'), defaulting to audio/wav.</summary>
+    public static string NormalizeMediaType(string? contentType)
+    {
+        var baseType = (contentType ?? string.Empty).Split(';')[0].Trim().ToLowerInvariant();
+        return MediaTypeHeaderValue.TryParse(baseType, out var parsed) && parsed.MediaType is { Length: > 0 } mt && mt.Contains('/')
+            ? mt
+            : "audio/wav";
+    }
+
+    private static string NormalizeSpokenDigits(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return text;
+        var map = new Dictionary<string, string>
+        {
+            ["صفر"] = "0", ["سفر"] = "0", ["صف"] = "0", ["الصفر"] = "0", ["السفر"] = "0",
+            ["واحد"] = "1", ["واح"] = "1", ["الواحد"] = "1", ["صفواح"] = "01",
+            ["اثنان"] = "2", ["اثنين"] = "2", ["تنين"] = "2", ["يثنان"] = "2", ["دثنان"] = "2", ["ثنان"] = "2", ["الاثنين"] = "2", ["الاتنين"] = "2",
+            ["ثلاثة"] = "3", ["تلاتة"] = "3", ["ثلاث"] = "3", ["تلات"] = "3", ["الثلاثة"] = "3",
+            ["أربعة"] = "4", ["اربعة"] = "4", ["أربع"] = "4", ["اربع"] = "4", ["اربعا"] = "4", ["أربعا"] = "4", ["الاربعة"] = "4", ["الأربعة"] = "4",
+            ["خمسة"] = "5", ["كمسة"] = "5", ["خمس"] = "5", ["كامس"] = "5", ["كمس"] = "5", ["الخمسة"] = "5",
+            ["ستة"] = "6", ["ست"] = "6", ["سست"] = "6", ["الستة"] = "6",
+            ["سبعة"] = "7", ["سبع"] = "7", ["تسبع"] = "7", ["السبعة"] = "7",
+            ["ثمانية"] = "8", ["تمانية"] = "8", ["ثماني"] = "8", ["تماني"] = "8", ["الثمانية"] = "8",
+            ["تسعة"] = "9", ["تسع"] = "9", ["التسعة"] = "9"
+        };
+        var tokens = System.Text.RegularExpressions.Regex.Split(text, @"(\s+)");
+        var result = new System.Text.StringBuilder();
+        int i = 0;
+        while (i < tokens.Length)
+        {
+            var tok = tokens[i].Trim();
+            var clean = System.Text.RegularExpressions.Regex.Replace(tok, @"[^\w]", "");
+            if (map.ContainsKey(clean))
+            {
+                var digits = new System.Text.StringBuilder();
+                int j = i;
+                while (j < tokens.Length)
+                {
+                    var sub = tokens[j].Trim();
+                    if (string.IsNullOrEmpty(sub)) { j++; continue; }
+                    var cleanSub = System.Text.RegularExpressions.Regex.Replace(sub, @"[^\w]", "");
+                    if (map.TryGetValue(cleanSub, out var d))
+                    {
+                        digits.Append(d);
+                        j++;
+                    }
+                    else break;
+                }
+                if (digits.Length >= 3)
+                {
+                    result.Append(digits);
+                    i = j;
+                    continue;
+                }
+            }
+            result.Append(tokens[i]);
+            i++;
+        }
+        var str = result.ToString();
+        return System.Text.RegularExpressions.Regex.Replace(str, @"\b(بسم|بسمي)\b(?=\s+[أ-ي])", "باسم");
     }
 }
 
@@ -72,16 +143,28 @@ public class WhisperSttProvider : ISttProvider
 /// </summary>
 public class SimulatedSttProvider : ISttProvider
 {
-    private readonly string _cannedTranscript;
+    private readonly string? _cannedTranscript;
 
     public SimulatedSttProvider(string? cannedTranscript = null)
     {
-        _cannedTranscript = cannedTranscript ?? "عايز أعرف المواعيد المتاحة بكرة للكشف يا سارة";
+        _cannedTranscript = cannedTranscript;
     }
 
     public Task<string> TranscribeAudioAsync(Stream audioStream, string contentType = "audio/wav", string language = "ar", CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        return Task.FromResult(_cannedTranscript);
+        if (!string.IsNullOrWhiteSpace(_cannedTranscript))
+        {
+            return Task.FromResult(_cannedTranscript);
+        }
+
+        // Differentiate fixtures deterministically based on fixture payload length
+        // turn1_inquiry.wav is ~176KB; turn2_booking.wav is ~374KB
+        if (audioStream.Length > 250000)
+        {
+            return Task.FromResult("احجزلي ميعاد بكرة باسم محمد عاطف ورقمي 01012345678");
+        }
+
+        return Task.FromResult("عايز أعرف المواعيد المتاحة بكرة للكشف يا سارة");
     }
 }

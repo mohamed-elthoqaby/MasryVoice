@@ -17,5 +17,19 @@ services:
       timeout: 5s
       retries: 5
 
+  asterisk:
+    build:
+      context: ./deploy/asterisk
+      dockerfile: Dockerfile
+    container_name: masryvoice-asterisk
+    restart: unless-stopped
+    profiles:
+      - telephony
+    ports:
+      - "5060:5060/udp"
+      - "10000-10050:10000-10050/udp"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
 volumes:
   postgres_data:

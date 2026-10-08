@@ -21,6 +21,12 @@ public class AppDbContext : DbContext
     public DbSet<DocumentChunk> DocumentChunks => Set<DocumentChunk>();
     public DbSet<OutboxJob> OutboxJobs => Set<OutboxJob>();
 
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+    {
+        base.OnConfiguring(optionsBuilder);
+        optionsBuilder.ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.PendingModelChangesWarning));
+    }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
@@ -110,10 +116,16 @@ public class AppDbContext : DbContext
              .HasForeignKey(bk => bk.SlotId)
              .OnDelete(DeleteBehavior.Restrict);
 
+            b.HasOne<Conversation>()
+             .WithMany()
+             .HasForeignKey(bk => bk.ConversationId)
+             .OnDelete(DeleteBehavior.SetNull);
+
             // Unique index on IdempotencyKey to prevent duplicate booking creation
             b.HasIndex(bk => bk.IdempotencyKey).IsUnique();
             // Fast order-by-descending seek for recent bookings
             b.HasIndex(bk => bk.CreatedAtUtc);
+            b.HasIndex(bk => bk.ConversationId);
         });
 
         if (Database.IsNpgsql())
@@ -167,6 +179,17 @@ public class AppDbContext : DbContext
 
         // 1. Seed or Update Default Egyptian Arabic Agent
         var defaultAgent = await Agents.FirstOrDefaultAsync(a => a.Id == Guid.Parse("11111111-1111-1111-1111-111111111111"));
+        const string promptText = """
+        أنتِ سارة، مساعدة عيادة النور التخصصية في القاهرة. تتحدثين بالعامية المصرية الودودة.
+        تعليمات الاستجابة:
+        1. إذا سلم العميل أو سأل سؤالاً عاماً (مثل مواعيد العمل، العنوان، التخصصات)، أجيبي فوراً بالعامية المصرية الودودة بوضوح، ولا تتركي الرد فارغاً أبداً.
+        2. عند سؤال المريض عن المواعيد المتاحة فقط، استدعي أداة CheckAvailability.
+        3. عندما يطلب المريض الحجز أو يذكر اسمه وتليفونه (مثال: احجزلي باسم فلان وتليفوني كذا)، استدعي فوراً وحصراً أداة StageBooking بالبيانات: customerName و customerPhone، ولا تستدعي CheckAvailability في هذه الحالة.
+        4. بعد استدعاء StageBooking، اطلبي من العميل مراجعة التفاصيل والضغط على زر 'تأكيد الحجز' في الشاشة.
+        5. لا تقومي بتأكيد الحجز بنفسك، فالتأكيد يتم حصرياً عبر ضغط العميل على زر التأكيد.
+        6. عندما يسأل العميل عن الخدمات والأسعار، استدعي أداة SearchKnowledgeBase.
+        """;
+
         if (defaultAgent == null)
         {
             defaultAgent = new Agent
@@ -174,33 +197,19 @@ public class AppDbContext : DbContext
                 Id = Guid.Parse("11111111-1111-1111-1111-111111111111"),
                 Name = "سارة - مساعدة عيادة النور التخصصية",
                 LanguageCode = "ar-EG",
-                ModelName = "qwen2.5:1.5b",
+                ModelName = "qwen2.5:3b",
                 Temperature = 0.2,
                 IsActive = true,
-                AllowedToolsJson = "[\"CheckAvailability\",\"StageBooking\",\"GetBooking\",\"SearchKnowledgeBase\"]",
-                SystemPrompt = """
-                أنتِ "سارة"، المساعدة الصوتية والذكية لعيادة النور التخصصية في القاهرة.
-                تتحدثين باللهجة المصرية العامية المهذبة والودودة والواضحة جداً.
-                قواعد العمل الصارمة والمراحل:
-                1. تحدثي دائماً بالعامية المصرية الودودة (مثال: "أهلاً بحضرتك يا فندم"، "تحت أمرك").
-                2. ساعات العمل الرسمية بالعيادة: من الأحد إلى الخميس، من 9:00 صباحاً حتى 5:00 مساءً بتوقيت القاهرة.
-                3. عندما يسأل العميل عن المواعيد المتاحة، استخدمي أداة CheckAvailability لمعرفة المواعيد من قاعدة البيانات.
-                4. مرحلة تجهيز الحجز (StageBooking):
-                   - عندما يطلب العميل ميعاداً ويعطي اسمه وتليفونه، استدعي أداة StageBooking لتسجيل مسودة حجز معلق في السيستم.
-                   - بعد استدعاء StageBooking بنجاح، راجعي البيانات مع العميل واطلبي منه مراجعة بطاقة الحجز المعروضة أمامه والضغط على زر "تأكيد الحجز" لإتمام الحجز نهائياً.
-                   - إذا طلب العميل تغيير الموعد أو الاسم أو التليفون، استدعي StageBooking مجدداً بالبيانات الجديدة (وهذا يلغي أي حجز معلق سابق تلقائياً).
-                5. عملية التأكيد النهائي وتثبيت الحجز لا يقوم بها الموديل، بل تتم حصرياً عبر موافقة العميل الصريحة وضغط زر التأكيد.
-                6. عندما يسأل العميل عن خدمات العيادة، أسعار الكشوفات، الأطباء، أو التعليمات، استدعي أداة SearchKnowledgeBase للبحث في قاعدة المعرفة المعتمدة. إذا لم تجدي إجابة كافية، قولي بلطف: "المعلومة دي مش متوفرة عندي حالياً يا فندم وهتأكد لحضرتك منها".
-                7. لا تنفذي أي أداة غير مسموح بها.
-                """
+                AllowedToolsJson = "[\"CheckAvailability\",\"StageBooking\",\"GetBooking\",\"CancelBooking\",\"SearchKnowledgeBase\"]",
+                SystemPrompt = promptText
             };
 
             Agents.Add(defaultAgent);
             await SaveChangesAsync();
         }
-        else
+        else if (defaultAgent.SystemPrompt != promptText)
         {
-            defaultAgent.AllowedToolsJson = "[\"CheckAvailability\",\"StageBooking\",\"GetBooking\",\"SearchKnowledgeBase\"]";
+            defaultAgent.SystemPrompt = promptText;
             await SaveChangesAsync();
         }
 

@@ -16,6 +16,12 @@ public record ChatEvent(
     object? Metadata = null
 );
 
+/// <summary>Stable machine-readable metadata attached to every "error" ChatEvent.</summary>
+public record ChatErrorInfo(
+    [property: System.Text.Json.Serialization.JsonPropertyName("code")] string Code,
+    [property: System.Text.Json.Serialization.JsonPropertyName("stage")] string Stage,
+    [property: System.Text.Json.Serialization.JsonPropertyName("retryAfterSeconds")] int? RetryAfterSeconds = null);
+
 public class AgentOrchestrator
 {
     private readonly AppDbContext _db;
@@ -66,7 +72,7 @@ public class AgentOrchestrator
 
         if (agent == null)
         {
-            yield return new ChatEvent("error", "الوكيل المطلوب غير موجود أو غير مفعل.");
+            yield return new ChatEvent("error", "الوكيل المطلوب غير موجود أو غير مفعل.", new ChatErrorInfo("AGENT_NOT_FOUND", "agent"));
             yield break;
         }
 
@@ -164,18 +170,19 @@ public class AgentOrchestrator
 
             if (overloadException != null)
             {
-                yield return new ChatEvent("error", overloadException.Message, new { code = overloadException.Code, retryAfter = overloadException.RetryAfterSeconds });
+                yield return OverloadEvent(overloadException);
                 yield break;
             }
 
+            string? providerError = null;
             try
             {
                 await foreach (var chunk in _llmProvider.StreamChatAsync(request, ct))
                 {
                     if (chunk.IsError)
                     {
-                        yield return new ChatEvent("error", chunk.ErrorMessage ?? "حدث خطأ في مزود الذكاء الاصطناعي");
-                        yield break;
+                        providerError = chunk.ErrorMessage ?? "unknown provider error";
+                        break;
                     }
 
                     if (!string.IsNullOrEmpty(chunk.DeltaText))
@@ -193,6 +200,85 @@ public class AgentOrchestrator
             finally
             {
                 inferencePermit?.Dispose();
+            }
+
+            if (providerError != null)
+            {
+                _logger.LogError("LLM provider failure on first pass: {ProviderError}", providerError);
+                yield return ProviderErrorEvent();
+                yield break;
+            }
+
+            // If the model produced 0 tokens and 0 tool calls while tools were enabled,
+            // retry once without tools to produce natural conversational output for general greetings or inquiries.
+            // The retry is a second inference call and therefore MUST be admitted through the same throttle:
+            // no permit => no upstream call.
+            if (assistantContentAccumulator.Length == 0 && pendingToolCalls.Count == 0 && allowedToolDefinitions.Count > 0)
+            {
+                var directRequest = new LlmChatRequest(
+                    Model: agent.ModelName,
+                    Messages: llmMessages,
+                    Tools: Array.Empty<ToolDefinition>(),
+                    Temperature: agent.Temperature
+                );
+
+                IDisposable? directPermit = null;
+                InferenceOverloadException? retryOverload = null;
+                try
+                {
+                    directPermit = await _throttlingManager.AcquirePermitAsync(ct);
+                }
+                catch (InferenceOverloadException ex)
+                {
+                    retryOverload = ex;
+                }
+
+                if (retryOverload != null)
+                {
+                    yield return OverloadEvent(retryOverload);
+                    yield break;
+                }
+
+                string? retryError = null;
+                try
+                {
+                    await foreach (var chunk in _llmProvider.StreamChatAsync(directRequest, ct))
+                    {
+                        if (chunk.IsError)
+                        {
+                            retryError = chunk.ErrorMessage ?? "unknown provider error";
+                            break;
+                        }
+                        if (!string.IsNullOrEmpty(chunk.DeltaText))
+                        {
+                            assistantContentAccumulator.Append(chunk.DeltaText);
+                            yield return new ChatEvent("token", chunk.DeltaText);
+                        }
+                    }
+                }
+                finally
+                {
+                    directPermit?.Dispose();
+                }
+
+                if (retryError != null)
+                {
+                    // Never persist an empty/partial assistant turn nor emit "done" after an upstream failure.
+                    _logger.LogError("LLM provider failure on conversational retry: {ProviderError}", retryError);
+                    yield return ProviderErrorEvent();
+                    yield break;
+                }
+            }
+
+            // Silence on the very first inference of a turn (no tool has run yet) is a failure, not a success.
+            // After tool execution an empty final text is legitimate and handled by the voice route fallback.
+            if (iterations == 1 && assistantContentAccumulator.Length == 0 && pendingToolCalls.Count == 0)
+            {
+                _logger.LogWarning("LLM produced no output for conversation {ConversationId} (tools offered: {ToolCount})",
+                    conversation.Id, allowedToolDefinitions.Count);
+                yield return new ChatEvent("error", "لم يصدر الوكيل أي رد. حاول إعادة صياغة سؤالك.",
+                    new ChatErrorInfo("LLM_EMPTY_RESPONSE", "llm"));
+                yield break;
             }
 
             // Save assistant message to DB
@@ -366,4 +452,10 @@ public class AgentOrchestrator
 
         yield return new ChatEvent("done", "اكتملت المحادثة.");
     }
+    private static ChatEvent OverloadEvent(InferenceOverloadException ex) =>
+        new("error", ex.Message, new ChatErrorInfo(ex.Code, "llm", ex.RetryAfterSeconds));
+
+    private static ChatEvent ProviderErrorEvent() =>
+        new("error", "خدمة الذكاء الاصطناعي غير متاحة حالياً أو فشلت في إكمال الرد. حاول مرة أخرى بعد قليل.",
+            new ChatErrorInfo("LLM_PROVIDER_UNAVAILABLE", "llm", 5));
 }
