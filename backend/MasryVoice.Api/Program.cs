@@ -14,6 +14,7 @@ using MasryVoice.Api.Features.Automation;
 using MasryVoice.Api.Features.Telephony;
 using MasryVoice.Api.Common;
 using MasryVoice.Api.Domain;
+using MasryVoice.Api.Features.Integrations;
 using Microsoft.Extensions.Caching.Memory;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -282,7 +283,28 @@ var voiceAdmissionOptions = new VoiceAdmissionOptions
 };
 builder.Services.AddSingleton(new VoiceAdmissionManager(voiceAdmissionOptions));
 
-// 12. Register Durable Outbox Processor Background Service
+// 12. Register Integrations (Calendar, WhatsApp, Telegram) & Durable Outbox
+builder.Services.AddHttpClient();
+var integrationMode = builder.Configuration["Integrations:ProviderMode"] ?? "Mock";
+if (string.Equals(integrationMode, "Production", StringComparison.OrdinalIgnoreCase) ||
+    string.Equals(integrationMode, "RealCloud", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddSingleton<ICalendarIntegrationService, Microsoft365CalendarService>();
+    builder.Services.AddSingleton<IWhatsAppMessagingService, WhatsAppCloudApiService>();
+    builder.Services.AddSingleton<ITelegramMessagingService, TelegramBotService>();
+}
+else
+{
+    builder.Services.AddSingleton<MockCalendarIntegrationService>();
+    builder.Services.AddSingleton<ICalendarIntegrationService>(sp => sp.GetRequiredService<MockCalendarIntegrationService>());
+
+    builder.Services.AddSingleton<MockWhatsAppMessagingService>();
+    builder.Services.AddSingleton<IWhatsAppMessagingService>(sp => sp.GetRequiredService<MockWhatsAppMessagingService>());
+
+    builder.Services.AddSingleton<MockTelegramMessagingService>();
+    builder.Services.AddSingleton<ITelegramMessagingService>(sp => sp.GetRequiredService<MockTelegramMessagingService>());
+}
+builder.Services.AddSingleton<IntegrationDispatchCoordinator>();
 builder.Services.AddHostedService<DurableOutboxProcessor>();
 
 // 13. Register Asterisk AudioSocket Telephony Adapter
@@ -1690,6 +1712,69 @@ if (app.Environment.IsEnvironment("Testing"))
     app.MapGet("/api/test/rate-limited", () => Results.Ok(new { status = "ok" }))
         .RequireRateLimiting("test-rate-limit");
 }
+
+// ----------------------------------------------------
+// External Channel Integrations (M365, WhatsApp, Telegram)
+// ----------------------------------------------------
+
+// Status of all configured channel integrations & external blockers
+app.MapGet("/api/integrations/status", (IntegrationDispatchCoordinator coordinator, IConfiguration cfg) =>
+{
+    var mode = cfg["Integrations:ProviderMode"] ?? "Mock";
+    return Results.Ok(coordinator.GetStatus(mode));
+});
+
+// WhatsApp Cloud API Webhook Verification (Meta Hub Challenge)
+app.MapGet("/api/integrations/whatsapp/webhook", (
+    [Microsoft.AspNetCore.Mvc.FromQuery(Name = "hub.mode")] string? mode,
+    [Microsoft.AspNetCore.Mvc.FromQuery(Name = "hub.verify_token")] string? token,
+    [Microsoft.AspNetCore.Mvc.FromQuery(Name = "hub.challenge")] string? challenge,
+    IConfiguration cfg) =>
+{
+    var expectedToken = cfg["Integrations:WhatsApp:VerifyToken"] ?? "masryvoice_webhook_token";
+    if (mode == "subscribe" && token == expectedToken)
+    {
+        return Results.Text(challenge ?? "");
+    }
+    return Results.StatusCode(403);
+});
+
+// WhatsApp Cloud API Inbound Webhook Receiver
+app.MapPost("/api/integrations/whatsapp/webhook", async (
+    HttpRequest request,
+    IWhatsAppMessagingService whatsAppService,
+    ILogger<Program> logger) =>
+{
+    using var reader = new StreamReader(request.Body);
+    var body = await reader.ReadToEndAsync();
+    var signature = request.Headers["X-Hub-Signature-256"].FirstOrDefault();
+
+    if (!whatsAppService.VerifyWebhookSignature(body, signature))
+    {
+        return Results.StatusCode(401);
+    }
+
+    logger.LogInformation("WhatsApp inbound webhook validated and received. Payload length: {Len}", body.Length);
+    return Results.Ok(new { status = "received", timestampUtc = DateTime.UtcNow });
+});
+
+// Telegram Bot Inbound Webhook Receiver
+app.MapPost("/api/integrations/telegram/webhook", async (
+    HttpRequest request,
+    ITelegramMessagingService telegramService,
+    ILogger<Program> logger) =>
+{
+    var secretHeader = request.Headers["X-Telegram-Bot-Api-Secret-Token"].FirstOrDefault();
+    if (!telegramService.VerifyWebhookSecret(secretHeader))
+    {
+        return Results.StatusCode(401);
+    }
+
+    using var reader = new StreamReader(request.Body);
+    var body = await reader.ReadToEndAsync();
+    logger.LogInformation("Telegram inbound webhook validated and received. Payload length: {Len}", body.Length);
+    return Results.Ok(new { status = "received", timestampUtc = DateTime.UtcNow });
+});
 
 app.Run();
 

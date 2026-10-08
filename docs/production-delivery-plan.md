@@ -18,9 +18,9 @@ In compliance with [AGENTS.md](file:///w:/AI%20Voice%20Agent/AGENTS.md):
 | **Phase A** | Operational Foundation, Transport & Safety | **COMPLETED & LOCALLY_VERIFIED** | `docs/evidence/phaseA-webm-PASSED.json` |
 | **Phase B** | Agent Engine, Grounded Availability & Bookings | **COMPLETED & LOCALLY_VERIFIED** | `PhaseBBookingAndDialectTests.cs`, `AuthorizationAcceptanceTests.cs` |
 | **Phase C** | Knowledge / RAG, Durable Outbox & Reminders | **COMPLETED & LOCALLY_VERIFIED** | `PhaseCKnowledgeAndOutboxTests.cs` |
-| **Phase D** | Integrated Voice Pipeline & Telephony Bridge | **LOCALLY_VERIFIED (Transport/Speech)** | `scripts/verify_webm_pipeline.py` |
-| **Phase E** | External Integrations (M365, WhatsApp, Telegram) | **IN PROGRESS (Mock Contracts)** | Integration contract tests |
-| **Phase F** | Production Hardening, Backup & Capacity Benchmarks | **PENDING** | Benchmark scripts & templates |
+| **Phase D** | Integrated Voice Pipeline & Telephony Bridge | **COMPLETED & LOCALLY_VERIFIED** | `verify_webm_pipeline.py`, `ProductionFeatureTests.cs`, `smoke.test.js` |
+| **Phase E** | External Integrations (M365, WhatsApp, Telegram) | **COMPLETED & LOCALLY_VERIFIED (Mocks) / EXTERNALLY_BLOCKED** | `PhaseEIntegrationContractTests.cs`, `GET /api/integrations/status` |
+| **Phase F** | Production Hardening, Backup & Capacity Benchmarks | **COMPLETED & LOCALLY_VERIFIED** | `SchemaMigrationAcceptanceTests.cs`, `backup_restore.py`, `phaseF-capacity-benchmark.json` |
 
 ---
 
@@ -60,23 +60,34 @@ In compliance with [AGENTS.md](file:///w:/AI%20Voice%20Agent/AGENTS.md):
 
 ### Phase D: Integrated Voice Pipeline & Telephony Bridge
 - [x] **D.1 Real Local Whisper STT Integration**: FastAPI Whisper on port 8000 handling browser WebM audio.  
-  *Status*: `LOCALLY_VERIFIED`
+  *Status*: `LOCALLY_VERIFIED` (`scripts/voice_server.py`, `scripts/verify_webm_pipeline.py`)
 - [x] **D.2 Real Local Piper TTS Integration**: FastAPI Piper synthesizing Egyptian Arabic audio.  
-  *Status*: `LOCALLY_VERIFIED`
-- [ ] **D.3 Browser UI Microphone Recording & PTT**: Chrome MediaRecorder WebM/Opus stream upload with live visualizer and error banner.
-- [ ] **D.4 Voice Interruption & Turn Cancellation**: Abort active synthesis/streaming when user speaks or clicks Interrupt (HTTP 499 handling).
-- [ ] **D.5 Telephony Asterisk AudioSocket Service**: AudioSocket TCP bridge on port 9092 for Asterisk PBX inbound calls.
+  *Status*: `LOCALLY_VERIFIED` (`scripts/voice_server.py`, `scripts/verify_webm_pipeline.py`)
+- [x] **D.3 Browser UI Microphone Recording & PTT**: Chrome MediaRecorder WebM/Opus stream upload with live visualizer and error banner.  
+  *Status*: `LOCALLY_VERIFIED` (`frontend/src/app/page.tsx`, `tests/browser/smoke.test.js`)
+- [x] **D.4 Voice Interruption & Turn Cancellation**: Abort active synthesis/streaming when user speaks or clicks Interrupt (HTTP 499 handling and `/api/voice/interrupt`).  
+  *Status*: `LOCALLY_VERIFIED` (`VoiceSessionManager.cs`, `ProductionFeatureTests.cs`, `tests/browser/smoke.test.js`)
+- [x] **D.5 Telephony Asterisk AudioSocket Service**: AudioSocket TCP bridge on port 9092 for Asterisk PBX inbound calls.  
+  *Status*: `LOCALLY_VERIFIED` (`AsteriskAudioSocketService.cs`, `ProductionFeatureTests.cs`)
 
 ### Phase E: External Integrations ($0 Cost Contracts & Local Mocks)
-- [ ] **E.1 Microsoft 365 Calendar Provider**: Contract interface + Local Mock + OAuth/Graph API client template.  
-  *Status*: `EXTERNALLY_BLOCKED` (Requires Azure AD tenant & application credentials; verified via mock).
-- [ ] **E.2 WhatsApp Business Messaging Provider**: Contract interface + Local Mock + Cloud API webhook handler.  
-  *Status*: `EXTERNALLY_BLOCKED` (Requires Meta Business Cloud API account; verified via mock).
-- [ ] **E.3 Telegram Bot Provider**: Contract interface + Local Mock + Bot API webhook handler.  
-  *Status*: `EXTERNALLY_BLOCKED` (Requires Telegram Bot Token; verified via mock).
+- [x] **E.1 Microsoft 365 Calendar Provider**: Contract interface `ICalendarIntegrationService` + `MockCalendarIntegrationService` + `Microsoft365CalendarService` with Graph API client.  
+  *Status*: `LOCALLY_VERIFIED (Mock Contracts)` / `EXTERNALLY_BLOCKED` (Requires Azure AD tenant & application credentials; verified via mock).
+- [x] **E.2 WhatsApp Business Messaging Provider**: Contract interface `IWhatsAppMessagingService` + `MockWhatsAppMessagingService` + `WhatsAppCloudApiService` with HMAC-SHA256 signature verification and webhook handlers.  
+  *Status*: `LOCALLY_VERIFIED (Mock Contracts)` / `EXTERNALLY_BLOCKED` (Requires Meta Business Cloud API account; verified via mock).
+- [x] **E.3 Telegram Bot Provider**: Contract interface `ITelegramMessagingService` + `MockTelegramMessagingService` + `TelegramBotService` with secret token verification and clinic staff notifications.  
+  *Status*: `LOCALLY_VERIFIED (Mock Contracts)` / `EXTERNALLY_BLOCKED` (Requires Telegram Bot Token; verified via mock).
+- [x] **E.4 Multi-Channel Dispatch Coordinator & Outbox Dispatch**: `IntegrationDispatchCoordinator` synchronizes calendar appointments, patient WhatsApp notices, and staff Telegram alerts with failure backoff in `DurableOutboxProcessor`.  
+  *Status*: `LOCALLY_VERIFIED` (`PhaseEIntegrationContractTests.cs`)
+- [x] **E.5 Status & Webhook Endpoints**: `GET /api/integrations/status`, `GET/POST /api/integrations/whatsapp/webhook`, `POST /api/integrations/telegram/webhook`.  
+  *Status*: `LOCALLY_VERIFIED` (`PhaseEIntegrationContractTests.cs`)
 
 ### Phase F: Production Hardening, Backup & Capacity Benchmarks
-- [ ] **F.1 PostgreSQL Migration & Schema Parity**: Automated migration scripts for SQLite and PostgreSQL.
-- [ ] **F.2 Backup & Restore Automation**: Database snapshot and recovery validation scripts.
-- [ ] **F.3 Asterisk PBX Docker / Configuration**: Dialplan extensions and AudioSocket configuration templates.
-- [ ] **F.4 Concurrency & Latency Stress Test**: Benchmark harness measuring p50/p95/p99 turn latencies under simulated concurrent calls.
+- [x] **F.1 PostgreSQL Migration & Schema Parity**: Migration helper supporting SQLite and PostgreSQL with schema integrity validation and baseline recovery.  
+  *Status*: `LOCALLY_VERIFIED` (`SchemaMigrationAcceptanceTests.cs`, `DatabaseMigrationHelper.cs`)
+- [x] **F.2 Backup & Restore Automation**: `scripts/backup_restore.py` with WAL checkpointing, SHA256 manifests, atomic restore, and integrity checks.  
+  *Status*: `LOCALLY_VERIFIED` (`scripts/backup_restore.py --self-test`)
+- [x] **F.3 Asterisk PBX Docker / Configuration Templates**: Production templates in `deploy/asterisk/` (`pjsip.conf`, `extensions.conf`, `audiosocket.conf`, `Dockerfile`) and compose profile.  
+  *Status*: `LOCALLY_VERIFIED` (`deploy/asterisk/`, `docker-compose.yml`)
+- [x] **F.4 Concurrency & Latency Stress Test**: Automated capacity benchmark harness `scripts/capacity_benchmark.py` measuring throughput and latency percentiles (p50, p90, p95, p99).  
+  *Status*: `LOCALLY_VERIFIED` (`docs/evidence/phaseF-capacity-benchmark.json`)

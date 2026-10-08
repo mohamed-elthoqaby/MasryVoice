@@ -3,6 +3,8 @@ using Microsoft.EntityFrameworkCore;
 using MasryVoice.Api.Common;
 using MasryVoice.Api.Domain;
 using MasryVoice.Api.Infrastructure.Persistence;
+using MasryVoice.Api.Features.Integrations;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace MasryVoice.Api.Features.Automation;
 
@@ -110,6 +112,7 @@ public class DurableOutboxProcessor : BackgroundService
     {
         using var scope = _serviceProvider.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var coordinator = scope.ServiceProvider.GetService<IntegrationDispatchCoordinator>();
 
         var now = DateTime.UtcNow;
         var pendingJobs = await db.OutboxJobs
@@ -125,7 +128,7 @@ public class DurableOutboxProcessor : BackgroundService
         {
             try
             {
-                await DispatchJobAsync(job, ct);
+                await DispatchJobAsync(job, coordinator, ct);
                 job.Status = "Completed";
                 job.ProcessedAtUtc = DateTime.UtcNow;
                 job.LastError = null;
@@ -155,8 +158,49 @@ public class DurableOutboxProcessor : BackgroundService
         return processedCount;
     }
 
-    private Task DispatchJobAsync(OutboxJob job, CancellationToken ct)
+    private async Task DispatchJobAsync(OutboxJob job, IntegrationDispatchCoordinator? coordinator, CancellationToken ct)
     {
+        if (coordinator != null)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(job.PayloadJson);
+                var root = doc.RootElement;
+                var bookingId = root.TryGetProperty("bookingId", out var bidProp) && bidProp.TryGetGuid(out var bid) ? bid : Guid.Empty;
+                var customerName = root.TryGetProperty("customerName", out var nameProp) ? nameProp.GetString() ?? "" : "";
+                var customerPhone = root.TryGetProperty("customerPhone", out var phoneProp) ? phoneProp.GetString() ?? "" : "";
+                var serviceName = root.TryGetProperty("serviceName", out var servProp) ? servProp.GetString() ?? "" : "";
+                var bookingDateUtc = root.TryGetProperty("bookingDateUtc", out var dateProp) && dateProp.TryGetDateTime(out var dt) ? dt : DateTime.UtcNow;
+
+                switch (job.Topic)
+                {
+                    case "BookingConfirmed":
+                        _logger.LogInformation("Outbox dispatching BookingConfirmed for job {JobId} (Booking: {BookingId})", job.Id, bookingId);
+                        await coordinator.DispatchBookingConfirmedAsync(bookingId, customerName, customerPhone, serviceName, bookingDateUtc, ct);
+                        return;
+
+                    case "BookingCancelled":
+                        var reason = root.TryGetProperty("reason", out var rProp) ? rProp.GetString() ?? "طلب المريض" : "طلب المريض";
+                        _logger.LogInformation("Outbox dispatching BookingCancelled for job {JobId} (Booking: {BookingId})", job.Id, bookingId);
+                        await coordinator.DispatchBookingCancelledAsync(bookingId, customerName, customerPhone, serviceName, bookingDateUtc, reason, ct);
+                        return;
+
+                    case "BookingReminder":
+                        _logger.LogInformation("Outbox dispatching BookingReminder for job {JobId} (Booking: {BookingId})", job.Id, bookingId);
+                        await coordinator.DispatchBookingReminderAsync(bookingId, customerName, customerPhone, serviceName, bookingDateUtc, ct);
+                        return;
+
+                    default:
+                        _logger.LogInformation("Outbox dispatched generic job topic '{Topic}' for job {JobId}.", job.Topic, job.Id);
+                        return;
+                }
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Outbox job {JobId} payload could not be parsed as JSON: {Payload}", job.Id, job.PayloadJson);
+            }
+        }
+
         switch (job.Topic)
         {
             case "BookingConfirmed":
@@ -175,7 +219,5 @@ public class DurableOutboxProcessor : BackgroundService
                 _logger.LogInformation("Outbox dispatched generic job topic '{Topic}' for job {JobId}.", job.Topic, job.Id);
                 break;
         }
-
-        return Task.CompletedTask;
     }
 }
