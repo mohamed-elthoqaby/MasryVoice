@@ -46,7 +46,7 @@ public class InferenceThrottlingManager
     public long TotalRejections => Interlocked.Read(ref _totalRejections);
     public long TotalProcessed => Interlocked.Read(ref _totalProcessed);
 
-    public async Task<IDisposable> AcquirePermitAsync(CancellationToken ct = default)
+    public virtual async Task<IDisposable> AcquirePermitAsync(CancellationToken ct = default)
     {
         // 1. Check if queue is full -> Reject immediately with 429 / overload
         int currentWaiting = Interlocked.Increment(ref _waitingCount);

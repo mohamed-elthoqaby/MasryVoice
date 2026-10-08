@@ -943,6 +943,7 @@ app.MapPost("/api/chat/stream", async (
     AppDbContext db,
     AgentOrchestrator orchestrator,
     ISecurityService security,
+    ILogger<Program> logger,
     [Microsoft.AspNetCore.Mvc.FromBody] ChatStreamRequest request,
     CancellationToken ct) =>
 {
@@ -1025,7 +1026,8 @@ app.MapPost("/api/chat/stream", async (
                 conversationId = convId,
                 type = chatEvent.EventType,
                 content = chatEvent.Content,
-                metadata = chatEvent.Metadata
+                metadata = chatEvent.Metadata,
+                correlationId = httpContext.TraceIdentifier
             });
 
             await httpContext.Response.WriteAsync($"data: {jsonEvent}\n\n", linkedCts.Token);
@@ -1038,12 +1040,14 @@ app.MapPost("/api/chat/stream", async (
     }
     catch (Exception ex) when (!httpContext.RequestAborted.IsCancellationRequested)
     {
+        logger.LogError(ex, "Chat stream failure correlationId={CorrelationId}", httpContext.TraceIdentifier);
         var errEvent = JsonSerializer.Serialize(new
         {
             conversationId = convId,
             type = "error",
             content = "عذراً، حدث خطأ أثناء معالجة المحادثة.",
-            metadata = new { error = ex.Message }
+            metadata = new ChatErrorInfo("INTERNAL_ERROR", "chat"),
+            correlationId = httpContext.TraceIdentifier
         });
         await httpContext.Response.WriteAsync($"data: {errEvent}\n\n", ct);
         await httpContext.Response.Body.FlushAsync(ct);
@@ -1169,6 +1173,7 @@ app.MapPost("/api/voice/stt", async (
     VoiceAdmissionManager admission,
     ISttProvider stt,
     HttpRequest request,
+    ILogger<Program> logger,
     CancellationToken ct) =>
 {
     // Authorization check: Require AdminKey or ownership of conversation
@@ -1227,19 +1232,13 @@ app.MapPost("/api/voice/stt", async (
         var transcribed = await stt.TranscribeAudioAsync(stream, file.ContentType ?? "audio/wav", "ar", linkedCts.Token);
         return Results.Ok(new { text = transcribed });
     }
-    catch (VoiceOverloadException ex)
+    catch (OperationCanceledException) when (linkedCts.IsCancellationRequested)
     {
-        ctx.Response.Headers.RetryAfter = ex.RetryAfterSeconds.ToString();
-        return Results.Json(new
-        {
-            code = ex.Code,
-            message = ex.Message,
-            retryAfterSeconds = ex.RetryAfterSeconds
-        }, statusCode: StatusCodes.Status429TooManyRequests);
+        return Results.StatusCode(499); // caller disconnected / cancelled
     }
-    catch (OperationCanceledException)
+    catch (Exception ex)
     {
-        return Results.StatusCode(499);
+        return VoiceErrorResults.Respond(ctx, logger, VoiceFailureClassifier.Classify(ex, "stt"), ex);
     }
 }).RequireRateLimiting("inference");
 
@@ -1248,6 +1247,7 @@ app.MapPost("/api/voice/tts", async (
     ISecurityService security,
     VoiceAdmissionManager admission,
     ITtsProvider tts,
+    ILogger<Program> logger,
     [Microsoft.AspNetCore.Mvc.FromBody] TtsSynthesizeRequest req,
     CancellationToken ct) =>
 {
@@ -1290,19 +1290,13 @@ app.MapPost("/api/voice/tts", async (
         var audio = await tts.SynthesizeSpeechAsync(req.Text, req.LanguageCode ?? "ar-EG", linkedCts.Token);
         return Results.File(audio.ToArray(), "audio/wav");
     }
-    catch (VoiceOverloadException ex)
-    {
-        ctx.Response.Headers.RetryAfter = ex.RetryAfterSeconds.ToString();
-        return Results.Json(new
-        {
-            code = ex.Code,
-            message = ex.Message,
-            retryAfterSeconds = ex.RetryAfterSeconds
-        }, statusCode: StatusCodes.Status429TooManyRequests);
-    }
-    catch (OperationCanceledException)
+    catch (OperationCanceledException) when (linkedCts.IsCancellationRequested)
     {
         return Results.StatusCode(499);
+    }
+    catch (Exception ex)
+    {
+        return VoiceErrorResults.Respond(ctx, logger, VoiceFailureClassifier.Classify(ex, "tts"), ex);
     }
 }).RequireRateLimiting("inference");
 
@@ -1315,6 +1309,7 @@ app.MapPost("/api/voice/turn", async (
     ITtsProvider tts,
     ISecurityService security,
     AppDbContext db,
+    ILogger<Program> logger,
     [Microsoft.AspNetCore.Mvc.FromBody] VoiceTurnRequest req,
     CancellationToken ct) =>
 {
@@ -1347,6 +1342,7 @@ app.MapPost("/api/voice/turn", async (
     double llmDurationMs = 0;
     double ttsDurationMs = 0;
 
+    var stage = "request"; // updated as the turn advances so failures are attributed to the right pipeline stage
     var assistantText = new System.Text.StringBuilder();
     try
     {
@@ -1390,6 +1386,7 @@ app.MapPost("/api/voice/turn", async (
             var effectiveMime = !string.IsNullOrWhiteSpace(req.MimeType) ? req.MimeType
                 : (audioBytes.Length >= 4 && audioBytes[0] == (byte)'R' && audioBytes[1] == (byte)'I' ? "audio/wav" : "audio/webm");
 
+            stage = "stt";
             var sttSw = System.Diagnostics.Stopwatch.StartNew();
             using (var sttPermit = await admission.AcquireSttPermitAsync(token))
             using (var audioStream = new MemoryStream(audioBytes))
@@ -1425,6 +1422,8 @@ app.MapPost("/api/voice/turn", async (
         }
 
         string? orchestratorError = null;
+        ChatErrorInfo? orchestratorErrorInfo = null;
+        stage = "llm";
         var llmSw = System.Diagnostics.Stopwatch.StartNew();
         // Process user message through LLM orchestrator (acquires and releases LLM permit internally)
         await foreach (var chatEvent in orchestrator.ProcessUserMessageAsync(effectiveAgentId, req.ConversationId, userMessage, token))
@@ -1437,6 +1436,7 @@ app.MapPost("/api/voice/turn", async (
             else if (chatEvent.EventType == "error")
             {
                 orchestratorError = chatEvent.Content;
+                orchestratorErrorInfo = chatEvent.Metadata as ChatErrorInfo;
             }
         }
         llmSw.Stop();
@@ -1447,9 +1447,20 @@ app.MapPost("/api/voice/turn", async (
             return Results.StatusCode(499); // Client Closed Request / Interrupted
         }
 
-        if (!string.IsNullOrEmpty(orchestratorError) && assistantText.Length == 0)
+        if (!string.IsNullOrEmpty(orchestratorError))
         {
-            return Results.Problem(detail: orchestratorError, statusCode: StatusCodes.Status500InternalServerError);
+            if (orchestratorErrorInfo?.Code == "LLM_EMPTY_RESPONSE")
+            {
+                orchestratorError = null; // Fall back to clinic greeting or tool-grounded clarification rather than 502
+            }
+            else
+            {
+                // An upstream/admission failure fails the turn, even if some text had streamed: never speak or persist a
+                // partial reply as a success. The orchestrator already refused to save an empty/partial assistant turn.
+                var info = orchestratorErrorInfo ?? new ChatErrorInfo("LLM_PROVIDER_UNAVAILABLE", "llm");
+                return VoiceErrorResults.Respond(ctx, logger,
+                    VoiceFailureClassifier.FromChatError(info.Code, info.Stage, orchestratorError, info.RetryAfterSeconds));
+            }
         }
 
         var reply = assistantText.ToString().Trim();
@@ -1564,6 +1575,7 @@ app.MapPost("/api/voice/turn", async (
         }
 
         // Synthesize response speech with TTS under separate bounded admission (Zero nested deadlock!)
+        stage = "tts";
         var ttsSw = System.Diagnostics.Stopwatch.StartNew();
         ReadOnlyMemory<byte> audioBytesOut;
         using (var ttsPermit = await admission.AcquireTtsPermitAsync(token))
@@ -1593,19 +1605,13 @@ app.MapPost("/api/voice/turn", async (
             }
         });
     }
-    catch (VoiceOverloadException ex)
+    catch (OperationCanceledException) when (token.IsCancellationRequested)
     {
-        ctx.Response.Headers.RetryAfter = ex.RetryAfterSeconds.ToString();
-        return Results.Json(new
-        {
-            code = ex.Code,
-            message = ex.Message,
-            retryAfterSeconds = ex.RetryAfterSeconds
-        }, statusCode: StatusCodes.Status429TooManyRequests);
+        return Results.StatusCode(499); // Graceful barge-in interruption / caller disconnect
     }
-    catch (OperationCanceledException)
+    catch (Exception ex)
     {
-        return Results.StatusCode(499); // Graceful barge-in interruption status
+        return VoiceErrorResults.Respond(ctx, logger, VoiceFailureClassifier.Classify(ex, stage), ex);
     }
 }).RequireRateLimiting("inference");
 

@@ -35,11 +35,17 @@ public class WhisperSttProvider : ISttProvider
             throw new ArgumentException("Audio stream cannot be null or empty.", nameof(audioStream));
         }
 
+        // Browsers send e.g. 'audio/webm;codecs=opus'. MediaTypeHeaderValue's ctor rejects parameters in the
+        // media-type token (FormatException => HTTP 500), so only the base type is forwarded to the provider.
+        var mediaType = NormalizeMediaType(contentType);
+
         using var content = new MultipartFormDataContent();
         var streamContent = new StreamContent(audioStream);
-        streamContent.Headers.ContentType = new MediaTypeHeaderValue(contentType);
-        var ext = contentType.Contains("webm", StringComparison.OrdinalIgnoreCase) ? ".webm"
-            : (contentType.Contains("ogg", StringComparison.OrdinalIgnoreCase) ? ".ogg" : ".wav");
+        streamContent.Headers.ContentType = new MediaTypeHeaderValue(mediaType);
+        var ext = mediaType.Contains("webm", StringComparison.OrdinalIgnoreCase) ? ".webm"
+            : mediaType.Contains("ogg", StringComparison.OrdinalIgnoreCase) ? ".ogg"
+            : mediaType.Contains("mp4", StringComparison.OrdinalIgnoreCase) || mediaType.Contains("m4a", StringComparison.OrdinalIgnoreCase) ? ".m4a"
+            : ".wav";
         content.Add(streamContent, "file", $"audio{ext}");
         content.Add(new StringContent("whisper-1"), "model");
         content.Add(new StringContent(language), "language");
@@ -51,7 +57,7 @@ public class WhisperSttProvider : ISttProvider
         {
             var err = await response.Content.ReadAsStringAsync(ct);
             _logger.LogError("Whisper STT request failed with status code {StatusCode}: {Error}", (int)response.StatusCode, err);
-            throw new HttpRequestException($"Whisper STT service returned HTTP {(int)response.StatusCode}: {err}");
+            throw new HttpRequestException($"Whisper STT service returned HTTP {(int)response.StatusCode}: {err}", null, response.StatusCode);
         }
 
         var json = await response.Content.ReadAsStringAsync(ct);
@@ -66,6 +72,15 @@ public class WhisperSttProvider : ISttProvider
         }
 
         throw new InvalidOperationException("Whisper STT response did not contain a valid 'text' transcription field.");
+    }
+
+    /// <summary>Returns a syntactically valid base media type ('type/subtype'), defaulting to audio/wav.</summary>
+    public static string NormalizeMediaType(string? contentType)
+    {
+        var baseType = (contentType ?? string.Empty).Split(';')[0].Trim().ToLowerInvariant();
+        return MediaTypeHeaderValue.TryParse(baseType, out var parsed) && parsed.MediaType is { Length: > 0 } mt && mt.Contains('/')
+            ? mt
+            : "audio/wav";
     }
 
     private static string NormalizeSpokenDigits(string text)

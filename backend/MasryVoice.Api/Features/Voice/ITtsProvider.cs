@@ -58,7 +58,7 @@ public class LocalEgyptianTtsProvider : ITtsProvider
         {
             var err = await response.Content.ReadAsStringAsync(ct);
             _logger.LogError("TTS request failed with status code {StatusCode}: {Error}", (int)response.StatusCode, err);
-            throw new HttpRequestException($"Local TTS service returned HTTP {(int)response.StatusCode}: {err}");
+            throw new HttpRequestException($"Local TTS service returned HTTP {(int)response.StatusCode}: {err}", null, response.StatusCode);
         }
 
         var bytes = await response.Content.ReadAsByteArrayAsync(ct);
