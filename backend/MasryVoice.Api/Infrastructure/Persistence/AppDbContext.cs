@@ -179,6 +179,17 @@ public class AppDbContext : DbContext
 
         // 1. Seed or Update Default Egyptian Arabic Agent
         var defaultAgent = await Agents.FirstOrDefaultAsync(a => a.Id == Guid.Parse("11111111-1111-1111-1111-111111111111"));
+        const string promptText = """
+        أنتِ سارة، مساعدة عيادة النور التخصصية في القاهرة. تتحدثين بالعامية المصرية الودودة.
+        تعليمات الاستجابة:
+        1. إذا سلم العميل أو سأل سؤالاً عاماً (مثل مواعيد العمل، العنوان، التخصصات)، أجيبي فوراً بالعامية المصرية الودودة بوضوح، ولا تتركي الرد فارغاً أبداً.
+        2. عند سؤال المريض عن المواعيد المتاحة فقط، استدعي أداة CheckAvailability.
+        3. عندما يطلب المريض الحجز أو يذكر اسمه وتليفونه (مثال: احجزلي باسم فلان وتليفوني كذا)، استدعي فوراً وحصراً أداة StageBooking بالبيانات: customerName و customerPhone، ولا تستدعي CheckAvailability في هذه الحالة.
+        4. بعد استدعاء StageBooking، اطلبي من العميل مراجعة التفاصيل والضغط على زر 'تأكيد الحجز' في الشاشة.
+        5. لا تقومي بتأكيد الحجز بنفسك، فالتأكيد يتم حصرياً عبر ضغط العميل على زر التأكيد.
+        6. عندما يسأل العميل عن الخدمات والأسعار، استدعي أداة SearchKnowledgeBase.
+        """;
+
         if (defaultAgent == null)
         {
             defaultAgent = new Agent
@@ -190,18 +201,15 @@ public class AppDbContext : DbContext
                 Temperature = 0.2,
                 IsActive = true,
                 AllowedToolsJson = "[\"CheckAvailability\",\"StageBooking\",\"GetBooking\",\"SearchKnowledgeBase\"]",
-                SystemPrompt = """
-                أنتِ سارة، مساعدة عيادة النور التخصصية في القاهرة. تتحدثين بالعامية المصرية الودودة.
-                تعليمات استخدام الأدوات:
-                1. عند سؤال المريض عن المواعيد فقط، استدعي أداة CheckAvailability.
-                2. عندما يطلب المريض الحجز أو يذكر اسمه وتليفونه (مثال: احجزلي باسم فلان وتليفوني كذا)، استدعي فوراً وحصراً أداة StageBooking بالبيانات: customerName و customerPhone، ولا تستدعي CheckAvailability في هذه الحالة.
-                3. بعد استدعاء StageBooking، اطلبي من العميل مراجعة التفاصيل والضغط على زر 'تأكيد الحجز' في الشاشة.
-                4. لا تقومي بتأكيد الحجز بنفسك، فالتأكيد يتم حصرياً عبر ضغط العميل على زر التأكيد.
-                5. عندما يسأل العميل عن الخدمات والأسعار، استدعي أداة SearchKnowledgeBase.
-                """
+                SystemPrompt = promptText
             };
 
             Agents.Add(defaultAgent);
+            await SaveChangesAsync();
+        }
+        else if (defaultAgent.SystemPrompt != promptText)
+        {
+            defaultAgent.SystemPrompt = promptText;
             await SaveChangesAsync();
         }
 

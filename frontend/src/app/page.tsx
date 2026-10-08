@@ -219,6 +219,38 @@ export default function Dashboard() {
     }
   };
 
+  const sessionPromiseRef = useRef<Promise<{ convId: string; token: string }> | null>(null);
+
+  // Guarantees server-issued session credentials before any authenticated request (STT, turn, etc.)
+  const ensureSessionCredentials = async (): Promise<{ convId: string; token: string }> => {
+    let conv = conversationId || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_conversation_id') : null);
+    let tok = customerToken || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_customer_token') : null);
+    if (conv && tok) {
+      return { convId: conv, token: tok };
+    }
+    if (!sessionPromiseRef.current) {
+      sessionPromiseRef.current = (async () => {
+        try {
+          const res = await fetch('/api/voice/session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ conversationId: conv || null })
+          });
+          if (!res.ok) {
+            throw new Error(`فشل إنشاء جلسة اتصال مع الخادم (كود ${res.status})`);
+          }
+          const data = await res.json();
+          updateSessionCredentials(data.conversationId, data.customerToken);
+          if (data.sessionId) setVoiceSessionId(data.sessionId);
+          return { convId: data.conversationId, token: data.customerToken };
+        } finally {
+          sessionPromiseRef.current = null;
+        }
+      })();
+    }
+    return sessionPromiseRef.current;
+  };
+
   const handleAdminLogin = (keyToSave: string) => {
     const trimmed = keyToSave.trim();
     setAdminKey(trimmed);
@@ -300,75 +332,117 @@ export default function Dashboard() {
         })
       });
 
-      if (!response.ok) throw new Error('فشل الاتصال بالخادم');
-      if (!response.body) throw new Error('لا توجد استجابة');
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`فشل الاتصال بالخادم (${response.status}): ${errorText || 'لا توجد تفاصيل إضافية'}`);
+      }
+      if (!response.body) throw new Error('لا توجد استجابة من الخادم');
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let assistantText = '';
+      let sseBuffer = '';
+
+      const processSseLine = (line: string) => {
+        if (!line.startsWith('data: ')) return;
+        const dataStr = line.substring(6).trim();
+        if (!dataStr) return;
+
+        try {
+          const data = JSON.parse(dataStr);
+          if (data.type === 'session') {
+            updateSessionCredentials(data.conversationId, data.customerToken);
+          } else if (data.type === 'token') {
+            assistantText += data.content;
+            setMessages(prev => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (last && last.role === 'assistant') {
+                last.content = assistantText;
+                last.time = new Date().toLocaleTimeString('ar-EG');
+              }
+              return updated;
+            });
+          } else if (data.type === 'error') {
+            const errDesc = data.content || data.message || 'حدث خطأ أثناء معالجة المحادثة من الخادم';
+            setMessages(prev => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (last && last.role === 'assistant') {
+                last.content = `⚠️ ${errDesc}`;
+                last.time = 'خطأ';
+              }
+              return updated;
+            });
+          } else if (data.type === 'done') {
+            if (!assistantText.trim()) {
+              setMessages(prev => {
+                const updated = [...prev];
+                const last = updated[updated.length - 1];
+                if (last && last.role === 'assistant' && !last.content.trim()) {
+                  last.content = 'عذراً، لم يتم استلام أي رد من المساعد.';
+                  last.time = 'انتهى';
+                }
+                return updated;
+              });
+            }
+          } else if (data.type === 'tool_call') {
+            setToolLogs(prev => [
+              { type: 'call', tool: data.content, meta: data.metadata, time: new Date().toLocaleTimeString('ar-EG') },
+              ...prev
+            ]);
+          } else if (data.type === 'tool_result') {
+            setToolLogs(prev => [
+              { type: 'result', tool: data.content, meta: data.metadata, time: new Date().toLocaleTimeString('ar-EG') },
+              ...prev
+            ]);
+            
+            // If StageBooking created a pending booking, display the explicit confirmation card
+            if (data.content === 'StageBooking' && data.metadata?.Success && data.metadata?.Data?.pendingBookingId) {
+              const d = data.metadata.Data;
+              if (d.customerToken) updateSessionCredentials(d.conversationId, d.customerToken);
+              setPendingCard({
+                id: d.pendingBookingId,
+                conversationId: d.conversationId || conversationId,
+                customerName: d.customerName,
+                customerPhone: d.customerPhone,
+                serviceName: d.service,
+                cairoTimeFormatted: d.cairoTime,
+                requestHash: d.requestHash,
+                status: 'Pending'
+              });
+            }
+
+            // Refresh bookings and slots after tool execution
+            fetchState();
+          }
+        } catch (e) {
+          console.error('Error parsing SSE line:', e, line);
+        }
+      };
 
       while (true) {
         const { value, done } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const dataStr = line.substring(6).trim();
-            if (!dataStr) continue;
-
-            try {
-              const data = JSON.parse(dataStr);
-              if (data.type === 'session') {
-                updateSessionCredentials(data.conversationId, data.customerToken);
-              } else if (data.type === 'token') {
-                assistantText += data.content;
-                setMessages(prev => {
-                  const updated = [...prev];
-                  const last = updated[updated.length - 1];
-                  if (last && last.role === 'assistant') {
-                    last.content = assistantText;
-                    last.time = new Date().toLocaleTimeString('ar-EG');
-                  }
-                  return updated;
-                });
-              } else if (data.type === 'tool_call') {
-                setToolLogs(prev => [
-                  { type: 'call', tool: data.content, meta: data.metadata, time: new Date().toLocaleTimeString('ar-EG') },
-                  ...prev
-                ]);
-              } else if (data.type === 'tool_result') {
-                setToolLogs(prev => [
-                  { type: 'result', tool: data.content, meta: data.metadata, time: new Date().toLocaleTimeString('ar-EG') },
-                  ...prev
-                ]);
-                
-                // If StageBooking created a pending booking, display the explicit confirmation card
-                if (data.content === 'StageBooking' && data.metadata?.Success && data.metadata?.Data?.pendingBookingId) {
-                  const d = data.metadata.Data;
-                  if (d.customerToken) updateSessionCredentials(d.conversationId, d.customerToken);
-                  setPendingCard({
-                    id: d.pendingBookingId,
-                    conversationId: d.conversationId || conversationId,
-                    customerName: d.customerName,
-                    customerPhone: d.customerPhone,
-                    serviceName: d.service,
-                    cairoTimeFormatted: d.cairoTime,
-                    requestHash: d.requestHash,
-                    status: 'Pending'
-                  });
-                }
-
-                // Refresh bookings and slots after tool execution
-                fetchState();
-              }
-            } catch (e) {
-              console.error('Error parsing SSE data:', e);
-            }
-          }
+        if (done) {
+          const finalChunk = decoder.decode();
+          if (finalChunk) sseBuffer += finalChunk;
+          break;
         }
+
+        sseBuffer += decoder.decode(value, { stream: true });
+        let lineEndIdx: number;
+        while ((lineEndIdx = sseBuffer.indexOf('\n')) !== -1) {
+          let line = sseBuffer.substring(0, lineEndIdx);
+          sseBuffer = sseBuffer.substring(lineEndIdx + 1);
+          if (line.endsWith('\r')) line = line.substring(0, line.length - 1);
+          processSseLine(line);
+        }
+      }
+
+      if (sseBuffer.trim()) {
+        let line = sseBuffer.trim();
+        if (line.endsWith('\r')) line = line.substring(0, line.length - 1);
+        processSseLine(line);
       }
     } catch (err: any) {
       setMessages(prev => [
@@ -511,35 +585,65 @@ export default function Dashboard() {
         reader.onloadend = async () => {
           if (currentRecId !== recordingSessionIdRef.current) return;
           const base64Data = (reader.result as string)?.split(',')[1];
-          if (base64Data) {
-            if (targetMode === 'voice') {
-              await handleSendVoiceTurn(undefined, base64Data, mime);
-            } else {
-              // For chat, send audio to STT then send user message
-              try {
-                const sId = voiceSessionId;
-                const tokenToUse = customerToken || (typeof window !== 'undefined' ? sessionStorage.getItem('masryvoice_customer_token') : null);
-                const headers: Record<string, string> = {};
-                if (tokenToUse) headers['X-Customer-Token'] = tokenToUse;
-                if (conversationId) headers['X-Conversation-Id'] = conversationId;
+          if (!base64Data) return;
 
-                const formData = new FormData();
-                formData.append('file', audioBlob, 'mic_recording.webm');
-                const sttRes = await fetch('/api/voice/stt', {
-                  method: 'POST',
-                  headers,
-                  body: formData
-                });
-                if (currentRecId !== recordingSessionIdRef.current) return;
-                if (sttRes.ok) {
-                  const data = await sttRes.json();
-                  if (data.text && currentRecId === recordingSessionIdRef.current) {
-                    handleSendMessage(data.text);
-                  }
-                }
-              } catch (sttErr) {
-                console.error('Chat STT error:', sttErr);
-              }
+          try {
+            setIsVoiceProcessing(true);
+            setMicError(null);
+
+            // 1. Guarantee valid session credentials before sending audio
+            const creds = await ensureSessionCredentials();
+            if (currentRecId !== recordingSessionIdRef.current) return;
+
+            const headers: Record<string, string> = {
+              'X-Customer-Token': creds.token,
+              'X-Conversation-Id': creds.convId
+            };
+
+            // 2. Perform STT transcription
+            const formData = new FormData();
+            formData.append('file', audioBlob, 'mic_recording.webm');
+            const sttRes = await fetch('/api/voice/stt', {
+              method: 'POST',
+              headers,
+              body: formData
+            });
+
+            if (currentRecId !== recordingSessionIdRef.current) return;
+
+            if (!sttRes.ok) {
+              const errBody = await sttRes.json().catch(() => null);
+              const errMsg = errBody?.message || `فشل التعرف على الصوت (رمز الخطأ: ${sttRes.status})`;
+              setMicError(errMsg);
+              return;
+            }
+
+            const data = await sttRes.json();
+            if (currentRecId !== recordingSessionIdRef.current) return;
+
+            const recognizedText = (data.text || '').trim();
+            if (!recognizedText) {
+              setMicError('لم يتم التقاط أي صوت أو كلمات واضحة من الميكروفون. يرجى التحدث بوضوح وإعادة المحاولة.');
+              return;
+            }
+
+            if (targetMode === 'voice') {
+              // Immediately show transcript to user (< 1s feedback)
+              setVoiceTranscript(recognizedText);
+              // Send turn to generate assistant voice response
+              await handleSendVoiceTurn(recognizedText, undefined, mime);
+            } else {
+              // Send message to chat stream
+              handleSendMessage(recognizedText);
+            }
+          } catch (sttErr: any) {
+            console.error('Audio processing error:', sttErr);
+            if (currentRecId === recordingSessionIdRef.current) {
+              setMicError(sttErr.message || 'حدث خطأ أثناء معالجة الصوت من الخادم.');
+            }
+          } finally {
+            if (currentRecId === recordingSessionIdRef.current) {
+              setIsVoiceProcessing(false);
             }
           }
         };
@@ -780,7 +884,10 @@ export default function Dashboard() {
           if (audioPlayerRef.current && !isInterruptedRef.current && currentRequestId === activeVoiceRequestIdRef.current) {
             audioPlayerRef.current.src = audioSrc;
             setIsVoiceSpeaking(true);
-            audioPlayerRef.current.play().catch(() => {});
+            audioPlayerRef.current.play().catch((playErr) => {
+              console.warn('Audio autoplay blocked by browser policy:', playErr);
+              setVoiceResponseText(prev => prev + '\n\n🔊 (تم حظر التشغيل التلقائي للصوت من إعدادات المتصفح. يمكنك النقر على زر الاستماع لتشغيل الصوت)');
+            });
             audioPlayerRef.current.onended = () => {
               if (currentRequestId === activeVoiceRequestIdRef.current) {
                 setIsVoiceSpeaking(false);
@@ -793,10 +900,20 @@ export default function Dashboard() {
           setIsVoiceSpeaking(false);
           setVoiceInterrupted(true);
         }
+      } else {
+        if (currentRequestId === activeVoiceRequestIdRef.current) {
+          const errData = await res.json().catch(() => null);
+          const errMsg = errData?.message || errData?.detail || `تعذر إكمال المعالجة الصوتية (رمز الخطأ: ${res.status})`;
+          setVoiceResponseText(`⚠️ ${errMsg}`);
+          setMicError(errMsg);
+        }
       }
-    } catch (err) {
+    } catch (err: any) {
       if (currentRequestId === activeVoiceRequestIdRef.current) {
-        console.error(err);
+        console.error('Voice turn request error:', err);
+        const errMsg = err?.message || 'حدث خطأ أثناء الاتصال بالخادم الصوتي.';
+        setVoiceResponseText(`⚠️ ${errMsg}`);
+        setMicError(errMsg);
       }
     } finally {
       // Only reset processing if this is still the active request
@@ -1525,6 +1642,48 @@ export default function Dashboard() {
                 ))}
               </div>
 
+              {/* Voice & Microphone Recording / Error Banner for Chat */}
+              {(isRecording || isVoiceProcessing || micError) && (
+                <div style={{
+                  padding: '10px 20px',
+                  background: micError ? 'rgba(239, 68, 68, 0.15)' : 'rgba(16, 185, 129, 0.1)',
+                  borderTop: micError ? '1px solid rgba(239, 68, 68, 0.3)' : '1px solid rgba(16, 185, 129, 0.2)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '12px',
+                  fontSize: '0.85rem'
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: micError ? '#fca5a5' : '#6ee7b7' }}>
+                    {micError ? (
+                      <>
+                        <AlertCircle size={16} color="#ef4444" />
+                        <span>{micError}</span>
+                      </>
+                    ) : isRecording ? (
+                      <>
+                        <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#ef4444', boxShadow: '0 0 8px #ef4444' }} />
+                        <span style={{ fontWeight: 600 }}>جاري التسجيل الصوتي... انقر على زر الميكروفون للإيقاف والإرسال ({micDuration} ث / 30 ث)</span>
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw size={14} className="spin" />
+                        <span>جاري التعرف على الصوت وتحويله إلى نص...</span>
+                      </>
+                    )}
+                  </div>
+                  {micError && (
+                    <button
+                      type="button"
+                      onClick={() => setMicError(null)}
+                      style={{ background: 'transparent', border: 'none', color: '#fca5a5', cursor: 'pointer', fontSize: '0.8rem' }}
+                    >
+                      إغلاق
+                    </button>
+                  )}
+                </div>
+              )}
+
               {/* Chat Input Bar with Push-to-Talk Microphone */}
               <div style={{
                 padding: '16px 20px',
@@ -2059,6 +2218,34 @@ export default function Dashboard() {
                   </span>
                 </div>
               </div>
+
+              {/* Active Mic Error Banner */}
+              {micError && (
+                <div style={{
+                  background: 'rgba(239, 68, 68, 0.15)',
+                  border: '1px solid rgba(239, 68, 68, 0.3)',
+                  borderRadius: '12px',
+                  padding: '12px 18px',
+                  color: '#fca5a5',
+                  fontSize: '0.85rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '12px'
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <AlertCircle size={16} color="#ef4444" />
+                    <span>{micError}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setMicError(null)}
+                    style={{ background: 'transparent', border: 'none', color: '#fca5a5', cursor: 'pointer', fontSize: '0.8rem' }}
+                  >
+                    إغلاق
+                  </button>
+                </div>
+              )}
 
               {/* Active Voice User Transcript Display */}
               {voiceTranscript && (

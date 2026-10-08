@@ -195,6 +195,42 @@ public class AgentOrchestrator
                 inferencePermit?.Dispose();
             }
 
+            // If the model produced 0 tokens and 0 tool calls while tools were enabled,
+            // retry once without tools to produce natural conversational output for general greetings or inquiries.
+            if (assistantContentAccumulator.Length == 0 && pendingToolCalls.Count == 0 && allowedToolDefinitions.Count > 0)
+            {
+                var directRequest = new LlmChatRequest(
+                    Model: agent.ModelName,
+                    Messages: llmMessages,
+                    Tools: Array.Empty<ToolDefinition>(),
+                    Temperature: agent.Temperature
+                );
+
+                IDisposable? directPermit = null;
+                try
+                {
+                    directPermit = await _throttlingManager.AcquirePermitAsync(ct);
+                }
+                catch (InferenceOverloadException) { }
+
+                try
+                {
+                    await foreach (var chunk in _llmProvider.StreamChatAsync(directRequest, ct))
+                    {
+                        if (chunk.IsError) break;
+                        if (!string.IsNullOrEmpty(chunk.DeltaText))
+                        {
+                            assistantContentAccumulator.Append(chunk.DeltaText);
+                            yield return new ChatEvent("token", chunk.DeltaText);
+                        }
+                    }
+                }
+                finally
+                {
+                    directPermit?.Dispose();
+                }
+            }
+
             // Save assistant message to DB
             var assistantText = assistantContentAccumulator.ToString();
             nextSeq++;

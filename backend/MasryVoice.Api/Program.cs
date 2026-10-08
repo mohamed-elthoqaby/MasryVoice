@@ -1009,9 +1009,16 @@ app.MapPost("/api/chat/stream", async (
     await httpContext.Response.WriteAsync($"data: {initEvent}\n\n", linkedCts.Token);
     await httpContext.Response.Body.FlushAsync(linkedCts.Token);
 
+    var effectiveAgentId = request.AgentId;
+    if (effectiveAgentId == Guid.Empty)
+    {
+        var existingConv = await db.Conversations.FirstOrDefaultAsync(c => c.Id == convId, ct);
+        effectiveAgentId = existingConv?.AgentId ?? (await db.Agents.FirstOrDefaultAsync(ct))?.Id ?? Guid.Parse("11111111-1111-1111-1111-111111111111");
+    }
+
     try
     {
-        await foreach (var chatEvent in orchestrator.ProcessUserMessageAsync(request.AgentId, convId, request.Message, linkedCts.Token))
+        await foreach (var chatEvent in orchestrator.ProcessUserMessageAsync(effectiveAgentId, convId, request.Message, linkedCts.Token))
         {
             var jsonEvent = JsonSerializer.Serialize(new
             {
@@ -1028,6 +1035,18 @@ app.MapPost("/api/chat/stream", async (
     catch (OperationCanceledException) when (httpContext.RequestAborted.IsCancellationRequested)
     {
         // Client disconnected; cancellation propagated to release locks & permits
+    }
+    catch (Exception ex) when (!httpContext.RequestAborted.IsCancellationRequested)
+    {
+        var errEvent = JsonSerializer.Serialize(new
+        {
+            conversationId = convId,
+            type = "error",
+            content = "عذراً، حدث خطأ أثناء معالجة المحادثة.",
+            metadata = new { error = ex.Message }
+        });
+        await httpContext.Response.WriteAsync($"data: {errEvent}\n\n", ct);
+        await httpContext.Response.Body.FlushAsync(ct);
     }
 }).RequireRateLimiting("inference");
 
